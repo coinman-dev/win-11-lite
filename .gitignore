@@ -1,0 +1,20 @@
+# Generated Windows images and installation media
+*.iso
+*.img
+*.wim
+*.esd
+
+# Downloaded servicing packages and generated build output
+*.msu
+*.cab
+/out/
+/iso/
+/updates/
+/log/
+/tmp/
+
+# Operating-system metadata and transient logs
+*.log
+Thumbs.db
+Desktop.ini
+.DS_Store

@@ -1,0 +1,461 @@
+﻿#Requires -Version 5.1
+# No elevation, DISM servicing, registry changes or real network operations.
+[CmdletBinding()]
+param()
+$ErrorActionPreference = 'Stop'
+$repo = Split-Path $PSScriptRoot -Parent
+$sourcePath = Join-Path $repo 'win-11-lite.ps1'
+$tokens = $null; $errors = $null
+$ast = [Management.Automation.Language.Parser]::ParseFile($sourcePath, [ref]$tokens, [ref]$errors)
+if ($errors.Count) { throw ($errors | Out-String) }
+$script:checks = 0
+function Assert([bool]$Condition, [string]$Message) {
+    if (-not $Condition) { throw "FAIL: $Message" }
+    $script:checks++
+}
+function Assert-Throws([scriptblock]$Action, [string]$Message) {
+    $thrown = $false
+    try { & $Action | Out-Null } catch { $thrown = $true }
+    Assert $thrown $Message
+}
+# Load declarations and pure configuration only, never execute the build pipeline.
+foreach ($name in @('T','Test-DismSuccess','ConvertFrom-DismList','Test-GroupActive','Test-Protected','Assert-ChildPath','Test-SafeToWipe','Get-FodSourceName','Get-UpdateTarget','Get-SetupSupportScripts','Get-ElevationCommand','Invoke-RegCommand','Set-Reg','Mount-Hive','Dismount-Hives','Remove-Reg','Save-ImageAudit','Write-ComponentStoreReport','Write-ServicingRemovalFailure','Get-PackageRemovalSkipReason','Get-RequestedRemovalItems','Remove-OfflineRecall','Write-RemainingRemovalReport','Assert-ImageFileState','Get-ProgressLine','Update-DismProgressState','Invoke-DismProgress','Assert-ImageLanguages','Write-WindowsBatchFile')) {
+    $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
+    if (-not $node) { throw "Missing function: $name" }
+    . ([scriptblock]::Create($node.Extent.Text))
+}
+$script:Lang = 'en'
+foreach ($name in @('CapabilityRules','PackageRules','FolderRules','AppxRules','NeverRemove','FileRules','DisableServices')) {
+    $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq ('$script:' + $name) }, $false)
+    . ([scriptblock]::Create($node.Extent.Text))
+}
+$testRoot = Join-Path $repo ('tmp\tests-' + [guid]::NewGuid().ToString('N'))
+$null = New-Item -ItemType Directory -Path $testRoot
+try {
+    Assert (Test-DismSuccess 3010) 'DISM restart-required is success'
+    Assert (-not (Test-DismSuccess 5)) 'DISM access denied is failure'
+    & {
+        $state = @{Percent=-1;Phase=1;Lines=[Collections.Generic.List[string]]::new()}
+        foreach ($sample in @('36%','100%','1%','100%','The operation completed successfully.')) { Update-DismProgressState -State $state -Text $sample }
+        Assert ($state.Phase -eq 2 -and $state.Percent -eq 100 -and $state.Lines.Count -eq 1) 'Checkpoint percentage reset creates another DISM phase'
+        foreach ($width in @(20,80,120)) {
+            $line = Get-ProgressLine -Activity ('Applying windows11.0-kb5124008-x64_' + ('a' * 40) + '.msu') -Percent 36 -Phase 2 -Elapsed ([TimeSpan]::FromSeconds(4000)) -Width $width
+            Assert ($line.Length -lt $width -and $line -notmatch '[\r\n]') "Progress never reaches the wrap column ($width)"
+        }
+        Assert ((Get-ProgressLine -Activity 'windows11.0-kb5124008-x64_longhash.msu' -Percent 1 -Phase 2 -Elapsed ([TimeSpan]::FromSeconds(1)) -Width 120) -match 'KB5124008') 'Progress retains KB while shortening update filenames'
+        $frames = [Collections.Generic.List[object]]::new()
+        function Write-ProgressBar { param($Activity,$Percent,$Phase=1,[switch]$Done,[switch]$Failed) $frames.Add([pscustomobject]@{Percent=$Percent;Phase=$Phase;Done=[bool]$Done;Failed=[bool]$Failed}) }
+        $payload = '[Console]::Write("36%`r"); [Console]::Out.Flush(); Start-Sleep -Milliseconds 650; [Console]::Write("100%`r1%`r100%`r"); [Console]::Error.WriteLine("Simulated failure after progress reached 100%."); exit 5'
+        $progressFixture = Join-Path $testRoot 'progress-simulation.ps1'
+        [IO.File]::WriteAllText($progressFixture, $payload, [Text.UTF8Encoding]::new($true))
+        $output = Invoke-DismProgress -Exe ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -Arguments @('-NoProfile','-NonInteractive','-File',$progressFixture) -Activity 'Native progress test'
+        Assert ($script:LastDismExit -eq 5 -and $output -match 'Simulated failure') 'Native progress preserves stderr and failure status'
+        Assert ($frames[-1].Done -and $frames[-1].Failed -and $frames[-1].Phase -eq 2) 'Reported 100 percent cannot turn a failed process into success'
+        Assert (@($frames | Where-Object { $_.Percent -eq 36 -and -not $_.Done }).Count -gt 0) 'Native stream is processed before the child process exits'
+    }
+    $parsed = @(ConvertFrom-DismList -Key 'Capability Identity' -Lines @('Capability Identity : Language.Basic~~~ru-RU~0.0.1.0','State : Installed','Capability Identity : Test~~~~0.0.1.0','State : Not Present'))
+    Assert ($parsed.Count -eq 2 -and $parsed[0].State -eq 'Installed') 'DISM multi-record parsing'
+    $Keep = @('Speech'); $Preset = 'balanced'; $AddLanguage = @(); $DownloadLanguage = @(); $script:ImageLanguages = @('en-US')
+    Assert (Test-Protected 'Language.Speech~~~ru-RU~0.0.1.0') 'Keep protects against RemoveExtra'
+    Assert (-not (Test-GroupActive 'balanced' 'Speech')) 'Keep disables its removal group'
+    $Keep = @(); $AddLanguage = @('ja-JP')
+    Assert (-not (Test-GroupActive 'balanced' 'Fonts')) 'Japanese image keeps CJK input and fonts'
+    $AddLanguage = @('ru-RU')
+    Assert (Test-GroupActive 'balanced' 'Fonts') 'Russian image permits CJK cleanup'
+    Assert ((Get-FodSourceName 'ru-RU') -eq 'Microsoft-Windows-LanguageFeatures-Basic-ru-ru-Package~31bf3856ad364e35~amd64~~.cab') 'Regression: CBS filename from the failing DISM log'
+    $balanced = @($script:FolderRules | Where-Object { Test-GroupActive $_.Preset $_.Group })
+    Assert (-not @($balanced | Where-Object { $_.Path -match 'EdgeWebView|EdgeUpdate|WinSxS\\Backup' }).Count) 'Balanced preserves WebView2 updater and component backups'
+    $Preset = 'max'
+    $maximum = @($script:FolderRules | Where-Object { Test-GroupActive $_.Preset $_.Group })
+    Assert (@($maximum | Where-Object { $_.Path -match 'EdgeWebView|EdgeUpdate|WinSxS\\Backup' }).Count -eq 3) 'Max retains its original aggressive removals'
+    $Keep = @('Edge')
+    Assert (-not (Test-GroupActive 'max' 'Edge')) 'Keep Edge overrides max'
+    Assert-Throws { Assert-ChildPath -Root $testRoot -Path (Split-Path $testRoot -Parent) } 'Parent deletion rejected'
+    Assert-Throws { Assert-ChildPath -Root $testRoot -Path ($testRoot + '-other\file') } 'Sibling prefix collision rejected'
+    Assert ((Assert-ChildPath -Root $testRoot -Path (Join-Path $testRoot 'child')) -eq (Join-Path $testRoot 'child')) 'Child path accepted'
+    & {
+        $leaf = Join-Path $testRoot 'wim-reparse-file'
+        function Get-Item {
+            param([string]$LiteralPath, [switch]$Force, $ErrorAction)
+            if ($LiteralPath -eq $leaf) {
+                [pscustomobject]@{ Attributes = [IO.FileAttributes]::ReparsePoint; PSIsContainer = $false }
+            } else {
+                Microsoft.PowerShell.Management\Get-Item @PSBoundParameters
+            }
+        }
+        Assert-Throws { Assert-ChildPath -Root $testRoot -Path $leaf } 'Leaf reparse point remains blocked by default'
+        Assert ((Assert-ChildPath -Root $testRoot -Path $leaf -AllowLeafReparse) -eq $leaf) 'WIM leaf reparse point is allowed without traversing it'
+    }
+    $script:WorkDirLeaf = 'win-11-lite-work'; $script:ScriptRoot = $repo
+    $InputIso = Join-Path $testRoot 'source.iso'; $OutputIso = Join-Path $testRoot 'out.iso'; $UpdatesDir = Join-Path $testRoot 'cache'
+    $LanguageSource = ''; $Unattend = ''; $DriversDir = ''
+    $work = Join-Path $testRoot 'win-11-lite-work'
+    Assert (Test-SafeToWipe $work) 'Marked work layout in workspace is permitted'
+    $InputIso = Join-Path $work 'iso\source.iso'
+    Assert (-not (Test-SafeToWipe $work)) 'Work containing input ISO is protected'
+    $InputIso = Join-Path $testRoot 'source.iso'
+    $updateDir = Join-Path $testRoot 'updates'; $null = New-Item -ItemType Directory -Path $updateDir
+    Set-Content -LiteralPath (Join-Path $updateDir 'checkpoint.msu') -Value ('x' * 100)
+    Set-Content -LiteralPath (Join-Path $updateDir 'target.msu') -Value 'x'
+    Assert-Throws { Get-UpdateTarget $updateDir } 'Ambiguous MSUs cannot be selected by size'
+    Set-Content -LiteralPath (Join-Path $updateDir 'target.txt') -Value 'target.msu'
+    Assert ((Get-UpdateTarget $updateDir).Name -eq 'target.msu') 'Explicit target wins over larger checkpoint'
+    Assert-Throws { Get-UpdateTarget $updateDir '..\outside.msu' } 'Update target traversal rejected'
+    $receiver = Join-Path $testRoot "parameter receiver's.ps1"
+    [IO.File]::WriteAllText($receiver, 'param([string[]]$Keep,[bool]$IncludeDotNetUpdate,[switch]$Guard,[switch]$Elevated) [pscustomobject]@{Keep=$Keep;DotNet=$IncludeDotNetUpdate;Guard=[bool]$Guard;Elevated=[bool]$Elevated}')
+    $encoded = Get-ElevationCommand -ScriptPath $receiver -Parameters @{Keep=@('Edge','Fonts');IncludeDotNetUpdate=$false;Guard=[switch]$false}
+    $received = & ([scriptblock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded))))
+    Assert ($received.Keep.Count -eq 2 -and $received.Keep[1] -eq 'Fonts') 'Elevation preserves array parameters and quoted paths'
+    Assert (-not $received.DotNet -and -not $received.Guard -and $received.Elevated) 'Elevation preserves false bool/switch values'
+
+    # Real native stderr/exit handling, read-only: PS 5.1 emits ErrorRecord objects.
+    & {
+        $PSNativeCommandUseErrorActionPreference = $true
+        $native = Invoke-RegCommand -Arguments @('query', ('HKCU\win-11-lite-missing-' + [guid]::NewGuid().ToString('N')))
+        Assert ($native.ExitCode -eq 1 -and $native.Output.Length -gt 0) 'Native registry failure preserves stderr and exit code'
+        $native = Invoke-RegCommand -Arguments @('/?')
+        Assert ($native.ExitCode -eq 0 -and $native.Output.Length -gt 0) 'Native registry success preserves stdout and exit code'
+        Assert ($ErrorActionPreference -eq 'Stop' -and $PSNativeCommandUseErrorActionPreference) 'Native wrapper does not change caller error preferences'
+    }
+    # Run the actual offline-registry stage. Reject the reported protected value
+    # and record the replacement policy, without loading hives or writing HKLM.
+    & {
+        $regState = @{ Writes = @{}; FailName = 'TaskbarDa'; FailLoad = $false; FailUnload = $false }
+        $regMessages = [Collections.Generic.List[string]]::new()
+        function reg.exe {
+            $global:LASTEXITCODE = 0
+            $op = $args[0]
+            if ($op -eq 'add') {
+                $name = if ($args -contains '/v') { $args[[array]::IndexOf($args, '/v') + 1] } else { '' }
+                if ($name -eq $regState.FailName) {
+                    $global:LASTEXITCODE = 1
+                    Write-Error 'SIMULATED: Access is denied.'
+                    return
+                }
+                $regState.Writes[($args[1] + '|' + $name)] = $args[[array]::IndexOf($args, '/d') + 1]
+            } elseif (($op -eq 'load' -and $regState.FailLoad) -or ($op -eq 'unload' -and $regState.FailUnload)) {
+                $global:LASTEXITCODE = 1
+                Write-Error 'SIMULATED: Hive is locked.'
+                return
+            }
+            'The operation completed successfully.'
+        }
+        function Write-Stage { param($Message) }
+        function Write-Ok { param($Message) }
+        function Write-Fail { param($Message) $regMessages.Add($Message) }
+        $mountDir = Join-Path $testRoot 'registry-mount'
+        foreach ($relative in @('Windows\System32\config\SOFTWARE','Windows\System32\config\SYSTEM','Users\Default\NTUSER.DAT')) {
+            $file = Join-Path $mountDir $relative
+            $null = New-Item -ItemType Directory -Path (Split-Path $file -Parent) -Force
+            $null = New-Item -ItemType File -Path $file
+        }
+        $script:LoadedHives = @(); $script:RemovedFonts = @(); $script:ManageOobe = $true
+        $Preset = 'balanced'; $Keep = @(); $NoBypass = $false; $imgLang = 'ru-RU'
+        $region = [regex]::Match($ast.Extent.Text, '(?ms)^#region[^\r\n]*Стадия 12\. Offline-реестр.*?^#endregion').Value
+        if (-not $region) { throw 'Offline-registry stage not found' }
+        & ([scriptblock]::Create($region))
+        Assert ($regState.Writes['HKLM\LITE_SOFTWARE\Policies\Microsoft\Dsh|AllowNewsAndInterests'] -eq '0') 'Offline stage disables widgets without writing protected TaskbarDa'
+        Assert ($regState.Writes['HKLM\LITE_DEFAULT\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced|TaskbarMn'] -eq '0' -and
+                $regState.Writes['HKLM\LITE_DEFAULT\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced|Start_IrisRecommendations'] -eq '0') 'Default profile settings after the former failure are applied'
+        Assert ($script:LoadedHives.Count -eq 0) 'Offline-registry stage unloads all owned hives'
+        Assert (-not $regState.Writes.ContainsKey('HKLM\LITE_DEFAULT\Control Panel\Desktop|PreferredUILanguages')) 'Language selection is left to Windows Setup instead of a registry override'
+        Assert (-not $regState.Writes.ContainsKey('HKLM\LITE_DEFAULT\Software\Microsoft\Windows\CurrentVersion\RunOnce|!Win11LiteFirstLogon')) 'No extra per-profile startup callback is installed'
+        $successOutput = @(Set-Reg -Path 'HKLM\LITE_SOFTWARE\test' -Name '' -Type REG_DWORD -Value 0)
+        Assert ($successOutput.Count -eq 0 -and $regState.Writes['HKLM\LITE_SOFTWARE\test|'] -eq '0') 'Set-Reg writes default values without emitting native output'
+        foreach ($lang in @('ru','en')) {
+            $script:Lang = $lang
+            $failure = ''
+            try { Set-Reg -Path 'HKLM\LITE_DEFAULT\test' -Name 'TaskbarDa' -Type REG_DWORD -Value 0 } catch { $failure = $_.Exception.Message }
+            Assert ($failure -match 'HKLM\\LITE_DEFAULT\\test\\TaskbarDa' -and $failure -match 'SIMULATED: Access is denied\.' -and $failure -match '1') "Registry write failures remain fatal and preserve diagnostics ($lang)"
+            Assert ($failure -match $(if ($lang -eq 'ru') { 'завершился ошибкой' } else { 'failed' })) "Registry failure summary is localized ($lang)"
+        }
+        $regState.FailName = 'AllowNewsAndInterests'
+        Assert-Throws { & ([scriptblock]::Create($region)) } 'Failure of the replacement machine policy aborts the stage'
+        Dismount-Hives
+        $regState.FailLoad = $true
+        $failure = ''
+        try { Mount-Hive -Name 'LITE_DEFAULT' -File $file } catch { $failure = $_.Exception.Message }
+        Assert ($failure -match 'SIMULATED: Hive is locked\.' -and $script:LoadedHives.Count -eq 0) 'Failed load retains diagnostics and does not register ownership'
+        $regState.FailLoad = $false
+        Mount-Hive -Name 'LITE_DEFAULT' -File $file
+        $regState.FailUnload = $true
+        Dismount-Hives
+        Assert ($script:LoadedHives -contains 'LITE_DEFAULT' -and $regMessages[-1] -match 'SIMULATED: Hive is locked\.') 'Failed unload preserves ownership for cleanup and records diagnostics'
+        $regState.FailUnload = $false
+        Dismount-Hives
+        Assert ($script:LoadedHives.Count -eq 0) 'Successful unload retry releases ownership'
+    }
+
+    & {
+        $Preset = 'balanced'; $Keep = @(); $RemoveExtra = @('Language'); $AddLanguage = @()
+        $servicing = @{
+            Caps = [ordered]@{ 'Language.OCR~~~en-US~0.0.1.0' = 'Installed'; 'Language.Speech~~~en-US~0.0.1.0' = 'Staged'; 'Language.Handwriting~~~en-US~0.0.1.0' = 'Install Pending'; 'Language.Basic~~~ru-RU~0.0.1.0' = 'Installed' }
+            Packages = [ordered]@{ 'Microsoft-Windows-Wallpaper-Content-Extended-FoD-Package~test' = 'Installed'; 'Microsoft-Windows-Hello-Face-Package~test' = 'Staged'; 'Microsoft-Windows-TabletPCMath-Package~test' = 'Install Pending' }
+            Recall = 'Disabled'; AnalyzeFails = $false; AnalyzeThrows = $false; RestoreEdge = $false
+        }
+        $events = [Collections.Generic.List[string]]::new()
+        $notes = [Collections.Generic.List[string]]::new()
+        $mountDir = $testRoot
+        $script:ImageAudit = [ordered]@{ ComponentStore = @(); RemovalFailures = @(); RemainingRemovals = @() }
+        $script:ImageAuditPath = Join-Path $testRoot 'image-audit.json'
+        function Write-Step { param($Message) $notes.Add($Message) }
+        function Write-Note { param($Message) $notes.Add($Message) }
+        function Write-Ok { param($Message) }
+        function Write-Stage { param($Message) }
+        function Format-Size { param($Bytes) "$Bytes bytes" }
+        function Invoke-Dism {
+            param($Arguments,[switch]$Quiet,[switch]$AllowFail,$Activity)
+            $events.Add(($Arguments -join ' '))
+            $code = 0; $lines = @()
+            if ($Arguments -contains '/Get-Capabilities') {
+                foreach ($entry in $servicing.Caps.GetEnumerator()) { $lines += "Capability Identity : $($entry.Key)", "State : $($entry.Value)" }
+            } elseif ($Arguments -contains '/Get-Packages') {
+                foreach ($entry in $servicing.Packages.GetEnumerator()) { $lines += "Package Identity : $($entry.Key)", "State : $($entry.Value)" }
+            } elseif ($Arguments -contains '/Get-ProvisionedAppxPackages') {
+                $lines = @('DisplayName : Microsoft.BingWeather', 'PackageName : Microsoft.BingWeather_test')
+            } elseif ($Arguments -contains '/Get-Features') {
+                $lines = @('Feature Name : Recall', "State : $($servicing.Recall)", 'Feature Name : NetFx3', 'State : Enabled')
+            } elseif ($Arguments -contains '/Disable-Feature') {
+                $servicing.Recall = 'Disabled with Payload Removed'
+            } elseif ($Arguments -contains '/Remove-Capability') {
+                $name = ($Arguments | Where-Object { $_ -like '/CapabilityName:*' }) -replace '^/CapabilityName:', ''
+                if ($name -like 'Language.OCR*') { $code = -2146498523; $lines = @('Error: 0x800f0825', 'SIMULATED: Package cannot be uninstalled.') }
+                else { $servicing.Caps[$name] = 'Not Present' }
+            } elseif ($Arguments -contains '/Remove-Package') {
+                $name = ($Arguments | Where-Object { $_ -like '/PackageName:*' }) -replace '^/PackageName:', ''
+                $servicing.Packages[$name] = 'Not Present'
+            } elseif ($Arguments -contains '/AnalyzeComponentStore') {
+                if ($servicing.AnalyzeThrows) { throw 'SIMULATED: Native analysis could not start.' }
+                if ($servicing.AnalyzeFails) { $code = 5; $lines = @('SIMULATED: Analysis unavailable.') }
+                else { $lines = @('Actual Size of Component Store : 4.88 GB', '    Shared with Windows : 4.38 GB', '    Backups and Disabled Features : 506.90 MB', 'Number of Reclaimable Packages : 0') }
+            } elseif ($Arguments -contains '/StartComponentCleanup' -and $servicing.RestoreEdge) {
+                $null = New-Item -ItemType Directory -Path $browser -Force
+                $null = New-Item -ItemType File -Path (Join-Path $browser 'msedge.exe') -Force
+            }
+            [pscustomobject]@{ ExitCode = $code; Output = $lines }
+        }
+        foreach ($regionName in @('Стадия 8\. Удаление возможностей', 'Стадия 9\. Удаление пакетов')) {
+            $region = [regex]::Match($ast.Extent.Text, ('(?ms)^#region[^\r\n]*' + $regionName + '.*?^#endregion')).Value
+            if (-not $region) { throw "Missing region: $regionName" }
+            & ([scriptblock]::Create($region))
+        }
+        Assert ($servicing.Caps['Language.Speech~~~en-US~0.0.1.0'] -eq 'Not Present') 'Balanced removes selected staged capability payload'
+        Assert ($servicing.Packages['Microsoft-Windows-Hello-Face-Package~test'] -eq 'Not Present') 'Balanced removes selected staged package payload'
+        Assert (-not @($events | Where-Object { $_ -match '/Remove-.+(Handwriting|TabletPCMath)' }).Count) 'Pending packages are not forced through incomplete servicing'
+        Assert ($servicing.Caps['Language.Basic~~~ru-RU~0.0.1.0'] -eq 'Installed') 'Update cleanup preserves required language even with RemoveExtra'
+        Assert ($script:ImageAudit.RemovalFailures[0].HResult -eq '0x800F0825' -and $script:ImageAudit.RemovalFailures[0].Detail -match 'cannot be uninstalled') 'Removal failure retains HRESULT and actual DISM explanation'
+        Assert (-not (Get-PackageRemovalSkipReason 'Microsoft-Windows-SenseClient-FoD-Package~neutral')) 'Sense package is not skipped merely because another component failed'
+        Write-ServicingRemovalFailure -Kind Capability -Name 'Microsoft.Windows.Sense.Client~~~~' -Result ([pscustomobject]@{ExitCode=-2146498523;Output=@('Permanent package cannot be uninstalled.')})
+        Assert ($script:ImageAudit.RemovalFailures[-1].Reason -eq 'PermanentPackage') 'CBS permanent-package refusal is identified from the actual error text'
+        Assert ((Get-PackageRemovalSkipReason 'Microsoft-Windows-SenseClient-FoD-Package~31bf3856ad364e35~amd64~en-US~10.0.26100.9444') -match '0x800F0825') 'Language satellite is not retried after Sense capability refusal'
+        $Preset='max'
+        Assert (-not (Get-PackageRemovalSkipReason 'Microsoft-Windows-SenseClient-FoD-Package~neutral')) 'Sense retry policy in max remains unchanged'
+        $Preset='balanced'
+        Remove-OfflineRecall -Image $testRoot
+        Assert ($servicing.Recall -eq 'Disabled with Payload Removed') 'Recall removal requested even when disabled but payload is present'
+        $events.Clear(); $Preset = 'max'
+        Remove-OfflineRecall -Image $testRoot
+        Assert ($events.Count -eq 0) 'New Recall servicing does not alter max'
+        $Preset = 'balanced'; $Keep = @('AI')
+        Remove-OfflineRecall -Image $testRoot
+        Assert ($events.Count -eq 0) 'Keep AI prevents Recall removal'
+        $Keep = @(); $servicing.Recall = 'Disable Pending'
+        Remove-OfflineRecall -Image $testRoot
+        Assert (-not @($events | Where-Object { $_ -match '/Disable-Feature' }).Count) 'Pending Recall is reported without unsafe retry'
+        Write-RemainingRemovalReport -Image $testRoot
+        $left = @($script:ImageAudit.RemainingRemovals)
+        Assert ($left.Count -eq 5 -and @($left | Where-Object { $_.State -match 'Pending' }).Count -eq 3) 'Final inventory exposes failed, pending and provisioned leftovers'
+        Assert (-not @($left | Where-Object { $_.Name -match 'Basic|Hello|Speech' }).Count) 'Final inventory excludes protected and removed items'
+        $Keep = @('Speech')
+        Write-RemainingRemovalReport -Image $testRoot
+        Assert (-not @($script:ImageAudit.RemainingRemovals | Where-Object { $_.Name -like 'Language.*' }).Count) 'Keep also protects pending items against RemoveExtra in the report'
+        $Keep = @()
+        Write-ComponentStoreReport -Image $testRoot -Phase 'source'
+        Assert ($notes -contains 'Actual size : 4.88 GB') 'Size summary uses native hard-link-aware measurement'
+        $servicing.AnalyzeFails = $true
+        Write-ComponentStoreReport -Image $testRoot -Phase 'after-cleanup'
+        $saved = Get-Content -LiteralPath $script:ImageAuditPath -Raw | ConvertFrom-Json
+        Assert ($saved.ComponentStore.Count -eq 2 -and $saved.ComponentStore[1].ExitCode -eq 5) 'Unavailable analysis is recorded rather than presented as zero size'
+        $servicing.AnalyzeThrows = $true
+        Write-ComponentStoreReport -Image $testRoot -Phase 'probe-failure'
+        Assert ($script:ImageAudit.ComponentStore[-1].ExitCode -eq -1) 'Failure to start optional size analysis does not abort the build'
+        $servicing.AnalyzeThrows = $false
+
+        # Simulate DISM recreating Edge after the first file-removal stage.
+        $mountDir = Join-Path $testRoot 'serviced-mount'
+        $browser = Join-Path $mountDir 'Program Files (x86)\Microsoft\Edge'
+        $webRoot = Join-Path $mountDir 'Program Files (x86)\Microsoft\EdgeWebView'
+        $newRuntime = Join-Path $webRoot 'Application\new-version\msedgewebview2.exe'
+        $null = New-Item -ItemType Directory -Path (Split-Path $newRuntime -Parent) -Force
+        $null = New-Item -ItemType File -Path $newRuntime
+        $script:PreservedWebView = @($webRoot)
+        $script:TaskFiles = @(); $Keep = @('Fonts'); $ResetBase = $false; $RemoveWinRE = $false
+        $wimPath = Join-Path $testRoot 'serviced.wim'; $null = New-Item -ItemType File -Path $wimPath
+        $servicing.RestoreEdge = $true
+        function Remove-ImagePath {
+            param($FullPath,$Description)
+            $safe = Assert-ChildPath -Path $FullPath -Root $mountDir
+            if (Test-Path -LiteralPath $safe) {
+                $events.Add("delete-file:$safe")
+                Remove-Item -LiteralPath $safe -Recurse -Force
+            }
+        }
+        $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Remove-SelectedImageFiles' }, $true)
+        . ([scriptblock]::Create($node.Extent.Text))
+        $commitStage = [regex]::Match($ast.Extent.Text, '(?ms)^Write-Stage \(T ''Очистка хранилища компонентов и фиксация образа''.*?(?=^# --- boot\.wim)').Value
+        if (-not $commitStage) { throw 'Final servicing stage not found' }
+        $events.Clear()
+        & ([scriptblock]::Create($commitStage))
+        Assert (-not (Test-Path -LiteralPath $browser)) 'Final cleanup removes Edge restored by DISM'
+        Assert (Test-Path -LiteralPath $newRuntime) 'Version replacement of WebView2 is accepted and the runtime survives'
+        $deleteAt = $events.IndexOf("delete-file:$browser")
+        $cleanupAt = $events.IndexOf(($events | Where-Object { $_ -match '/StartComponentCleanup' } | Select-Object -First 1))
+        $commitAt = $events.IndexOf(($events | Where-Object { $_ -match '/Unmount-Image' } | Select-Object -First 1))
+        Assert ($cleanupAt -lt $deleteAt -and $deleteAt -lt $commitAt) 'Restored files are removed after DISM cleanup and before commit'
+        Remove-Item -LiteralPath $newRuntime -Force
+        Assert-Throws { Assert-ImageFileState -Image $mountDir } 'Missing WebView2 still blocks commit'
+        $script:ImageAuditPath = $null
+    }
+
+    foreach ($lang in @('ru-RU','en-US')) {
+        foreach ($block in @($true,$false)) {
+            $support = Get-SetupSupportScripts -BlockNetwork $block -RemoveEdge $true -EnableGuard $true -Language $lang
+            foreach ($name in @('Prepare','Finalize')) {
+                $t = $null; $e = $null
+                $null = [Management.Automation.Language.Parser]::ParseInput($support[$name], [ref]$t, [ref]$e)
+                Assert ($e.Count -eq 0) "Generated $name parses ($lang, network=$block): $e"
+                Assert ($support[$name] -notmatch '__[A-Z]+__') "No unresolved placeholders in $name"
+            }
+        }
+    }
+    # Evaluate the actual answer-file expressions, then parse the resulting XML.
+    $imgLang = 'ru-RU'; $setupLang = 'en-US'; $ProductKey = ''; $CompactOS = $false; $NoOobeNetworkBlock = $false
+    foreach ($name in @('compactBlock','oobeNetBlock','unattendXml')) {
+        $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq ('$' + $name) }, $true)
+        . ([scriptblock]::Create($node.Extent.Text))
+    }
+    $xml = [xml]$unattendXml
+    $ns = New-Object Xml.XmlNamespaceManager($xml.NameTable); $ns.AddNamespace('u','urn:schemas-microsoft-com:unattend')
+    Assert ($xml.SelectSingleNode('//u:SetupUILanguage/u:UILanguage',$ns).InnerText -eq 'en-US') 'WinPE uses a language actually present in boot.wim'
+    Assert ($xml.SelectSingleNode('//u:settings[@pass="windowsPE"]/u:component[@name="Microsoft-Windows-International-Core-WinPE"]/u:UILanguage',$ns).InnerText -eq 'ru-RU') 'Windows default language is not overwritten by English Setup UI'
+    $firstCommand = $xml.SelectSingleNode('//u:FirstLogonCommands/u:SynchronousCommand/u:CommandLine',$ns).InnerText
+    Assert ($firstCommand -match 'Finalize.ps1.*-FirstLogon' -and $firstCommand -match '-WindowStyle Hidden') 'Answer file starts finalization directly and hidden'
+    Assert ($xml.SelectSingleNode('//u:RunSynchronousCommand/u:Path',$ns).InnerText -match '-WindowStyle Hidden') 'Specialize PowerShell window is hidden'
+    $node = $ast.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$setupComplete'}, $true)
+    . ([scriptblock]::Create($node.Extent.Text))
+    Assert ($setupComplete -match '-WindowStyle Hidden' -and $setupComplete -match 'setupcomplete.log' -and $setupComplete -notmatch '>>[^\r\n]*prepare.log') 'SetupComplete is hidden and does not lock the preparation log'
+    Assert ($xml.SelectSingleNode('//u:settings[@pass="specialize"]/u:component[@name="Microsoft-Windows-International-Core"]/u:UILanguage',$ns).InnerText -eq 'ru-RU') 'System language applied before OOBE'
+    Assert ($xml.SelectSingleNode('//u:RunSynchronousCommand/u:Path',$ns).InnerText -match 'Prepare.ps1') 'Specialize registers finalization'
+    & {
+        function Invoke-Dism { param($Arguments,[switch]$Quiet) [pscustomobject]@{ExitCode=0;Output=@('State : Installed')} }
+        $image = Join-Path $testRoot 'language-image'
+        $mui = Join-Path $image 'Windows\ImmersiveControlPanel\ru-RU\SystemSettings.exe.mui'
+        $null = New-Item -ItemType Directory -Path (Split-Path $mui -Parent) -Force
+        $null = New-Item -ItemType File -Path $mui
+        Assert-Throws { Assert-ImageLanguages -Image $image -Languages 'ru-RU' -SourceLanguage 'en-US' } 'A Settings MUI alone is insufficient to validate Russian resources'
+        foreach ($relative in @('Windows\ImmersiveControlPanel\pris\resources.ru-RU.pri','Windows\SystemResources\Windows.UI.SettingsAppThreshold\pris\Windows.UI.SettingsAppThreshold.ru-RU.pri')) {
+            $path = Join-Path $image $relative
+            $null = New-Item -ItemType Directory -Path (Split-Path $path -Parent) -Force
+            Set-Content -LiteralPath $path -Value 'nonempty fixture'
+        }
+        Assert-ImageLanguages -Image $image -Languages 'ru-RU' -SourceLanguage 'en-US'
+        Assert $true 'Both Settings language resource locations are accepted'
+        Clear-Content -LiteralPath $path
+        Assert-Throws { Assert-ImageLanguages -Image $image -Languages 'ru-RU' -SourceLanguage 'en-US' } 'Empty Settings PRI is rejected'
+    }
+    $guardPolicies=@('HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection|AllowTelemetry|0')
+    $guardFolders=@('Windows\diagnostics'); $guardServices=@('DiagTrack'); $guardCaps=@(); $guardAppx=@()
+    foreach ($name in @('toPsList','guardScript')) {
+        $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq ('$' + $name) }, $true)
+        . ([scriptblock]::Create($node.Extent.Text))
+    }
+    $t=$null; $e=$null
+    $null=[Management.Automation.Language.Parser]::ParseInput($guardScript,[ref]$t,[ref]$e)
+    Assert ($e.Count -eq 0) 'Generated guard parses with actual policy/folder lists'
+
+    # Execute generated scripts with mocked privileged APIs and a fake file tree.
+    & {
+        $testEvents = [Collections.Generic.List[string]]::new()
+        $taskFailure = @{Enabled=$false}
+        $testAdapters = @(
+            [pscustomobject]@{InterfaceGuid='adapter-enabled'; AdminStatus='Up'},
+            [pscustomobject]@{InterfaceGuid='adapter-disabled'; AdminStatus='Down'}
+        )
+        function New-ScheduledTaskAction { param($Execute,$Argument) [pscustomobject]@{Execute=$Execute;Argument=$Argument} }
+        function New-ScheduledTaskTrigger { param([switch]$AtLogOn) [pscustomobject]@{Delay=''} }
+        function New-ScheduledTaskPrincipal { param($UserId,$LogonType,$RunLevel) Assert ($UserId -eq 'S-1-5-18') 'Finalizer uses SYSTEM'; 'principal' }
+        function New-ScheduledTaskSettingsSet { param([switch]$StartWhenAvailable,[switch]$AllowStartIfOnBatteries,[switch]$DontStopIfGoingOnBatteries,$MultipleInstances,$ExecutionTimeLimit) 'settings' }
+        function Register-ScheduledTask { param($TaskName,$Action,$Trigger,$Principal,$Settings,[switch]$Force) if($taskFailure.Enabled){throw 'Simulated unavailable scheduler'}; $testEvents.Add('register') }
+        function Unregister-ScheduledTask { [CmdletBinding(SupportsShouldProcess)]param($TaskName) $testEvents.Add('unregister') }
+        function Get-NetAdapter { param([switch]$IncludeHidden) $testAdapters }
+        function Disable-NetAdapter { [CmdletBinding(SupportsShouldProcess)]param([Parameter(ValueFromPipeline)]$InputObject) process { $testEvents.Add('disable:'+$InputObject.InterfaceGuid); $InputObject.AdminStatus='Down' } }
+        function Enable-NetAdapter { [CmdletBinding(SupportsShouldProcess)]param([Parameter(ValueFromPipeline)]$InputObject) process { $testEvents.Add('enable:'+$InputObject.InterfaceGuid); $InputObject.AdminStatus='Up' } }
+        function Get-ItemProperty { param($LiteralPath,$Name,$ErrorAction) $null }
+        function Get-Process { param($Name,$ErrorAction) @() }
+        function Get-CimInstance { param($ClassName) @() }
+        function takeown.exe { $global:LASTEXITCODE=0 }
+        function icacls.exe { $global:LASTEXITCODE=0 }
+        function Test-Path { [CmdletBinding()]param([Parameter(Position=0)]$Path,$LiteralPath) $p=if($LiteralPath){$LiteralPath}else{$Path}; if($p -like 'HKLM:*'){$false}else{Microsoft.PowerShell.Management\Test-Path -LiteralPath $p} }
+        $oldProgramFiles=$env:ProgramFiles; $oldX86=${env:ProgramFiles(x86)}; $oldPublic=$env:PUBLIC; $oldData=$env:ProgramData
+        try {
+            $env:ProgramFiles=Join-Path $testRoot 'pf'; ${env:ProgramFiles(x86)}=Join-Path $testRoot 'pf86'; $env:PUBLIC=Join-Path $testRoot 'public'; $env:ProgramData=Join-Path $testRoot 'data'
+            $browser=Join-Path $env:ProgramFiles 'Microsoft\Edge'
+            $webview=Join-Path $env:ProgramFiles 'Microsoft\EdgeWebView'
+            $null=New-Item -ItemType Directory -Path $browser,$webview
+            Set-Content -LiteralPath (Join-Path $browser 'msedge.exe') -Value 'browser'
+            Set-Content -LiteralPath (Join-Path $webview 'msedgewebview2.exe') -Value 'runtime'
+            $support=Get-SetupSupportScripts -BlockNetwork $true -RemoveEdge $true -EnableGuard $false -Language 'en-US'
+            foreach($name in @('Prepare','Finalize')) { [IO.File]::WriteAllText((Join-Path $testRoot "$name.ps1"),$support[$name],[Text.UTF8Encoding]::new($true)) }
+            & (Join-Path $testRoot 'Prepare.ps1')
+            Assert ($testEvents[0] -eq 'disable:adapter-enabled') 'Specialize blocks network independently of Task Scheduler availability'
+            Assert (@($testEvents | Where-Object {$_ -like 'disable:*'}).Count -eq 1) 'Only enabled adapters are disabled'
+            & (Join-Path $testRoot 'Finalize.ps1')
+            Assert (-not (Test-Path -LiteralPath $browser)) 'Restored Edge removed at first logon'
+            Assert (Test-Path -LiteralPath (Join-Path $webview 'msedgewebview2.exe')) 'WebView2 survives finalization'
+            Assert ($testEvents -contains 'enable:adapter-enabled') 'Changed adapter is restored'
+            Assert ($testEvents -notcontains 'enable:adapter-disabled') 'Previously disabled adapter remains disabled'
+            Assert (-not (Test-Path -LiteralPath (Join-Path $testRoot 'network-state.clixml'))) 'Network state removed after restoration'
+            Assert ($testEvents -contains 'unregister') 'Successful finalizer removes its one-time task'
+            # A cleanup failure must never leave the machine without connectivity.
+            $testEvents.Clear()
+            $null=New-Item -ItemType Directory -Path $browser
+            function Remove-Item {
+                [CmdletBinding()]param($LiteralPath,[switch]$Recurse,[switch]$Force)
+                if ($LiteralPath -eq $browser) { throw 'Simulated locked browser' }
+                Microsoft.PowerShell.Management\Remove-Item -LiteralPath $LiteralPath -Recurse:$Recurse -Force:$Force
+            }
+            & (Join-Path $testRoot 'Prepare.ps1')
+            & (Join-Path $testRoot 'Finalize.ps1')
+            Assert ($LASTEXITCODE -eq 1) 'Cleanup failure returns nonzero status'
+            Assert ($testEvents -contains 'enable:adapter-enabled') 'Network restored despite Edge cleanup failure'
+            Assert ($testEvents -notcontains 'unregister') 'Failed finalizer retains its retry task'
+            $testEvents.Clear()
+            function Get-ItemProperty { param($LiteralPath,$Name,$ErrorAction) if($LiteralPath -eq 'HKLM:\SYSTEM\Setup') { [pscustomobject]@{OOBEInProgress=1;SystemSetupInProgress=0} } }
+            & (Join-Path $testRoot 'Prepare.ps1')
+            & (Join-Path $testRoot 'Finalize.ps1')
+            Assert ($testEvents -notcontains 'enable:adapter-enabled') 'OOBE defaultuser0 logon does not restore network early'
+            Assert ($testEvents -notcontains 'unregister') 'OOBE logon retains the task for the real user'
+            & (Join-Path $testRoot 'Finalize.ps1') -FirstLogon
+            Assert ($testEvents -contains 'enable:adapter-enabled') 'Explicit real-user logon restores connectivity even while OOBE flags are being cleared'
+
+            $support=Get-SetupSupportScripts -BlockNetwork $true -RemoveEdge $true -EnableGuard $false -Language 'ru-RU'
+            Assert ($support.Count -eq 2) 'Only preparation and finalization scripts are generated'
+            foreach($name in @('Prepare','Finalize')) { [IO.File]::WriteAllText((Join-Path $testRoot "$name.ps1"),$support[$name],[Text.UTF8Encoding]::new($true)) }
+            $taskFailure.Enabled = $true
+            $testEvents.Clear()
+            & (Join-Path $testRoot 'Prepare.ps1')
+            Assert ($testAdapters[0].AdminStatus -eq 'Down' -and $testEvents -notcontains 'register') 'Unavailable scheduler cannot leave OOBE online'
+            & (Join-Path $testRoot 'Finalize.ps1') -FirstLogon
+            Assert ($testAdapters[0].AdminStatus -eq 'Up' -and $testAdapters[1].AdminStatus -eq 'Down') 'Direct first-logon callback restores only changed adapters without a registered task'
+        } finally {
+            $env:ProgramFiles=$oldProgramFiles; ${env:ProgramFiles(x86)}=$oldX86; $env:PUBLIC=$oldPublic; $env:ProgramData=$oldData
+        }
+    }
+    Write-Host "PASS: $script:checks checks; PowerShell $($PSVersionTable.PSVersion)"
+} finally {
+    $safeRoot = [IO.Path]::GetFullPath((Join-Path $repo 'tmp')).TrimEnd('\')
+    $resolved = [IO.Path]::GetFullPath($testRoot)
+    if ($resolved.StartsWith("$safeRoot\tests-",[StringComparison]::OrdinalIgnoreCase)) {
+        Remove-Item -LiteralPath $resolved -Recurse -Force
+    }
+}
