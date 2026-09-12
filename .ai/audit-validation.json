@@ -1,9 +1,9 @@
 {
-  "Date": "2026-09-12T20:00:54.7429042+03:00",
-  "ScriptSHA256": "C40324B4AF6363970988D271A61AC164A8A6FE1BE15D6DFE9448B189D8931EAE",
-  "ChecksPerRuntime": 479,
+  "Date": "2026-09-12T20:29:16.6398273+03:00",
+  "ScriptSHA256": "6EE58811E0E1AA2276DFF9008A13D6E3DBE339531B03C6BBE2B8C52501C37814",
+  "ChecksPerRuntime": 491,
   "ChecksBySuite": {
-    "Main": 130,
+    "Main": 142,
     "WindowsBatch": 142,
     "Guard": 33,
     "Downloads": 80,
@@ -20,7 +20,7 @@
   ],
   "PowerShell7": "7.6.6 PASS",
   "WindowsPowerShell": "5.1.19041.7725 PASS",
-  "DryRun": "Source LTSC ISO index 2, DownloadLanguage ru-RU: Setup language ru-RU; PowerShell 7 RU (LegacySetup/TrimSources) and PS 5.1 EN PASS. See .ai/setup-language-validation.",
+  "DryRun": "Source LTSC ISO index 2, -DryRun -Debug -Verbose -UILang ru: PASS on PowerShell 7 and 5.1, zero console VERBOSE/DEBUG lines. No log files created in DryRun.",
   "FullIsoBuild": "Current out ISO inspected: BuildId 20260912-180510, 3155714048 bytes, RU Windows and Setup, UpdateMode none, winget false, Guard and GuardDebug true. Predates new OOBE network and Firefox launcher fixes; rebuild required.",
   "LastUserBuild": "20260912-002657: completed 01:09:59, ISO 3121188864 bytes, no KB5124008 (language-repair LCU only); predates all 2026-09-12 revisions",
   "VmInstall": "User screenshots: OOBE downloads updates (1%), then VM desktop, guard with 57 checks and 0 errors, Firefox installed and running. Guest build-info and prepare/finalize logs not obtained; cannot prove which isolation failure occurred. New OOBE/Firefox fixes not VM-tested.",
@@ -31,9 +31,10 @@
   "WebView2AfterLcu": "KB5124008 replaces in-box Microsoft-Edge-WebView 10.0.26100.1 (122.0.2365.106) with 10.0.26100.9444 (151.0.4129.59); CBS unprojects Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\122.*, runtime remains in Windows\\System32\\Microsoft-Edge-WebView. Builder now accepts any known root; first-boot WebView2 registration must be verified in a VM.",
   "DownloadPreparation": "All payloads prepared before ISO copy, work cleanup and WIM servicing; component skip/cancel, verified cache, checkpoints, language repair dependencies, partial-file handling and offline integration tested with mocks. No new full ISO build or VM install.",
   "LatestUserBuildFailure": "User reported api.github.com DNS failure while embedding winget at stage 16 with no internet. Downloads have now been moved to preparation; actual rebuild required.",
-  "ValidationLogs": ".ai/oobe-validation; 130 main + 142 CMD + 33 guard + 80 downloads + 54 Setup language + 40 OOBE tests per runtime. Windows system APIs mocked; actual read-only OOBEComplete binding smoke-checked on host. CMD checks include negative winget HRESULTs.",
+  "ValidationLogs": ".ai/logging-validation: updated main suite (142) passed on PowerShell 7.6.6 and Windows PowerShell 5.1.19041.7725; Debug+Verbose DryRun on both has zero console verbose/debug lines. Other unchanged suites retain .ai/oobe-validation results; 491 checks per runtime in total.",
   "SetupLanguage": "User output ISO 20260912-180510 was built with RU Windows/Setup and KB5043080 for Setup, as verified from its embedded manifest. Official RU WinPE CABs and offline cache validated. New OOBE networking changes are not part of that ISO.",
   "WinPeCatalogSHA256": "78059F63D9DAF5E86F858C469B7B683AE0CA0E3A57FD7E4D3BC1F5BA9E0A5DA0",
   "Publication": "coinman-dev/win-11-lite, main; README/CHANGELOG, current Windows source, data, tests and maintained project notes. No new full ISO build or VM installation.",
-  "OobeFix": "Retry adapter discovery, repeat blocking from SetupComplete, persistent temporary outbound rule for late interfaces, native OOBEComplete gating even at FirstLogon, hidden wait worker, independent network restoration, completion marker to prevent reblocking. Guest logs still required to identify the exact regression mechanism."
+  "OobeFix": "Retry adapter discovery, repeat blocking from SetupComplete, persistent temporary outbound rule for late interfaces, native OOBEComplete gating even at FirstLogon, hidden wait worker, independent network restoration, completion marker to prevent reblocking. Guest logs still required to identify the exact regression mechanism.",
+  "QuietLogging": "Debug, LogFile and wizard logging keep console verbose/debug silent. Commands and technical messages are appended to UTF-8 .details.log; transcript and native .dism.log use separate writers. Native DISM logging also enabled by explicit LogFile; failures remain visible."
 }

@@ -254,7 +254,8 @@ param(
     [switch]$InstallAdk,
 
     # Файл лога. Если не задан, лог пишется только при -Debug — в подпапку log
-    # рядом со скриптом, с именем <имя исходного ISO>_<дата-время>.log
+    # рядом со скриптом, с именем <имя исходного ISO>_<дата-время>.log.
+    # Технические сообщения — в соседнем .details.log, журнал DISM — в .dism.log.
     [string]$LogFile,
 
     # Показать план и оценки, ничего не менять. Работает без прав администратора.
@@ -280,12 +281,11 @@ param(
     [switch]$Elevated
 )
 
-# -Debug — стандартный параметр PowerShell. Включает запись полного лога работы
-# в папку скрипта и подробный вывод (в том числе команд DISM).
-$script:DebugMode = $PSBoundParameters.ContainsKey('Debug')
-if ($script:DebugMode) {
-    $DebugPreference = 'Continue'      # иначе PowerShell спрашивает подтверждение
-    $VerbosePreference = 'Continue'
+# -Debug включает файлы диагностики, сохраняя обычный вид консоли.
+$script:DebugMode = $PSBoundParameters.ContainsKey('Debug') -and [bool]$PSBoundParameters['Debug']
+if ($script:DebugMode -or $LogFile) {
+    $DebugPreference = 'SilentlyContinue'
+    $VerbosePreference = 'SilentlyContinue'
 }
 
 $script:ScriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
@@ -799,6 +799,24 @@ function Update-ProgressState {
 
 # Единая обёртка над dism.exe. /English обязателен — иначе парсинг вывода
 # ломается на локализованных системах.
+function Write-DiagnosticLog {
+    param([string]$Message)
+    if (-not $script:DetailLogPath) {
+        # Явный -Verbose без логирования остаётся доступным для диагностики.
+        Write-Verbose $Message
+        return
+    }
+    if ($script:DetailLogFailed) { return }
+    try {
+        # Transcript имеет своего писателя. Технический журнал пишется отдельно,
+        # чтобы не конфликтовать с ним и не выводить строки через консоль.
+        [IO.File]::AppendAllText($script:DetailLogPath, "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $Message`r`n", [Text.UTF8Encoding]::new($true))
+    } catch {
+        $script:DetailLogFailed = $true
+        Write-Warning (T "Не удалось дописать технический журнал $script:DetailLogPath : $($_.Exception.Message)" "Could not append to diagnostic log $script:DetailLogPath : $($_.Exception.Message)")
+    }
+}
+
 function Invoke-Dism {
     param(
         [Parameter(Mandatory)][string[]]$Arguments,
@@ -807,11 +825,11 @@ function Invoke-Dism {
         [string]$Activity          # задан — показываем полосу вместо вывода DISM
     )
     $all = @('/English') + $Arguments
-    # В режиме -Debug просим DISM вести собственный подробный лог рядом с нашим
-    if ($script:DebugMode -and $script:DismLogPath) {
+    # И -Debug, и явный -LogFile включают собственный подробный журнал DISM.
+    if ($script:DismLogPath) {
         $all += @("/LogPath:$script:DismLogPath", '/LogLevel:4')
     }
-    Write-Verbose "dism $($all -join ' ')"
+    Write-DiagnosticLog "dism $($all -join ' ')"
 
     if ($Activity -and $script:CanDrawProgress) {
         $run = Invoke-ProgressProcess -Exe $script:Dism -Arguments $all -Activity $Activity -SuccessCodes @(0, 3010)
@@ -904,7 +922,7 @@ function Invoke-ProgressProcess {
         $failed = $exitCode -notin $SuccessCodes
         Write-ProgressBar -Activity $Activity -Percent $(if ($failed) { [Math]::Max(0, $state.Percent) } else { 100 }) -Phase $state.Phase -Done -Failed:$failed
         $tool = [IO.Path]::GetFileName($Exe)
-        Write-Verbose (T "$tool завершился: этапов $($state.Phase), код $exitCode, операция: $Activity" "$tool finished: $($state.Phase) phases, code $exitCode, operation: $Activity")
+        Write-DiagnosticLog (T "$tool завершился: этапов $($state.Phase), код $exitCode, операция: $Activity" "$tool finished: $($state.Phase) phases, code $exitCode, operation: $Activity")
     } finally { $proc.Dispose() }
     [PSCustomObject]@{ ExitCode = $exitCode; Output = $lines.ToArray() }
 }
@@ -2578,7 +2596,8 @@ if ($script:WizardMode) {
     Write-Host ''
     if (Read-YesNo -Question (T 'Вести подробный лог работы?' 'Write a detailed log?') -Default $false) {
         $script:DebugMode = $true
-        $VerbosePreference = 'Continue'
+        $VerbosePreference = 'SilentlyContinue'
+        $DebugPreference = 'SilentlyContinue'
     }
 
     # Итог
@@ -2646,6 +2665,7 @@ $script:ManageOobe = -not $Unattend
 if (-not $LogFile -and $script:DebugMode) {
     $LogFile = Join-Path $script:ScriptRoot ("log\{0}_{1:yyyyMMdd-HHmmss}.log" -f $isoName, (Get-Date))
 }
+if ($LogFile) { $LogFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogFile) }
 if (-not $DryRun) {
     $null = New-Item -ItemType Directory -Path (Split-Path $OutputIso -Parent) -Force
     $script:ImageAuditPath = [IO.Path]::ChangeExtension($OutputIso, '.image-audit.json')
@@ -2737,15 +2757,21 @@ $isoDir = Join-Path $WorkDir 'iso'
 $bootMountDir = Join-Path $WorkDir 'bootmount'
 $wimPath = Join-Path $WorkDir 'install.wim'
 
+#region ── Журналы сборки ────────────────────────────────────────────────────
 $script:Transcribing = $false
 $script:DismLogPath = $null
+$script:DetailLogPath = $null
+$script:DetailLogFailed = $false
 if ($LogFile -and -not $DryRun) {
+    $LogFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogFile)
     $null = New-Item -ItemType Directory -Path (Split-Path $LogFile -Parent) -Force
-    try { Start-Transcript -Path $LogFile -Force | Out-Null; $script:Transcribing = $true } catch { }
-    if ($script:DebugMode) {
-        $script:DismLogPath = [IO.Path]::ChangeExtension($LogFile, '.dism.log')
-    }
+    $script:DetailLogPath = [IO.Path]::ChangeExtension($LogFile, '.details.log')
+    $script:DismLogPath = [IO.Path]::ChangeExtension($LogFile, '.dism.log')
+    [IO.File]::WriteAllText($script:DetailLogPath, '', [Text.UTF8Encoding]::new($true))
+    try { Start-Transcript -Path $LogFile -Force | Out-Null; $script:Transcribing = $true }
+    catch { Write-Warning (T "Не удалось открыть основной журнал: $($_.Exception.Message)" "Could not start the main log: $($_.Exception.Message)") }
 }
+#endregion
 
 Write-Host ''
 Write-Host '╔══════════════════════════════════════════════════════════════════════════╗' -ForegroundColor Cyan
@@ -2762,6 +2788,7 @@ if ($Preset -eq 'max') {
 }
 if ($LogFile) { Write-Host (T "  Лог          : $LogFile" "  Log          : $LogFile") }
 else { Write-Host (T '  Лог          : не ведётся  (включить: -Debug)' '  Log          : disabled  (enable with -Debug)') }
+if ($script:DetailLogPath) { Write-Host (T "  Подробный лог: $script:DetailLogPath" "  Details log  : $script:DetailLogPath") }
 if ($DryRun) { Write-Host (T '  РЕЖИМ        : DryRun — ничего не изменяется' '  MODE         : DryRun - nothing will be changed') -ForegroundColor Yellow }
 Write-Host ''
 
@@ -3734,7 +3761,7 @@ if (Test-GroupActive -RulePreset 'balanced' -Group 'Fonts') {
                 $freed += $size
                 $script:RemovedFonts += $f.Name
             } catch {
-                Write-Verbose (T "Шрифт $($f.Name): $($_.Exception.Message)" "Font $($f.Name): $($_.Exception.Message)")
+                Write-DiagnosticLog (T "Шрифт $($f.Name): $($_.Exception.Message)" "Font $($f.Name): $($_.Exception.Message)")
             }
         }
         $script:FreedBytes += $freed
@@ -4401,7 +4428,7 @@ if ($SkipIso) {
         throw (T "oscdimg завершился с кодом $($isoRun.ExitCode)`n$tail" "oscdimg exited with code $($isoRun.ExitCode)`n$tail")
     }
     # Полоса заменила живой вывод oscdimg; его отчёт сохраняем в подробном логе.
-    Write-Verbose (($isoRun.Output -join "`n").Trim())
+    Write-DiagnosticLog (($isoRun.Output -join "`n").Trim())
     if (Test-Path -LiteralPath $OutputIso) { [IO.File]::Replace($buildingIso, $OutputIso, $null) }
     else { [IO.File]::Move($buildingIso, $OutputIso) }
 

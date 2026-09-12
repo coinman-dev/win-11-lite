@@ -19,7 +19,7 @@ function Assert-Throws([scriptblock]$Action, [string]$Message) {
     Assert $thrown $Message
 }
 # Load declarations and pure configuration only, never execute the build pipeline.
-foreach ($name in @('T','Test-DismSuccess','ConvertFrom-DismList','Test-GroupActive','Test-Protected','Assert-ChildPath','Test-SafeToWipe','Get-FodSourceName','Get-UpdateTarget','Get-SetupSupportScripts','Get-GuardScript','Get-ElevationCommand','Invoke-RegCommand','Invoke-NativeQuiet','Set-Reg','Mount-Hive','Dismount-Hives','Remove-Reg','Save-ImageAudit','Write-ComponentStoreReport','Write-ServicingRemovalFailure','Get-PackageRemovalSkipReason','Get-RequestedRemovalItems','Remove-OfflineRecall','Write-RemainingRemovalReport','Get-WebViewRuntimeRoots','Assert-ImageFileState','Get-ProgressLine','Update-ProgressState','Invoke-ProgressProcess','Get-CopyPercent','Assert-ImageLanguages','Write-WindowsBatchFile')) {
+foreach ($name in @('T','Test-DismSuccess','ConvertFrom-DismList','Test-GroupActive','Test-Protected','Assert-ChildPath','Test-SafeToWipe','Get-FodSourceName','Get-UpdateTarget','Get-SetupSupportScripts','Get-GuardScript','Get-ElevationCommand','Invoke-RegCommand','Invoke-NativeQuiet','Set-Reg','Mount-Hive','Dismount-Hives','Remove-Reg','Save-ImageAudit','Write-ComponentStoreReport','Write-ServicingRemovalFailure','Get-PackageRemovalSkipReason','Get-RequestedRemovalItems','Remove-OfflineRecall','Write-RemainingRemovalReport','Get-WebViewRuntimeRoots','Assert-ImageFileState','Get-ProgressLine','Update-ProgressState','Invoke-ProgressProcess','Get-CopyPercent','Assert-ImageLanguages','Write-WindowsBatchFile','Write-DiagnosticLog','Invoke-Dism')) {
     $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
     if (-not $node) { throw "Missing function: $name" }
     . ([scriptblock]::Create($node.Extent.Text))
@@ -34,6 +34,49 @@ $null = New-Item -ItemType Directory -Path $testRoot
 try {
     Assert (Test-DismSuccess 3010) 'DISM restart-required is success'
     Assert (-not (Test-DismSuccess 5)) 'DISM access denied is failure'
+    & {
+        $modeText = [regex]::Match($ast.Extent.Text, '(?ms)^\$script:DebugMode =.*?(?=^\$script:ScriptRoot)').Value
+        $modeProbe = [scriptblock]::Create('[CmdletBinding()]param([string]$LogFile)' + "`n" + $modeText + "`n" + '[pscustomobject]@{Debug=$script:DebugMode;VerbosePreference=$VerbosePreference;DebugPreference=$DebugPreference}')
+        $mode = & $modeProbe -Debug -Verbose
+        Assert ($mode.Debug -and $mode.VerbosePreference -eq 'SilentlyContinue' -and $mode.DebugPreference -eq 'SilentlyContinue') 'Debug logging does not enable console verbose/debug streams'
+        $mode = & $modeProbe -LogFile 'build.log' -Verbose
+        Assert (-not $mode.Debug -and $mode.VerbosePreference -eq 'SilentlyContinue') 'Explicit LogFile also keeps technical console output quiet'
+        $mode = & $modeProbe -Debug:$false
+        Assert (-not $mode.Debug) 'Debug false does not activate logging'
+
+        $setup = [regex]::Match($ast.Extent.Text, '(?ms)^#region[^\r\n]*Журналы сборки.*?^#endregion').Value
+        Assert ([bool]$setup) 'Log initialization can be exercised without the build'
+        $DryRun = $false; $LogFile = 'журнал сборки.log'; $script:DebugMode = $false
+        $VerbosePreference = 'SilentlyContinue'
+        Push-Location $testRoot
+        try {
+            . ([scriptblock]::Create($setup))
+            Assert ($LogFile -eq (Join-Path $testRoot 'журнал сборки.log')) 'Relative LogFile follows the PowerShell working directory'
+            Assert ($script:Transcribing -and $script:DetailLogPath -ne $LogFile -and $script:DismLogPath -ne $LogFile) 'Transcript and technical logs have separate writers'
+            $VerbosePreference = 'Continue' # even an explicit caller preference must not print logged details
+            $script:Dism = 'Invoke-FakeDism'; $script:CanDrawProgress = $false
+            $fixture = @{Code=0}
+            function Invoke-FakeDism { $global:LASTEXITCODE=$fixture.Code; 'Native diagnostic output' }
+            $records = @(Invoke-Dism -Arguments @('/Image:C:\fake-mount','/Get-Features','/Format:List') -Quiet 4>&1)
+            Assert ($records.Count -eq 1 -and $records[0].ExitCode -eq 0) 'Logging does not print verbose records or pollute the DISM result'
+            $detail = Get-Content -LiteralPath $script:DetailLogPath -Raw -Encoding UTF8
+            Assert ($detail.Contains('dism /English /Image:C:\fake-mount /Get-Features /Format:List') -and $detail.Contains('/LogLevel:4')) 'Exact DISM command is written to the technical file even without Debug'
+            $fixture.Code=5
+            Assert-Throws { Invoke-Dism -Arguments @('/Image:C:\fake-mount','/Get-Packages') -Quiet } 'Quiet console logging does not suppress DISM failures'
+            $records = @(Write-DiagnosticLog 'Подробности oscdimg и шрифтов' 4>&1)
+            Assert ($records.Count -eq 0 -and (Get-Content -LiteralPath $script:DetailLogPath -Raw).Contains('Подробности oscdimg и шрифтов')) 'Non-DISM technical messages are readable as UTF-8 in both runtimes without console output'
+        } finally {
+            if($script:Transcribing){Stop-Transcript|Out-Null;$script:Transcribing=$false}
+            Pop-Location
+        }
+        $script:DetailLogPath=$null;$script:DismLogPath=$null;$script:DetailLogFailed=$false
+        $records = @(Write-DiagnosticLog 'Explicit console diagnostic' 4>&1)
+        Assert ($records.Count -eq 1 -and $records[0] -is [Management.Automation.VerboseRecord]) 'Explicit Verbose without logging remains available'
+        $DryRun=$true;$LogFile=Join-Path $testRoot 'dryrun.log'
+        . ([scriptblock]::Create($setup))
+        Assert (-not (Test-Path -LiteralPath $LogFile) -and -not $script:DetailLogPath -and -not $script:DismLogPath) 'DryRun does not create log files or enable native logs'
+        $script:DebugMode=$false;$global:LASTEXITCODE=0
+    }
     & {
         $state = @{Percent=-1;Phase=1;Lines=[Collections.Generic.List[string]]::new()}
         foreach ($sample in @('36%','100%','1%','100%','The operation completed successfully.')) { Update-ProgressState -State $state -Text $sample }
