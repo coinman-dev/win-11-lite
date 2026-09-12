@@ -2021,7 +2021,31 @@ if ($Watch) {
 }
 function Write-GuardLog {
     param([string]$Level, [string]$Message)
-    "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Message" | Add-Content -LiteralPath $logFile -Encoding UTF8
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Message"
+    $encoding = [Text.UTF8Encoding]::new($true)
+    [byte[]]$data = $encoding.GetBytes($line + [Environment]::NewLine)
+    # Windows PowerShell 5.1 Add-Content denies concurrent readers, including
+    # our Get-Content -Wait viewer. Open explicitly with shared read/write access.
+    $attempts = if ($counts.LogFailed) { 1 } else { 5 }
+    for ($attempt = 0; $attempt -lt $attempts; $attempt++) {
+        try {
+            $stream = [IO.File]::Open($logFile,[IO.FileMode]::Append,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite)
+            try {
+                [byte[]]$record = if ($stream.Length -eq 0) { $encoding.GetPreamble() + $data } else { $data }
+                $stream.Write($record,0,$record.Length)
+            } finally { $stream.Dispose() }
+            return
+        } catch {
+            $problem = $_.Exception.GetBaseException()
+            $code = $problem.HResult -band 0xFFFF
+            if ($code -in @(32,33) -and $attempt + 1 -lt $attempts) { Start-Sleep -Milliseconds 100; continue }
+            break
+        }
+    }
+    # A logging failure must never become a policy/service failure or abort the
+    # remaining checks. The GUI launcher captures stderr in launcher.log.
+    $counts.LogFailed++
+    try { [Console]::Error.WriteLine("[LOG ERROR] ${logFile}: $($problem.Message)`r`n$line") } catch { }
 }
 # takeown/icacls report problems on stderr. Under Windows PowerShell 5.1 with
 # ErrorActionPreference=Stop a redirected stderr line becomes an exception
@@ -2043,7 +2067,7 @@ function Test-GuardMatch {
     foreach ($pattern in $Patterns) { if ($pattern -and $Name -match $pattern) { return $true } }
     return $false
 }
-$counts = @{Checked=0;Changed=0;Pending=0;Failed=0;Skipped=0}
+$counts = @{Checked=0;Changed=0;Pending=0;Failed=0;Skipped=0;LogFailed=0}
 function Invoke-GuardCheck {
     param([string]$Label, [scriptblock]$Action)
     $counts.Checked++
@@ -2181,10 +2205,13 @@ try {
     $counts.Failed++
     Write-GuardLog 'ERROR' $_.Exception.Message
 } finally {
-    Write-GuardLog 'END' (T "Проверено $($counts.Checked); изменено $($counts.Changed); ожидают завершения $($counts.Pending); пропущено $($counts.Skipped); ошибок $($counts.Failed)" "Checked $($counts.Checked); changed $($counts.Changed); pending $($counts.Pending); skipped $($counts.Skipped); errors $($counts.Failed)")
-    $runLock.Dispose()
+    try { Write-GuardLog 'END' (T "Проверено $($counts.Checked); изменено $($counts.Changed); ожидают завершения $($counts.Pending); пропущено $($counts.Skipped); ошибок $($counts.Failed)" "Checked $($counts.Checked); changed $($counts.Changed); pending $($counts.Pending); skipped $($counts.Skipped); errors $($counts.Failed)") }
+    finally { $runLock.Dispose() }
 }
-if ($counts.Failed) { exit 1 }
+if ($counts.LogFailed) {
+    try { [Console]::Error.WriteLine((T "[LOG ERROR] Не записано строк в guard.log: $($counts.LogFailed); строки переданы в stderr (launcher.log при штатном запуске)." "[LOG ERROR] Lines not written to guard.log: $($counts.LogFailed); forwarded to stderr (launcher.log during normal startup).")) } catch { }
+}
+if ($counts.Failed -or $counts.LogFailed) { exit 1 }
 exit 0
 '@
 }

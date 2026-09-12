@@ -131,6 +131,15 @@ try{
             Assert ($fixture.Policy -eq 0 -and $calls -contains 'policy') 'A second logon rechecks and repairs restored values'
             Assert ([regex]::Matches((Get-Content -LiteralPath $log -Raw),'\[START\]').Count -eq 2) 'Guard runs repeatedly rather than only once'
 
+            # Real shared reader: the old PS 5.1 Add-Content writer fails while
+            # this handle is open, even though the reader permits writes.
+            $fixture.Policy=1;$fixture.App=$true;$fixture.Provisioned=$true;$calls.Clear()
+            $reader=[IO.File]::Open($log,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+            try { & $guard; $sharedExit=$LASTEXITCODE } finally { $reader.Dispose() }
+            Assert ($sharedExit -eq 0 -and $fixture.Policy -eq 0) 'A live reader does not block logging or policy checks'
+            Assert ($calls -contains 'app' -and $calls -contains 'provisioned') 'Checks continue through app inventory and removal while a reader holds the log'
+            Assert ((Get-Content -LiteralPath $log -Raw) -notmatch '\[ERROR\]') 'Shared logging does not produce false component failures'
+
             Clear-Content -LiteralPath $log
             $fixture.Policy=1;$fixture.DenyPolicy=$true;$fixture.Cap='Installed';$fixture.DenyCap=$true
             & $guard
@@ -163,6 +172,26 @@ try{
             Assert ($LASTEXITCODE -eq 1 -and (Test-Path -LiteralPath $marker)) 'A configured parent path cannot escape the system drive'
             $testConfig.Paths=@()
             $testConfig | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $configFile -Encoding UTF8
+
+            # A genuinely exclusive external lock cannot be bypassed. Logging
+            # falls back to stderr while all mocked system checks still finish.
+            $fixture.Policy=1;$fixture.App=$true;$fixture.Provisioned=$true;$calls.Clear()
+            $exclusive=[IO.File]::Open($log,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+            $oldError=[Console]::Error;$captured=[IO.StringWriter]::new()
+            try {
+                [Console]::SetError($captured)
+                & $guard
+                $lockedExit=$LASTEXITCODE
+            } finally { [Console]::SetError($oldError);$exclusive.Dispose() }
+            $fallback=$captured.ToString();$captured.Dispose()
+            Assert ($lockedExit -eq 1 -and $fixture.Policy -eq 0 -and $calls -contains 'app' -and $calls -contains 'provisioned') 'Exclusive log failure is reported without aborting independent checks'
+            Assert ($fallback -match '\[END\].*errors 0' -and $fallback -notmatch '\[ERROR\]') 'Logging failure is not counted as a failed policy or service'
+            Assert ($fallback -match '\[LOG ERROR\]' -and $fallback -match '\[START\]' -and $fallback -match 'Lines not written') 'Failed log records and a logging-specific summary are preserved on stderr'
+            $lockProbe=[IO.File]::Open((Join-Path $root 'guard.lock'),[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+            $lockProbe.Dispose()
+            Assert $true 'Run lock is released after logging failures'
+            & $guard
+            Assert ($LASTEXITCODE -eq 0) 'The next run recovers after the external log lock is released'
 
             function Start-Process {param($FilePath,$WindowStyle,$ArgumentList)$fixture.Launched=$true;$fixture.WindowStyle=$WindowStyle;$fixture.Arguments=$ArgumentList}
             & $guard -ShowDebugWindow
