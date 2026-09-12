@@ -1,6 +1,5 @@
 # PowerShell 5.1 scripts keep their existing UTF-8 BOM and Windows line endings.
 *.ps1 text eol=crlf
-*.cs text eol=lf
 *.md text eol=lf
 *.json text eol=lf
 .gitignore text eol=lf

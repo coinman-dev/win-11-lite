@@ -1,6 +1,5 @@
 ﻿#Requires -Version 5.1
-# Compiles/runs the real GUI launcher with inert fixture scripts only.
-# No Prepare/Finalize/guard operations, services, firewall or registry changes.
+# Exercises the PowerShell runner with inert fixture scripts, never real setup/guard actions.
 [CmdletBinding()]
 param()
 $ErrorActionPreference='Stop'
@@ -8,135 +7,126 @@ $repo=Split-Path $PSScriptRoot -Parent
 $t=$null;$e=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'win-11-lite.ps1'),[ref]$t,[ref]$e)
 if($e.Count){throw ($e|Out-String)}
-foreach($name in @('T','Write-DiagnosticLog','Get-ProgressLine','Write-ProgressBar','Update-ProgressState','Invoke-ProgressProcess','Assert-ChildPath','Read-PreparedCache','Write-PreparedCache','Build-SetupLauncher','Write-WindowsBatchFile')){
+foreach($name in 'T','Get-SetupRunnerPath','Write-WindowsBatchFile'){
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     . ([scriptblock]::Create($node.Extent.Text))
 }
-$script:Lang='en';$script:ScriptRoot=$repo;$script:CanDrawProgress=$false
-$script:checks=0
-function Assert([bool]$Condition,[string]$Message){if(-not $Condition){throw "FAIL: $Message"};$script:checks++}
-function Assert-Throws([scriptblock]$Action,[string]$Message){$failed=$false;try{& $Action|Out-Null}catch{$failed=$true};Assert $failed $Message}
-$root=Join-Path $repo ('tmp\launcher-tests-'+[guid]::NewGuid().ToString('N'))
+$script:ScriptRoot=$repo;$script:Lang='en';$Guard=$true;$script:checks=0
+function Assert([bool]$Value,[string]$Message){if(-not $Value){throw "FAIL: $Message"};$script:checks++}
+$root=Join-Path $repo ('tmp\runner-tests-'+[guid]::NewGuid().ToString('N'))
 $null=New-Item -ItemType Directory -Path $root
+$powershell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+function New-RunnerProcess([string]$Runner,[string]$Mode,[string]$Directory){
+    $psi=[Diagnostics.ProcessStartInfo]::new();$psi.FileName=$powershell
+    $psi.Arguments='-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "'+$Runner+'" -Mode '+$Mode
+    $psi.WorkingDirectory=$Directory;$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true
+    $psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true
+    $psi.EnvironmentVariables['TEMP']=$Directory;$psi.EnvironmentVariables['TMP']=$Directory
+    $psi
+}
 try{
-    $exe=Build-SetupLauncher -Directory $root
-    $bytes=[IO.File]::ReadAllBytes($exe);$pe=[BitConverter]::ToInt32($bytes,0x3c)
-    Assert ([BitConverter]::ToUInt16($bytes,$pe+4) -eq 0x8664) 'Launcher is built for x64 Windows'
-    Assert ([BitConverter]::ToUInt16($bytes,$pe+24+68) -eq 2) 'Launcher has Windows GUI subsystem, so Windows does not allocate a startup console'
-    & {
-        function Invoke-ProgressProcess {throw 'Cached launcher must not recompile'}
-        Assert ((Build-SetupLauncher -Directory $root) -eq $exe) 'Verified launcher cache avoids another compiler invocation'
-    }
+    $runnerSource=Get-SetupRunnerPath
+    Assert ((Split-Path $runnerSource -Leaf) -eq 'Run-Setup.ps1') 'Setup runner is a PowerShell source file'
+    Assert (-not $ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Build-SetupLauncher'},$false)) 'Builder has no executable compilation stage'
+    Assert (-not(Test-Path (Join-Path $repo 'data\SetupLauncher.cs'))) 'No custom EXE source remains in data'
     $fixture=@'
 param([switch]$RegisterOnly,[switch]$FirstLogon,[switch]$WaitForOobe,[switch]$ShowDebugWindow)
 $ErrorActionPreference='Stop'
 Add-Type 'using System; using System.Runtime.InteropServices; public static class ConsoleProbe { [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow(); }'
-$result=[ordered]@{
-    Script=$MyInvocation.MyCommand.Name
-    Directory=$PSScriptRoot
-    WorkingDirectory=$PWD.Path
-    ConsoleWindow=[ConsoleProbe]::GetConsoleWindow().ToInt64()
-    OutputCodePage=[Console]::OutputEncoding.CodePage
-    RegisterOnly=[bool]$RegisterOnly
-    FirstLogon=[bool]$FirstLogon
-    WaitForOobe=[bool]$WaitForOobe
-    ShowDebugWindow=[bool]$ShowDebugWindow
-}
-$result|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $PSScriptRoot 'result.json') -Encoding UTF8
-[Console]::WriteLine('fixture stdout')
-[Console]::WriteLine('Вывод для журнала')
-[Console]::Error.WriteLine('fixture stderr')
-exit ([int]$env:LAUNCHER_TEST_EXIT)
+[ordered]@{Script=$MyInvocation.MyCommand.Name;Directory=$PSScriptRoot;WorkingDirectory=$PWD.Path;ConsoleWindow=[ConsoleProbe]::GetConsoleWindow().ToInt64();RegisterOnly=[bool]$RegisterOnly;FirstLogon=[bool]$FirstLogon;WaitForOobe=[bool]$WaitForOobe;ShowDebugWindow=[bool]$ShowDebugWindow}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $PSScriptRoot 'result.json') -Encoding utf8
+[Console]::WriteLine('fixture stdout');[Console]::WriteLine('Вывод для журнала');[Console]::Error.WriteLine('fixture stderr')
+exit ([int]$env:RUNNER_TEST_EXIT)
 '@
-    $cases=@(
-        @{Mode='prepare';Script='Prepare.ps1';Flag='';Exit=17},
-        @{Mode='prepare-register';Script='Prepare.ps1';Flag='RegisterOnly';Exit=0},
-        @{Mode='finalize';Script='Finalize.ps1';Flag='FirstLogon';Exit=0},
-        @{Mode='finalize-wait';Script='Finalize.ps1';Flag='WaitForOobe';Exit=5},
-        @{Mode='guard';Script='guard.ps1';Flag='';Exit=0},
-        @{Mode='guard-debug';Script='guard.ps1';Flag='ShowDebugWindow';Exit=0}
-    )
-    foreach($case in $cases){
-        $dir=Join-Path $root ("$($case.Mode) папка & ' !")
-        $null=New-Item -ItemType Directory -Path $dir
-        $localExe=Join-Path $dir 'Win11Lite.Run.exe'
-        Copy-Item -LiteralPath $exe -Destination $localExe
-        [IO.File]::WriteAllText((Join-Path $dir $case.Script),$fixture,[Text.UTF8Encoding]::new($true))
-        $psi=[Diagnostics.ProcessStartInfo]::new()
-        $psi.FileName=$localExe;$psi.Arguments=$case.Mode;$psi.WorkingDirectory=$root
-        $psi.UseShellExecute=$false;$psi.CreateNoWindow=$true
-        $psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true
-        $psi.EnvironmentVariables['TEMP']=$dir;$psi.EnvironmentVariables['TMP']=$dir
-        $psi.EnvironmentVariables['LAUNCHER_TEST_EXIT']=[string]$case.Exit
+    foreach($case in @(@{Mode='prepare';Script='Prepare.ps1';Flag='';Exit=17},@{Mode='prepare-register';Script='Prepare.ps1';Flag='RegisterOnly';Exit=0},@{Mode='finalize';Script='Finalize.ps1';Flag='FirstLogon';Exit=0},@{Mode='finalize-wait';Script='Finalize.ps1';Flag='WaitForOobe';Exit=5},@{Mode='guard';Script='guard.ps1';Flag='';Exit=0},@{Mode='guard-debug';Script='guard.ps1';Flag='ShowDebugWindow';Exit=0})){
+        $directory=Join-Path $root ("$($case.Mode) папка & ' !");$null=New-Item -ItemType Directory -Path $directory
+        $runner=Join-Path $directory 'Run-Setup.ps1';Copy-Item -LiteralPath $runnerSource -Destination $runner
+        [IO.File]::WriteAllText((Join-Path $directory $case.Script),$fixture,[Text.UTF8Encoding]::new($true))
+        $psi=New-RunnerProcess $runner $case.Mode $directory;$psi.EnvironmentVariables['RUNNER_TEST_EXIT']=[string]$case.Exit
         $process=[Diagnostics.Process]::Start($psi)
         try{
             $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
-            if(-not $process.WaitForExit(20000)){$process.Kill();throw 'Fixture launcher timed out'}
-            Assert ($process.ExitCode -eq $case.Exit) "Child exit code reaches the caller ($($case.Mode))"
-            Assert ($stdout.GetAwaiter().GetResult().Length -eq 0 -and $stderr.GetAwaiter().GetResult().Length -eq 0) "No console output escapes the launcher ($($case.Mode))"
-            $actual=Get-Content -LiteralPath (Join-Path $dir 'result.json') -Raw|ConvertFrom-Json
-            Assert ($actual.ConsoleWindow -eq 0) "Child PowerShell actually has no console window ($($case.Mode))"
-            Assert ($actual.Script -eq $case.Script -and $actual.Directory -eq $dir -and $actual.WorkingDirectory -eq $dir) "Mode and quoted paths reach the intended fixture ($($case.Mode))"
-            $flags=@('RegisterOnly','FirstLogon','WaitForOobe','ShowDebugWindow')
-            Assert (@($flags|Where-Object{[bool]$actual.$_ -ne ($_ -eq $case.Flag)}).Count -eq 0) "Only the intended switch is passed ($($case.Mode))"
-            $log=Get-Content -LiteralPath (Join-Path $dir 'launcher.log') -Raw
-            Assert ($log -match 'fixture stdout' -and $log -match 'fixture stderr' -and $log -match "END ExitCode=$($case.Exit)") "Hidden output and completion remain in a file ($($case.Mode))"
-            Assert ($log.Contains('Вывод для журнала')) "Russian output remains readable in the launcher log ($($case.Mode)); child encoding=$($actual.OutputCodePage); log=$log"
+            if(-not $process.WaitForExit(30000)){$process.Kill();throw 'Runner fixture timed out'}
+            Assert ($process.ExitCode -eq $case.Exit) "Child exit code reaches the caller: $($case.Mode)"
+            Assert ($stdout.GetAwaiter().GetResult().Length -eq 0 -and $stderr.GetAwaiter().GetResult().Length -eq 0) 'Runner writes diagnostics to a file'
+            $actual=Get-Content -LiteralPath (Join-Path $directory 'result.json') -Raw|ConvertFrom-Json
+            Assert ($actual.ConsoleWindow -eq 0) 'Runner child has no console window'
+            Assert ($actual.Script -eq $case.Script -and $actual.Directory -eq $directory -and $actual.WorkingDirectory -eq $directory) 'Quoted paths and working directory reach the intended fixture'
+            Assert (@('RegisterOnly','FirstLogon','WaitForOobe','ShowDebugWindow'|Where-Object{[bool]$actual.$_ -ne ($_ -eq $case.Flag)}).Count -eq 0) 'Only the selected script switch is passed'
+            $log=Get-Content -LiteralPath (Join-Path $directory 'launcher.log') -Raw
+            Assert ($log.Contains('Вывод для журнала') -and $log -match 'fixture stdout' -and $log -match 'fixture stderr') 'Russian output and stderr remain readable'
+            Assert ($log -match "END ExitCode=$($case.Exit)") 'Completion status is logged'
         }finally{$process.Dispose()}
     }
-    # SetupComplete is a batch entry point: verify waiting and exit propagation.
-    $setupDir=Join-Path $root 'setupcomplete'
-    $null=New-Item -ItemType Directory -Path $setupDir
-    $localExe=Join-Path $setupDir 'Win11Lite.Run.exe';Copy-Item -LiteralPath $exe -Destination $localExe
-    [IO.File]::WriteAllText((Join-Path $setupDir 'Prepare.ps1'),'param([switch]$RegisterOnly) Start-Sleep -Milliseconds 400; exit 23',[Text.UTF8Encoding]::new($true))
+    $directory=Join-Path $root 'setupcomplete';$null=New-Item -ItemType Directory -Path $directory
+    $runner=Join-Path $directory 'Run-Setup.ps1';Copy-Item -LiteralPath $runnerSource -Destination $runner
+    [IO.File]::WriteAllText((Join-Path $directory 'Prepare.ps1'),'param([switch]$RegisterOnly) Start-Sleep -Milliseconds 400; exit 23',[Text.UTF8Encoding]::new($true))
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$setupComplete'},$true)
     . ([scriptblock]::Create($node.Extent.Text))
-    $setupComplete=$setupComplete.Replace('%SystemRoot%\Setup\Scripts\Win11Lite\Win11Lite.Run.exe',$localExe).Replace('%SystemRoot%\Setup\Scripts\Win11Lite\setupcomplete.log',(Join-Path $setupDir 'setupcomplete.log'))
-    $batch=Join-Path $setupDir 'SetupComplete.cmd';Write-WindowsBatchFile -Path $batch -Content $setupComplete
-    $psi=[Diagnostics.ProcessStartInfo]::new();$psi.FileName="$env:SystemRoot\System32\cmd.exe";$psi.Arguments='/d /s /c ""'+$batch+'""'
-    $psi.UseShellExecute=$false;$psi.CreateNoWindow=$true;$psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true
+    $setupComplete=$setupComplete.Replace('%SystemRoot%\Setup\Scripts\Win11Lite\Run-Setup.ps1',$runner).Replace('%SystemRoot%\Setup\Scripts\Win11Lite\setupcomplete.log',(Join-Path $directory 'setupcomplete.log'))
+    $batch=Join-Path $directory 'SetupComplete.cmd';Write-WindowsBatchFile -Path $batch -Content $setupComplete
+    $psi=[Diagnostics.ProcessStartInfo]::new();$psi.FileName=Join-Path $env:SystemRoot 'System32\cmd.exe';$psi.Arguments='/d /s /c ""'+$batch+'""';$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true
     $process=[Diagnostics.Process]::Start($psi)
-    try{if(-not $process.WaitForExit(15000)){$process.Kill();throw 'SetupComplete fixture timed out'};Assert ($process.ExitCode -eq 23) 'SetupComplete waits for the GUI process and preserves its exit code'}finally{$process.Dispose()}
-    foreach($mode in @('unknown','prepare extra','guard')){
-        $psi=[Diagnostics.ProcessStartInfo]::new();$psi.FileName=$exe;$psi.Arguments=$mode;$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true
-        $process=[Diagnostics.Process]::Start($psi)
-        try{if(-not $process.WaitForExit(5000)){$process.Kill();throw 'Invalid-mode fixture timed out'};Assert ($process.ExitCode -eq $(if($mode -eq 'guard'){2}else{87})) "Unsupported modes and missing scripts fail without a popup ($mode)"}finally{$process.Dispose()}
+    try{if(-not $process.WaitForExit(15000)){$process.Kill();throw 'SetupComplete fixture timed out'};Assert ($process.ExitCode -eq 23) 'SetupComplete waits for PowerShell and retains the script exit code'}finally{$process.Dispose()}
+    $empty=Join-Path $root 'empty';$null=New-Item -ItemType Directory -Path $empty
+    $runner=Join-Path $empty 'Run-Setup.ps1';Copy-Item -LiteralPath $runnerSource -Destination $runner
+    foreach($mode in 'unknown','prepare extra','guard'){
+        $process=[Diagnostics.Process]::Start((New-RunnerProcess $runner $mode $empty))
+        try{if(-not $process.WaitForExit(10000)){$process.Kill();throw 'Mode fixture timed out'};Assert ($process.ExitCode -eq $(if($mode -eq 'guard'){2}else{87})) 'Unknown modes, extra arguments and missing scripts fail'}finally{$process.Dispose()}
     }
+    $directory=Join-Path $root 'delayed-oobe';$null=New-Item -ItemType Directory -Path $directory
+    $source=[IO.File]::ReadAllText($runnerSource);$rt=$null;$re=$null;$runnerAst=[Management.Automation.Language.Parser]::ParseInput($source,[ref]$rt,[ref]$re)
+    $probe=$runnerAst.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Test-SetupOobeComplete'},$false)
+    $replacement='$script:ReadyAt=(Get-Date).AddSeconds(1); function Test-SetupOobeComplete { (Get-Date) -ge $script:ReadyAt }'
+    $source=$source.Remove($probe.Extent.StartOffset,$probe.Extent.EndOffset-$probe.Extent.StartOffset).Insert($probe.Extent.StartOffset,$replacement)
+    $runner=Join-Path $directory 'Run-Setup.ps1';[IO.File]::WriteAllText($runner,$source,[Text.UTF8Encoding]::new($true))
+    [IO.File]::WriteAllText((Join-Path $directory 'guard.ps1'),'param([switch]$ShowDebugWindow) exit 0',[Text.UTF8Encoding]::new($true))
+    $timer=[Diagnostics.Stopwatch]::StartNew();$process=[Diagnostics.Process]::Start((New-RunnerProcess $runner 'guard-debug' $directory))
+    try{
+        if(-not $process.WaitForExit(15000)){$process.Kill();throw 'OOBE fixture timed out'}
+        Assert ($process.ExitCode -eq 0 -and $timer.ElapsedMilliseconds -ge 900) 'Visible debug observer waits for OOBE completion'
+        $log=Get-Content -LiteralPath (Join-Path $directory 'launcher.log') -Raw
+        Assert ($log.IndexOf('WAIT OOBE') -ge 0 -and $log.IndexOf('WAIT OOBE') -lt $log.IndexOf('START PID')) 'OOBE gate precedes observer startup'
+    }finally{$process.Dispose()}
     & {
-        # Replace only the read-only OOBE API in a fixture build; production source is unchanged.
-        $script:ScriptRoot=Join-Path $root 'delayed-oobe-source';$null=New-Item -ItemType Directory -Path (Join-Path $script:ScriptRoot 'data')
-        $source=[IO.File]::ReadAllText((Join-Path $repo 'data\SetupLauncher.cs'))
-        $pattern='(?s)\[DllImport\("kernel32\.dll", SetLastError = true\)\]\s*\[return: MarshalAs\(UnmanagedType\.Bool\)\]\s*private static extern bool OOBEComplete\(\[MarshalAs\(UnmanagedType\.Bool\)\] out bool complete\);'
-        $substitute='private static readonly DateTime ReadyAt = DateTime.UtcNow.AddSeconds(1); private static bool OOBEComplete(out bool complete) { complete = DateTime.UtcNow >= ReadyAt; return true; }'
-        $modified=[regex]::Replace($source,$pattern,$substitute)
-        Assert ($modified -ne $source) 'Only the OOBE probe is replaced for the delayed-completion fixture'
-        [IO.File]::WriteAllText((Join-Path $script:ScriptRoot 'data\SetupLauncher.cs'),$modified)
-        $delayed=Build-SetupLauncher -Directory (Join-Path $root 'delayed-oobe-cache')
-        $dir=Split-Path $delayed -Parent
-        [IO.File]::WriteAllText((Join-Path $dir 'guard.ps1'),'param([switch]$ShowDebugWindow) exit 0',[Text.UTF8Encoding]::new($true))
-        $psi=[Diagnostics.ProcessStartInfo]::new();$psi.FileName=$delayed;$psi.Arguments='guard-debug';$psi.UseShellExecute=$false;$psi.CreateNoWindow=$true
-        $timer=[Diagnostics.Stopwatch]::StartNew();$process=[Diagnostics.Process]::Start($psi)
-        try{
-            if(-not $process.WaitForExit(10000)){$process.Kill();throw 'Delayed OOBE fixture timed out'}
-            Assert ($process.ExitCode -eq 0 -and $timer.ElapsedMilliseconds -ge 900) 'Debug observer waits for OOBE completion before launching'
-            $log=Get-Content -LiteralPath (Join-Path $dir 'launcher.log') -Raw
-            Assert ($log.IndexOf('WAIT OOBE') -ge 0 -and $log.IndexOf('WAIT OOBE') -lt $log.IndexOf('START PID')) 'OOBE gate runs before the observer PowerShell process exists'
-        }finally{$process.Dispose()}
-    }
-    & {
-        $script:ScriptRoot=Join-Path $root 'invalid-source';$null=New-Item -ItemType Directory -Path (Join-Path $script:ScriptRoot 'data')
-        [IO.File]::WriteAllText((Join-Path $script:ScriptRoot 'data\SetupLauncher.cs'),'invalid C# source')
-        Assert-Throws {Build-SetupLauncher -Directory (Join-Path $root 'invalid-cache')} 'Compiler failure is caught before image servicing'
-        Assert (-not (Read-PreparedCache -Directory (Join-Path $root 'invalid-cache\setup-launcher') -Key 'launcher')) 'Failed compilation never creates a ready cache entry'
-    }
-    Write-Host "PASS: $script:checks launcher checks; PowerShell $($PSVersionTable.PSVersion)"
-}finally{
-    $safe=[IO.Path]::GetFullPath((Join-Path $repo 'tmp')).TrimEnd('\')+'\launcher-tests-'
-    $full=[IO.Path]::GetFullPath($root)
-    if($full.StartsWith($safe,[StringComparison]::OrdinalIgnoreCase)){
-        for($attempt=0;$attempt -lt 5;$attempt++){
-            try{Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop;break}
-            catch{if($attempt -eq 4){throw};Start-Sleep -Milliseconds 250}
+        $ut=$null;$ue=$null;$updateAst=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'tools\Update-InstalledGuard.ps1'),[ref]$ut,[ref]$ue)
+        foreach($name in 'Convert-LegacySetupHook','Update-Win11LiteRuntime'){
+            $function=$updateAst.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
+            . ([scriptblock]::Create($function.Extent.Text))
+        }
+        $support=Join-Path $root 'installed\Win11Lite';$null=New-Item -ItemType Directory -Path $support
+        [IO.File]::WriteAllText((Join-Path $support 'build-info.json'),'{"BuildId":"fixture","Guard":true}')
+        [IO.File]::WriteAllText((Join-Path $support 'oobe-complete'),'yes')
+        [IO.File]::WriteAllText((Join-Path $support 'guard.ps1'),'# old guard')
+        $oldExe=Join-Path $support 'Win11Lite.Run.exe';[IO.File]::WriteAllText($oldExe,'inert fixture')
+        $oldPrepare=@'
+$exe = Join-Path $PSScriptRoot 'Win11Lite.Run.exe'
+$action=New-ScheduledTaskAction -Execute $exe -Argument 'finalize-wait'
+$action=New-ScheduledTaskAction -Execute $exe -Argument 'guard'
+$action=New-ScheduledTaskAction -Execute $exe -Argument 'guard-debug'
+'@
+        [IO.File]::WriteAllText((Join-Path $support 'Prepare.ps1'),$oldPrepare)
+        [IO.File]::WriteAllText((Join-Path $support 'Finalize.ps1'),'$exe = Join-Path $PSScriptRoot ''Win11Lite.Run.exe'''+"`r`n"+'Start-Process -FilePath $exe -WindowStyle Hidden -ArgumentList ''finalize-wait''')
+        $task=[pscustomobject]@{TaskName='win-11-lite guard';TaskPath='\';State='Disabled';Actions=@([pscustomobject]@{Execute=$oldExe;Arguments='guard'})}
+        $state=@{Updates=0}
+        function Get-ScheduledTask {param($ErrorAction)$task}
+        function Export-ScheduledTask {param($TaskName)'<Task />'}
+        function New-ScheduledTaskAction {param($Execute,$Argument)[pscustomobject]@{Execute=$Execute;Arguments=$Argument}}
+        function Set-ScheduledTask {param($TaskName,$Action,$ErrorAction)$task.Actions=@($Action);$state.Updates++}
+        $task.State='Running';$blocked=$false
+        try{Update-Win11LiteRuntime -SupportDirectory $support -SourceDirectory (Join-Path $repo 'data')|Out-Null}catch{$blocked=$true}
+        Assert ($blocked -and $state.Updates -eq 0 -and (Get-Content (Join-Path $support 'guard.ps1') -Raw) -eq '# old guard') 'VM updater waits for running tasks before making changes'
+        $task.State='Disabled'
+        $result=Update-Win11LiteRuntime -SupportDirectory $support -SourceDirectory (Join-Path $repo 'data')
+        Assert ($state.Updates -eq 1 -and $task.State -eq 'Disabled' -and $task.Actions[0].Arguments -match 'Run-Setup\.ps1" -Mode guard$') 'VM updater changes the action while preserving task state'
+        Assert ((Test-Path (Join-Path $result.Backup 'guard.ps1')) -and (Test-Path (Join-Path $result.Backup 'win-11-lite guard.xml'))) 'VM updater backs up scripts and task definitions'
+        Assert (-not(Test-Path $oldExe) -and (Test-Path (Join-Path $support 'Run-Setup.ps1'))) 'VM updater removes the obsolete EXE after installing its replacement'
+        foreach($file in 'Prepare.ps1','Finalize.ps1'){
+            $content=Get-Content (Join-Path $support $file) -Raw
+            Assert ($content -notmatch 'Win11Lite\.Run\.exe' -and $content -match 'Run-Setup\.ps1') 'Legacy support scripts no longer refer to the removed EXE'
         }
     }
+    Write-Host "PASS: $script:checks runner checks; PowerShell $($PSVersionTable.PSVersion)"
+}finally{
+    $full=[IO.Path]::GetFullPath($root);$base=[IO.Path]::GetFullPath((Join-Path $repo 'tmp')).TrimEnd('\')+'\runner-tests-'
+    if($full.StartsWith($base,[StringComparison]::OrdinalIgnoreCase)){for($attempt=0;$attempt -lt 5;$attempt++){try{Remove-Item -LiteralPath $full -Recurse -Force;break}catch{if($attempt -eq 4){throw};Start-Sleep -Milliseconds 250}}}
 }

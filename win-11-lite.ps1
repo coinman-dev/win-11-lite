@@ -1987,233 +1987,7 @@ timeout /t 3 >nul 2>&1
 }
 
 function Get-GuardScript {
-    @'
-#Requires -Version 5.1
-param([switch]$Watch, [switch]$ShowDebugWindow, [int]$WaitSeconds = 120)
-$ErrorActionPreference = 'Stop'
-$ProgressPreference = 'SilentlyContinue'
-$config = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'guard.json') -Raw | ConvertFrom-Json
-function T { param([string]$Ru, [string]$En) if ($config.Language -like 'ru*') { $Ru } else { $En } }
-$logFile = Join-Path $PSScriptRoot 'guard.log'
-if ($ShowDebugWindow) {
-    $setup = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\Setup' -ErrorAction Stop
-    if ($env:USERNAME -eq 'defaultuser0' -or $setup.OOBEInProgress -eq 1 -or $setup.SystemSetupInProgress -eq 1) { return }
-    $exe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    Start-Process -FilePath $exe -WindowStyle Normal -ArgumentList ('-NoExit -NoProfile -ExecutionPolicy Bypass -File "{0}\guard.ps1" -Watch' -f $PSScriptRoot)
-    return
-}
-if ($Watch) {
-    $Host.UI.RawUI.WindowTitle = 'win-11-lite guard - debug'
-    Write-Host (T 'Живой журнал guard. Проверки выполняются от SYSTEM.' 'Live guard log. Checks run as SYSTEM.') -ForegroundColor Cyan
-    Write-Host (T 'Это окно можно закрыть: работа guard продолжится.' 'Closing this window does not stop the guard.')
-    Write-Host $logFile
-    $deadline = (Get-Date).AddSeconds($WaitSeconds)
-    while (-not (Test-Path -LiteralPath $logFile)) {
-        if ((Get-Date) -ge $deadline) { Write-Host (T 'Журнал ещё не создан. Проверьте задачу win-11-lite guard.' 'No log was created. Check the win-11-lite guard task.') -ForegroundColor Yellow; return }
-        Start-Sleep -Seconds 1
-    }
-    Write-Host (T 'Последние записи и дальнейшие действия:' 'Recent records and subsequent activity:')
-    Get-Content -LiteralPath $logFile -Encoding UTF8 -Tail 60 -Wait | ForEach-Object {
-        $color = if ($_ -match '\[ERROR\]') { 'Red' } elseif ($_ -match '\[CHANGED\]|\[END\]') { 'Green' } elseif ($_ -match '\[SKIP\]|\[PENDING\]') { 'Yellow' } else { 'Gray' }
-        Write-Host $_ -ForegroundColor $color
-    }
-    return
-}
-function Write-GuardLog {
-    param([string]$Level, [string]$Message)
-    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Message"
-    $encoding = [Text.UTF8Encoding]::new($true)
-    [byte[]]$data = $encoding.GetBytes($line + [Environment]::NewLine)
-    # Windows PowerShell 5.1 Add-Content denies concurrent readers, including
-    # our Get-Content -Wait viewer. Open explicitly with shared read/write access.
-    $attempts = if ($counts.LogFailed) { 1 } else { 5 }
-    for ($attempt = 0; $attempt -lt $attempts; $attempt++) {
-        try {
-            $stream = [IO.File]::Open($logFile,[IO.FileMode]::Append,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite)
-            try {
-                [byte[]]$record = if ($stream.Length -eq 0) { $encoding.GetPreamble() + $data } else { $data }
-                $stream.Write($record,0,$record.Length)
-            } finally { $stream.Dispose() }
-            return
-        } catch {
-            $problem = $_.Exception.GetBaseException()
-            $code = $problem.HResult -band 0xFFFF
-            if ($code -in @(32,33) -and $attempt + 1 -lt $attempts) { Start-Sleep -Milliseconds 100; continue }
-            break
-        }
-    }
-    # A logging failure must never become a policy/service failure or abort the
-    # remaining checks. The GUI launcher captures stderr in launcher.log.
-    $counts.LogFailed++
-    try { [Console]::Error.WriteLine("[LOG ERROR] ${logFile}: $($problem.Message)`r`n$line") } catch { }
-}
-# takeown/icacls report problems on stderr. Under Windows PowerShell 5.1 with
-# ErrorActionPreference=Stop a redirected stderr line becomes an exception
-# before Remove-Item runs, so the preference is relaxed only inside this helper.
-function Grant-SystemAccess {
-    param([string]$Path, [switch]$Recurse)
-    $ErrorActionPreference = 'Continue'
-    if ($Recurse) {
-        & takeown.exe /F $Path /R /A /D Y *> $null
-        & icacls.exe $Path /grant '*S-1-5-18:(OI)(CI)F' /T /C /Q *> $null
-    } else {
-        & takeown.exe /F $Path /A *> $null
-        & icacls.exe $Path /grant '*S-1-5-18:F' /C /Q *> $null
-    }
-}
-function Test-GuardMatch {
-    param([string]$Name, [string[]]$Patterns)
-    foreach ($pattern in @($config.Protected)) { if ($pattern -and $Name -match $pattern) { return $false } }
-    foreach ($pattern in $Patterns) { if ($pattern -and $Name -match $pattern) { return $true } }
-    return $false
-}
-$counts = @{Checked=0;Changed=0;Pending=0;Failed=0;Skipped=0;LogFailed=0}
-function Invoke-GuardCheck {
-    param([string]$Label, [scriptblock]$Action)
-    $counts.Checked++
-    Write-GuardLog 'CHECK' $Label
-    try {
-        $result = & $Action
-        if ($result -eq 'changed') { $counts.Changed++; Write-GuardLog 'CHANGED' $Label }
-        elseif ($result -eq 'pending') { $counts.Pending++; Write-GuardLog 'PENDING' (T "$Label — требуется завершение обслуживания" "$Label - servicing still pending") }
-        elseif ($result -eq 'skipped') { $counts.Skipped++; Write-GuardLog 'SKIP' $Label }
-        else { Write-GuardLog 'OK' $Label }
-    } catch {
-        $counts.Failed++
-        Write-GuardLog 'ERROR' "$Label : $($_.Exception.Message)"
-    }
-}
-function Read-GuardInventory {
-    param([string]$Label, [scriptblock]$Read)
-    $counts.Checked++
-    Write-GuardLog 'CHECK' $Label
-    try { & $Read }
-    catch { $counts.Failed++; Write-GuardLog 'ERROR' "$Label : $($_.Exception.Message)" }
-}
-try { $runLock = [IO.File]::Open((Join-Path $PSScriptRoot 'guard.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
-catch [IO.IOException] { return }
-try {
-    Write-GuardLog 'START' (T "Проверка при входе; сборка $($config.BuildId)" "Logon check; build $($config.BuildId)")
-    $setup = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\Setup' -ErrorAction Stop
-    if ($setup.OOBEInProgress -eq 1 -or $setup.SystemSetupInProgress -eq 1) {
-        $counts.Skipped++
-        Write-GuardLog 'SKIP' (T 'OOBE ещё выполняется. Проверка продолжится при следующем входе.' 'OOBE is still running. Checks will run at the next logon.')
-    } else {
-        if ($config.RemoveEdge) {
-            Invoke-GuardCheck 'Edge' {
-                $browserPaths = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ } | Select-Object -Unique | ForEach-Object { Join-Path $_ 'Microsoft\Edge' }
-                $hadBrowser = @($browserPaths | Where-Object { Test-Path -LiteralPath $_ }).Count -gt 0
-                $global:LASTEXITCODE = 0
-                & (Join-Path $PSScriptRoot 'Finalize.ps1') -EdgeOnly
-                if ($LASTEXITCODE -ne 0) { throw (T 'Ошибка очистки Edge; см. finalize.log' 'Edge cleanup failed; see finalize.log') }
-                if (@($browserPaths | Where-Object { Test-Path -LiteralPath $_ }).Count) { throw (T 'Файлы Edge всё ещё присутствуют' 'Edge files are still present') }
-                if ($hadBrowser) { 'changed' } else { 'ok' }
-            }
-        }
-        foreach ($entry in @($config.Policies)) {
-            $parts = $entry -split '\|'; $path = $parts[0]; $name = $parts[1]; $want = [int]$parts[2]
-            Invoke-GuardCheck (T "Политика $name" "Policy $name") {
-                $current = (Get-ItemProperty -LiteralPath $path -Name $name -ErrorAction SilentlyContinue).$name
-                if ($null -ne $current -and [int]$current -eq $want) { return 'ok' }
-                if (-not (Test-Path -LiteralPath $path)) { New-Item -Path $path -Force | Out-Null }
-                Set-ItemProperty -LiteralPath $path -Name $name -Value $want -Type DWord -Force -ErrorAction Stop
-                $actual = (Get-ItemProperty -LiteralPath $path -Name $name -ErrorAction Stop).$name
-                if ($null -eq $actual -or [int]$actual -ne $want) { throw (T 'Значение не изменилось' 'Value did not change') }
-                'changed'
-            }
-        }
-        foreach ($svc in @($config.Services)) {
-            Invoke-GuardCheck (T "Служба $svc" "Service $svc") {
-                $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$svc"
-                if (-not (Test-Path -LiteralPath $key)) { return 'ok' }
-                $changed = $false
-                if ((Get-ItemProperty -LiteralPath $key -Name Start -ErrorAction Stop).Start -ne 4) {
-                    Set-ItemProperty -LiteralPath $key -Name Start -Value 4 -Type DWord -Force -ErrorAction Stop
-                    $changed = $true
-                }
-                $service = Get-Service -Name $svc -ErrorAction Stop
-                if ($service.Status -ne 'Stopped') {
-                    Stop-Service -Name $svc -Force -ErrorAction Stop
-                    $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(10))
-                    $changed = $true
-                }
-                if ((Get-ItemProperty -LiteralPath $key -Name Start -ErrorAction Stop).Start -ne 4) { throw (T 'Служба не отключена' 'Service is not disabled') }
-                if ($changed) { 'changed' } else { 'ok' }
-            }
-        }
-        if (@($config.Capabilities).Count) {
-            $capabilities = @(Read-GuardInventory (T 'Получение списка возможностей Windows' 'Reading Windows capabilities') { Get-WindowsCapability -Online -ErrorAction Stop })
-            foreach ($cap in @($capabilities | Where-Object { $_.State -eq 'Installed' })) {
-                if (-not (Test-GuardMatch $cap.Name $config.Capabilities)) { continue }
-                Invoke-GuardCheck (T "Возможность $($cap.Name)" "Capability $($cap.Name)") {
-                    $result = Remove-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop
-                    $state = (Get-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop).State
-                    if ($state -eq 'NotPresent' -or $state -eq 'Not Present') { return 'changed' }
-                    if ($result.RestartNeeded -or [string]$state -match 'Pending') { return 'pending' }
-                    throw (T "Возможность осталась: $state" "Capability remains: $state")
-                }
-            }
-        }
-        if (@($config.Apps).Count) {
-            $apps = @(Read-GuardInventory (T 'Получение списка приложений' 'Reading apps') { Get-AppxPackage -AllUsers -ErrorAction Stop })
-            foreach ($pkg in $apps) {
-                if (-not (Test-GuardMatch $pkg.Name $config.Apps)) { continue }
-                Invoke-GuardCheck (T "Приложение $($pkg.PackageFullName)" "App $($pkg.PackageFullName)") {
-                    Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop
-                    if (@(Get-AppxPackage -AllUsers -Name $pkg.Name -ErrorAction Stop | Where-Object { $_.PackageFullName -eq $pkg.PackageFullName }).Count) { 'pending' } else { 'changed' }
-                }
-            }
-            $provisioned = @(Read-GuardInventory (T 'Получение списка встроенных пакетов' 'Reading provisioned apps') { Get-AppxProvisionedPackage -Online -ErrorAction Stop })
-            foreach ($pkg in $provisioned) {
-                if (-not (Test-GuardMatch $pkg.DisplayName $config.Apps)) { continue }
-                Invoke-GuardCheck (T "Встроенный пакет $($pkg.PackageName)" "Provisioned app $($pkg.PackageName)") {
-                    Remove-AppxProvisionedPackage -Online -PackageName $pkg.PackageName -ErrorAction Stop | Out-Null
-                    if (@(Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object { $_.PackageName -eq $pkg.PackageName }).Count) { 'pending' } else { 'changed' }
-                }
-            }
-        }
-        $driveRoot = [IO.Path]::GetFullPath($env:SystemDrive + '\')
-        foreach ($relative in @($config.Paths)) {
-            Write-GuardLog 'CHECK' (T "Поиск $relative" "Checking $relative")
-            $pathErrors = @()
-            $items = @(Get-Item -Path (Join-Path $driveRoot $relative) -Force -ErrorAction SilentlyContinue -ErrorVariable pathErrors)
-            $readErrors = @($pathErrors | Where-Object { $_.CategoryInfo.Category -ne 'ObjectNotFound' })
-            foreach ($readError in $readErrors) { $counts.Failed++; Write-GuardLog 'ERROR' "$relative : $($readError.Exception.Message)" }
-            if (-not $items.Count -and -not $readErrors.Count) { $counts.Checked++; Write-GuardLog 'OK' (T "$relative отсутствует" "$relative is absent") }
-            foreach ($item in $items) {
-                Invoke-GuardCheck (T "Файл/каталог $($item.FullName)" "File/directory $($item.FullName)") {
-                    $full = [IO.Path]::GetFullPath($item.FullName)
-                    if (-not $full.StartsWith($driveRoot, [StringComparison]::OrdinalIgnoreCase) -or $full.TrimEnd('\') -eq $driveRoot.TrimEnd('\')) { throw (T 'Путь вне системного диска' 'Path is outside the system drive') }
-                    $cursor = $full
-                    while ($cursor) {
-                        if ((Get-Item -LiteralPath $cursor -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) { return 'skipped' }
-                        $cursor = Split-Path $cursor -Parent
-                    }
-                    Grant-SystemAccess -Path $full -Recurse:$item.PSIsContainer
-                    if ($item.PSIsContainer) {
-                        Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
-                    } else {
-                        Remove-Item -LiteralPath $full -Force -ErrorAction Stop
-                    }
-                    if (Test-Path -LiteralPath $full) { throw (T 'Объект остался после удаления' 'Object remains after removal') }
-                    'changed'
-                }
-            }
-        }
-    }
-} catch {
-    $counts.Failed++
-    Write-GuardLog 'ERROR' $_.Exception.Message
-} finally {
-    try { Write-GuardLog 'END' (T "Проверено $($counts.Checked); изменено $($counts.Changed); ожидают завершения $($counts.Pending); пропущено $($counts.Skipped); ошибок $($counts.Failed)" "Checked $($counts.Checked); changed $($counts.Changed); pending $($counts.Pending); skipped $($counts.Skipped); errors $($counts.Failed)") }
-    finally { $runLock.Dispose() }
-}
-if ($counts.LogFailed) {
-    try { [Console]::Error.WriteLine((T "[LOG ERROR] Не записано строк в guard.log: $($counts.LogFailed); строки переданы в stderr (launcher.log при штатном запуске)." "[LOG ERROR] Lines not written to guard.log: $($counts.LogFailed); forwarded to stderr (launcher.log during normal startup).")) } catch { }
-}
-if ($counts.Failed -or $counts.LogFailed) { exit 1 }
-exit 0
-'@
+    [IO.File]::ReadAllText((Join-Path $script:ScriptRoot 'data\guard.ps1'))
 }
 
 function Get-NativeToolVersion {
@@ -2311,29 +2085,12 @@ function Ensure-WimMountDriver {
     if (-not (Test-DismSuccess $code) -or -not (Test-Path $key)) { throw (T "Не удалось зарегистрировать WIMMount (код $code)" "Could not register WIMMount (exit code $code)") }
 }
 
-function Build-SetupLauncher {
-    param([string]$Directory)
-    $source = Join-Path $script:ScriptRoot 'data\SetupLauncher.cs'
-    $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
-    $dir = Join-Path $Directory 'setup-launcher'
-    $path = Join-Path $dir 'Win11Lite.Run.exe'
-    $cached = Read-PreparedCache -Directory $dir -Key 'launcher'
-    if ($cached -and $cached.Data.SourceSHA256 -eq $sourceHash -and 'Win11Lite.Run.exe' -in @($cached.Files.Name)) { return $path }
-    $compiler = @(
-        (Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'),
-        (Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe')
-    ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
-    if (-not $compiler) { throw (T 'Не найден компилятор .NET Framework для скрытого запуска служебных скриптов' '.NET Framework compiler for windowless setup scripts was not found') }
-    $null = New-Item -ItemType Directory -Path $dir -Force
-    $run = Invoke-ProgressProcess -Exe $compiler -Arguments @('/nologo','/target:winexe','/platform:x64','/optimize+',"/out:$path",$source) `
-        -Activity (T 'Подготовка скрытого запуска установочных скриптов' 'Preparing windowless setup script launcher')
-    if ($run.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw (T "Не удалось собрать служебный запускатель: $($run.Output -join ' ')" "Could not build the setup launcher: $($run.Output -join ' ')")
-    }
-    Write-PreparedCache -Directory $dir -Key 'launcher' -Files @($path) -Data @{ SourceSHA256=$sourceHash }
+function Get-SetupRunnerPath {
+    $path=Join-Path $script:ScriptRoot 'data\Run-Setup.ps1'
+    if(-not (Test-Path -LiteralPath $path -PathType Leaf)){throw (T 'Не найден data\Run-Setup.ps1 — скачайте полный репозиторий' 'data\Run-Setup.ps1 was not found - download the full repository')}
+    if($Guard -and -not(Test-Path -LiteralPath (Join-Path $script:ScriptRoot 'data\guard.ps1') -PathType Leaf)){throw (T 'Не найден data\guard.ps1 — скачайте полный репозиторий' 'data\guard.ps1 was not found - download the full repository')}
     $path
 }
-
 function Get-SetupSupportScripts {
     param([bool]$BlockNetwork, [bool]$RemoveEdge, [bool]$EnableGuard, [bool]$ManageOobe = $true, [string]$Language = 'en-US', [bool]$ShowGuardWindow = $true)
     $prepare = @'
@@ -2407,8 +2164,9 @@ if (__NETWORK__ -and -not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'oobe
 }
 try {
 $taskName = 'win-11-lite finalize'
-$exe = Join-Path $PSScriptRoot 'Win11Lite.Run.exe'
-$action = New-ScheduledTaskAction -Execute $exe -Argument 'finalize-wait'
+$exe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+$runnerArguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}\Run-Setup.ps1" -Mode ' -f $PSScriptRoot
+$action = New-ScheduledTaskAction -Execute $exe -Argument ($runnerArguments + 'finalize-wait')
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $trigger.Delay = 'PT30S'
 $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
@@ -2416,10 +2174,10 @@ $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatt
 $finalizeSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 3)
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $finalizeSettings -Force | Out-Null
 if (__GUARD__) {
-    $guardAction = New-ScheduledTaskAction -Execute $exe -Argument 'guard'
+    $guardAction = New-ScheduledTaskAction -Execute $exe -Argument ($runnerArguments + 'guard')
     Register-ScheduledTask -TaskName 'win-11-lite guard' -Action $guardAction -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
     if (__GUARDDEBUG__) {
-        $viewerAction = New-ScheduledTaskAction -Execute $exe -Argument 'guard-debug'
+        $viewerAction = New-ScheduledTaskAction -Execute $exe -Argument ($runnerArguments + 'guard-debug')
         $viewerPrincipal = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited
         $viewerTrigger = New-ScheduledTaskTrigger -AtLogOn
         $viewerTrigger.Delay = 'PT30S'
@@ -2489,8 +2247,8 @@ if (-not $EdgeOnly) {
         Write-FinalizeLog (T 'WAIT: первый вход ещё не подтверждает окончание OOBE' 'WAIT: first logon does not yet confirm OOBE completion')
         if ($FirstLogon) {
             # Не удерживаем FirstLogonCommands: это может задержать открытие рабочего стола.
-            $exe = Join-Path $PSScriptRoot 'Win11Lite.Run.exe'
-            Start-Process -FilePath $exe -WindowStyle Hidden -ArgumentList 'finalize-wait' | Out-Null
+            $exe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+            Start-Process -FilePath $exe -WindowStyle Hidden -ArgumentList ('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}\Run-Setup.ps1" -Mode finalize-wait' -f $PSScriptRoot) | Out-Null
         }
         return
     }
@@ -3474,7 +3232,7 @@ if (-not $DryRun) {
         }
     }
     # Обязательный локальный помощник готовится до любых изменений образа.
-    $setupLauncher = Build-SetupLauncher -Directory $UpdatesDir
+    $setupRunner = Get-SetupRunnerPath
     $script:DownloadsClosed = $true
     Write-Ok (T 'Все компоненты подготовлены. Дальнейшая сборка не требует интернета.' 'All components are prepared. The remaining build requires no internet connection.')
     if ($script:SkippedDownloads.Count) { Write-Note (T "Исключено по вашему выбору: $($script:SkippedDownloads -join '; ')" "Skipped by your choice: $($script:SkippedDownloads -join '; ')") }
@@ -4301,6 +4059,7 @@ if ($Guard) {
         Apps = @($guardAppx | Sort-Object -Unique)
         Protected = @($guardProtected | Sort-Object -Unique)
         Paths = @($guardFolders | Sort-Object -Unique)
+        TargetLabels = @($script:CapabilityRules | Where-Object { Test-GroupActive -RulePreset $_.Preset -Group $_.Group } | ForEach-Object { [ordered]@{Category='capability';Pattern=$_.Pattern;Name=$_.Desc} })
     }
     [IO.File]::WriteAllText((Join-Path $guardDir 'guard.json'), ($guardConfig | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($true))
     $guardScript = Get-GuardScript
@@ -4315,7 +4074,8 @@ if ($Guard) {
 $scriptsDir = Join-Path $mountDir 'Windows\Setup\Scripts'
 $supportDir = Join-Path $scriptsDir 'Win11Lite'
 $null = New-Item -ItemType Directory -Path $supportDir -Force
-Copy-Item -LiteralPath $setupLauncher -Destination (Join-Path $supportDir 'Win11Lite.Run.exe') -Force
+Copy-Item -LiteralPath $setupRunner -Destination (Join-Path $supportDir 'Run-Setup.ps1') -Force
+Remove-Item -LiteralPath (Join-Path $supportDir 'Win11Lite.Run.exe') -Force -ErrorAction SilentlyContinue
 $support = Get-SetupSupportScripts -BlockNetwork ($script:ManageOobe -and -not $NoOobeNetworkBlock) `
     -RemoveEdge (Test-GroupActive -RulePreset 'safe' -Group 'Edge') -EnableGuard ([bool]$Guard) `
     -ManageOobe $script:ManageOobe -Language $imgLang -ShowGuardWindow ([bool]$GuardDebug)
@@ -4342,7 +4102,7 @@ $buildInfo = [ordered]@{
     GuardDebug = [bool]($Guard -and $GuardDebug)
     OobeNetworkBlock = [bool]($script:ManageOobe -and -not $NoOobeNetworkBlock)
     OobeCompletionCheck = 'OOBEComplete'
-    SetupScriptLauncher = 'Win11Lite.Run.exe'
+    SetupScriptLauncher = 'PowerShell / Run-Setup.ps1'
     ServicingDismVersion = [string](Get-NativeToolVersion $script:Dism)
     AccountMode = $AccountMode
 } | ConvertTo-Json -Depth 4
@@ -4351,7 +4111,7 @@ $buildInfo = [ordered]@{
 Write-Ok (T "ID сборки: $($script:StartedAt.ToString('yyyyMMdd-HHmmss')) — записан в ISO и установленную Windows" "Build ID: $($script:StartedAt.ToString('yyyyMMdd-HHmmss')) - recorded in the ISO and installed Windows")
 $setupComplete = @"
 @echo off
-start "" /wait "%SystemRoot%\Setup\Scripts\Win11Lite\Win11Lite.Run.exe" prepare-register >> "%SystemRoot%\Setup\Scripts\Win11Lite\setupcomplete.log" 2>&1
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "%SystemRoot%\Setup\Scripts\Win11Lite\Run-Setup.ps1" -Mode prepare-register >> "%SystemRoot%\Setup\Scripts\Win11Lite\setupcomplete.log" 2>&1
 exit /b %errorlevel%
 "@
 Write-WindowsBatchFile -Path (Join-Path $scriptsDir 'SetupComplete.cmd') -Content $setupComplete
@@ -4549,7 +4309,7 @@ if ($Unattend -eq 'none') {
                 <RunSynchronousCommand wcm:action="add">
                     <Order>1</Order>
                     <Description>Prepare first logon and OOBE</Description>
-                    <Path>"%WINDIR%\Setup\Scripts\Win11Lite\Win11Lite.Run.exe" prepare</Path>
+                    <Path>"%WINDIR%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "%WINDIR%\Setup\Scripts\Win11Lite\Run-Setup.ps1" -Mode prepare</Path>
                 </RunSynchronousCommand>
             </RunSynchronous>
         </component>
@@ -4598,7 +4358,7 @@ if ($Unattend -eq 'none') {
                 <SynchronousCommand wcm:action="add">
                     <Order>1</Order>
                     <Description>Finish installation</Description>
-                    <CommandLine>"%SystemRoot%\Setup\Scripts\Win11Lite\Win11Lite.Run.exe" finalize</CommandLine>
+                    <CommandLine>"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "%SystemRoot%\Setup\Scripts\Win11Lite\Run-Setup.ps1" -Mode finalize</CommandLine>
                 </SynchronousCommand>
             </FirstLogonCommands>$localAccountXml
         </component>

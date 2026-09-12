@@ -2,6 +2,7 @@
 # Generated guard and task registration run with mocked Windows APIs only.
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
+$script:ScriptRoot=$repo
 $t=$null; $e=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'win-11-lite.ps1'),[ref]$t,[ref]$e)
 if($e.Count){throw ($e|Out-String)}
@@ -58,7 +59,7 @@ try{
         Assert ($worker.Principal.UserId -eq 'S-1-5-18' -and $worker.Principal.LogonType -eq 'ServiceAccount') 'Worker retains SYSTEM privileges'
         Assert ($worker.Trigger.AtLogOn -and $worker.Settings.MultipleInstances -eq 'IgnoreNew') 'Worker triggers on logon and prevents overlap'
         Assert ($viewer.Principal.GroupId -eq 'S-1-5-32-545' -and $viewer.Principal.RunLevel -eq 'Limited') 'Observer uses the interactive user group without elevation'
-        Assert ($viewer.Action.Argument -eq 'guard-debug' -and $viewer.Action.Execute -like '*\Win11Lite.Run.exe' -and $viewer.Trigger.AtLogOn) 'Debug task opens observer through the OOBE check without an extra console'
+        Assert ($viewer.Action.Argument -match 'Run-Setup\.ps1" -Mode guard-debug$' -and $viewer.Action.Execute -like '*\powershell.exe' -and $viewer.Trigger.AtLogOn) 'Debug task opens observer through the OOBE check without an extra console'
         $scripts=Get-SetupSupportScripts -BlockNetwork $false -RemoveEdge $true -EnableGuard $true -ShowGuardWindow $false
         [IO.File]::WriteAllText($prepare,$scripts.Prepare,[Text.UTF8Encoding]::new($true))
         & $prepare -RegisterOnly
@@ -67,7 +68,7 @@ try{
 
     & {
         $calls=[Collections.Generic.List[string]]::new()
-        $fixture=@{Oobe=0;Policy=1;DenyPolicy=$false;Cap='Installed';DenyCap=$false;PendingCap=$false;InventoryFails=$false;App=$true;Provisioned=$true;WatchReads=0;Launched=$false}
+        $fixture=@{Oobe=0;SetupReadFails=$false;Policy=1;MissingPolicy=$null;ServiceStart=4;DenyPolicy=$false;Cap='Installed';DenyCap=$false;PendingCap=$false;InventoryFails=$false;App=$true;Provisioned=$true;WatchReads=0;Launched=$false}
         $service=[pscustomobject]@{Status='Running'}
         $service | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value {param($Want,$Timeout)if($this.Status -ne $Want){throw 'Service did not stop'}}
         $oldDrive=$env:SystemDrive; $oldPf=$env:ProgramFiles; $oldPf86=${env:ProgramFiles(x86)}
@@ -82,15 +83,16 @@ try{
             $testConfig | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $configFile -Encoding UTF8
             function Get-ItemProperty {
                 param($LiteralPath,$Name,$ErrorAction)
-                if($LiteralPath -eq 'HKLM:\SYSTEM\Setup'){return [pscustomobject]@{OOBEInProgress=$fixture.Oobe;SystemSetupInProgress=0}}
-                if($LiteralPath -eq 'HKLM:\SOFTWARE\TestGuard'){return [pscustomobject]@{AllowTelemetry=$fixture.Policy}}
-                if($LiteralPath -like '*\Services\TestSvc'){return [pscustomobject]@{Start=4}}
+                if($LiteralPath -eq 'HKLM:\SYSTEM\Setup'){if($fixture.SetupReadFails){throw 'Setup state unavailable'};return [pscustomobject]@{OOBEInProgress=$fixture.Oobe;SystemSetupInProgress=0}}
+                if($LiteralPath -eq 'HKLM:\SOFTWARE\TestGuard'){return [pscustomobject]@{AllowTelemetry=$fixture.Policy;MissingSetting=$fixture.MissingPolicy}}
+                if($LiteralPath -like '*\Services\TestSvc'){return [pscustomobject]@{Start=$fixture.ServiceStart}}
                 throw "Unexpected registry read: $LiteralPath"
             }
-            function Set-ItemProperty {param($LiteralPath,$Name,$Value,$Type,[switch]$Force,$ErrorAction)if($fixture.DenyPolicy){throw 'Policy denied'};$fixture.Policy=$Value;$calls.Add('policy')}
+            function Set-ItemProperty {param($LiteralPath,$Name,$Value,$Type,[switch]$Force,$ErrorAction)if($fixture.DenyPolicy){throw 'Policy denied'};if($LiteralPath -like '*\Services\TestSvc'){$fixture.ServiceStart=$Value}elseif($Name -eq 'MissingSetting'){$fixture.MissingPolicy=$Value}else{$fixture.Policy=$Value};$calls.Add('policy')}
             function Test-Path {
                 [CmdletBinding()]param($LiteralPath,$Path)
                 $p=if($LiteralPath){$LiteralPath}else{$Path}
+                if($p -like '*\Services\MissingSvc'){return $false}
                 if($p -like 'HKLM:*'){return $true}
                 Microsoft.PowerShell.Management\Test-Path -LiteralPath $p
             }
@@ -126,10 +128,19 @@ try{
             Assert (-not (Test-Path -LiteralPath $remove)) 'Selected directory is removed'
             $text=Get-Content -LiteralPath $log -Raw
             Assert ($text -match '\[START\]' -and $text -match '\[END\]' -and $text -notmatch '\[ERROR\]') 'A successful run always records start and summary'
-            $fixture.Policy=1; $calls.Clear()
+            $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
+            Assert ($report.Complete -and -not $report.Errors -and $report.Summary.service.stopped -eq 1) 'Structured report distinguishes stopping an already disabled service'
+            Assert (@($report.Items|Where-Object{$_.Category -eq 'app' -and $_.Name -eq 'Microsoft.BingWeather' -and $_.Found -and $_.Outcome -eq 'removed'}).Count -eq 1) 'Report names apps that were found and successfully removed'
+            Assert (@($report.Items|Where-Object{$_.Repeated}).Count -eq 0) 'First report does not invent repeated changes'
+            $human=Get-Content -LiteralPath (Join-Path $root 'guard-report.txt') -Raw
+            Assert ($human -match 'SERVICES AND DRIVERS' -and $human -match 'Before: startup: disabled; state: running' -and $human -match 'successfully removed') 'Human report contains categories, names, previous state and actual outcomes'
+            $fixture.Policy=1;$fixture.ServiceStart=2;$service.Status='Running';$calls.Clear()
             & $guard
             Assert ($fixture.Policy -eq 0 -and $calls -contains 'policy') 'A second logon rechecks and repairs restored values'
             Assert ([regex]::Matches((Get-Content -LiteralPath $log -Raw),'\[START\]').Count -eq 2) 'Guard runs repeatedly rather than only once'
+            $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
+            Assert ($report.Summary.setting.Repeated -eq 1 -and $report.Summary.service.Repeated -eq 1 -and $report.Summary.service.disabled -eq 1) 'Prior successful observations prove repeated policy repair and service disabling'
+            Assert (@($report.Items|Where-Object{$_.Category -eq 'app' -and $_.Name -eq 'Microsoft.BingWeather' -and $_.Outcome -eq 'absent'}).Count -eq 1) 'Missing apps have explicit names and are not counted as removals'
 
             # Real shared reader: the old PS 5.1 Add-Content writer fails while
             # this handle is open, even though the reader permits writes.
@@ -149,6 +160,8 @@ try{
             $fixture.DenyPolicy=$false;$fixture.DenyCap=$false;$fixture.InventoryFails=$true;$fixture.App=$true
             & $guard
             Assert (-not $fixture.App -and $LASTEXITCODE -eq 1) 'Capability inventory failure does not prevent independent app checks'
+            $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
+            Assert (@($report.Items|Where-Object{$_.Category -eq 'capability' -and $_.Outcome -eq 'failed' -and $null -eq $_.Found}).Count -eq 1 -and @($report.Items|Where-Object{$_.Category -eq 'capability' -and $_.Outcome -eq 'absent'}).Count -eq 0) 'Unreadable inventory is reported as unknown rather than not found'
             Clear-Content -LiteralPath $log
             $fixture.InventoryFails=$false;$fixture.Cap='Installed';$fixture.PendingCap=$true
             & $guard
@@ -156,6 +169,8 @@ try{
             $fixture.Oobe=1;$fixture.Policy=1;$calls.Clear()
             & $guard
             Assert ($calls.Count -eq 0 -and $fixture.Policy -eq 1) 'OOBE logon performs no cleanup'
+            $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
+            Assert ($report.Deferred -and -not $report.Complete -and $report.Summary.setting.NotChecked -eq 1 -and $report.Summary.service.NotChecked -eq 1) 'Deferred reports list unexamined settings and services'
             $fixture.Oobe=0
 
             $outside=Join-Path $root 'outside-system'; $null=New-Item -ItemType Directory -Path $outside
@@ -171,7 +186,14 @@ try{
             & $guard
             Assert ($LASTEXITCODE -eq 1 -and (Test-Path -LiteralPath $marker)) 'A configured parent path cannot escape the system drive'
             $testConfig.Paths=@()
+            $testConfig.Services=@('TestSvc','MissingSvc')
+            $testConfig.Policies+=@('HKLM:\SOFTWARE\TestGuard|MissingSetting|0')
             $testConfig | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $configFile -Encoding UTF8
+
+            & $guard
+            $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
+            Assert ($report.Summary.setting.created -eq 1 -and @($report.Items|Where-Object{$_.Name -eq 'MissingSetting' -and $_.Found -eq $false -and $_.After -eq '0'}).Count -eq 1) 'Missing settings are distinguished from existing settings and record creation'
+            Assert (@($report.Items|Where-Object{$_.Name -eq 'MissingSvc' -and $_.Found -eq $false -and $_.Outcome -eq 'absent'}).Count -eq 1) 'Absent services are named explicitly'
 
             # A genuinely exclusive external lock cannot be bypassed. Logging
             # falls back to stderr while all mocked system checks still finish.
@@ -192,6 +214,15 @@ try{
             Assert $true 'Run lock is released after logging failures'
             & $guard
             Assert ($LASTEXITCODE -eq 0) 'The next run recovers after the external log lock is released'
+            $fixture.SetupReadFails=$true;$calls.Clear()
+            & $guard
+            $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
+            Assert ($LASTEXITCODE -eq 1 -and -not $report.Complete -and $report.Summary.setting.NotChecked -eq 2 -and $report.Summary.service.NotChecked -eq 2 -and $calls.Count -eq 0) 'Interrupted runs explicitly name work that was not performed'
+            $fixture.SetupReadFails=$false;$testConfig.Language='ru-RU'
+            $testConfig|ConvertTo-Json -Depth 5|Set-Content -LiteralPath $configFile -Encoding utf8
+            & $guard
+            $human=Get-Content -LiteralPath (Join-Path $root 'guard-report.txt') -Raw
+            Assert ($LASTEXITCODE -eq 0 -and $human.Contains('ИТОГ ПРОВЕРКИ GUARD') -and $human.Contains('уже отключена и остановлена') -and $human.Contains('MissingSvc: не найдено')) 'Russian report is readable and keeps exact object names'
 
             function Start-Process {param($FilePath,$WindowStyle,$ArgumentList)$fixture.Launched=$true;$fixture.WindowStyle=$WindowStyle;$fixture.Arguments=$ArgumentList}
             & $guard -ShowDebugWindow
