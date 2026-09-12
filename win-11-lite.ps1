@@ -619,6 +619,15 @@ $script:NeverRemove = @(
     'Microsoft-Windows-PhotoBasic'                                  # единственный просмотрщик картинок в LTSC
 )
 
+# Платформа Store/MSIX сохраняется в safe и balanced, включая зависимости.
+# Список также передаётся guard; состав агрессивного max не меняется.
+$script:AppPlatformProtected = @(
+    '^Microsoft\.(WindowsStore|StorePurchaseApp|DesktopAppInstaller)(_|$)'
+    '^Microsoft\.(VCLibs\.|UI\.Xaml\.|NET\.Native\.|WindowsAppRuntime\.)'
+    '^Microsoft\.Services\.Store\.Engagement(_|$)'
+    '^Microsoft\.(AAD\.BrokerPlugin|AccountsControl|Windows\.CloudExperienceHost|Windows\.AppResolverUX)(_|$)'
+)
+
 # Provisioned Appx на удаление.
 $script:AppxRules = @(
     @{ Preset = 'balanced'; Group = 'Defender'; Pattern = '^Microsoft\.SecHealthUI'; Desc = (T 'Интерфейс «Безопасность Windows»' 'Windows Security app') }
@@ -985,15 +994,42 @@ function ConvertFrom-DismList {
     $result | ForEach-Object { [PSCustomObject]$_ }
 }
 
+function Get-ProtectedPatterns {
+    $script:NeverRemove
+    if ($Preset -ne 'max') { $script:AppPlatformProtected }
+}
+
 function Test-Protected {
     param([string]$Name)
     foreach ($rule in ($script:CapabilityRules + $script:PackageRules)) {
         if ($Keep -contains $rule.Group -and $Name -match $rule.Pattern) { return $true }
     }
-    foreach ($p in $script:NeverRemove) {
+    foreach ($p in @(Get-ProtectedPatterns)) {
         if ($Name -match $p) { return $true }
     }
     $false
+}
+
+function Get-WindowsRelease {
+    param([int]$Build)
+    # Новые ветки не должны получать обновления от последней известной версии.
+    switch ($Build) {
+        22000 { '21H2' }
+        22621 { '22H2' }
+        22631 { '23H2' }
+        26100 { '24H2' }
+        26200 { '25H2' }
+        28000 { '26H1' }
+        default { throw (T "Неизвестная ветка Windows: $Build. Подбор обновлений для неё не настроен." "Unknown Windows build branch: $Build. Update selection is not configured for it.") }
+    }
+}
+
+function Get-EditionConfig {
+    param([string]$EditionId)
+    # EI.CFG допускает OEM/Retail, а признак Volume задаётся отдельно в [VL].
+    # Обычные Home/Pro не должны превращаться в корпоративный установочный носитель.
+    $volume = if ($EditionId -match '^(Enterprise|Education|IoTEnterpriseS)') { 1 } else { 0 }
+    "[EditionID]`r`n$EditionId`r`n`r`n[Channel]`r`nRetail`r`n`r`n[VL]`r`n$volume`r`n"
 }
 
 # Активна ли группа удаления при текущем пресете и -Keep.
@@ -3112,17 +3148,13 @@ elseif ($imgVersion -match '^(\d{5})') { $buildNumber = [int]$matches[1] }
 $imgRevision = ''
 if ($imgVersion -match '(\d{5}\.\d+)') { $imgRevision = $matches[1] }
 
-$winVersion = switch ($buildNumber) {
-    { $_ -ge 26200 } { '25H2'; break }
-    { $_ -ge 26100 } { '24H2'; break }
-    { $_ -ge 22631 } { '23H2'; break }
-    { $_ -ge 22621 } { '22H2'; break }
-    { $_ -ge 22000 } { '21H2'; break }
-    default          { '24H2' }
-}
+$winVersion = Get-WindowsRelease -Build $buildNumber
 
 Write-Ok (T "Выбран индекс $srcIndex — $($selected.Name)" "Selected index $srcIndex - $($selected.Name)")
 Write-Ok (T "Редакция: $($selected.EditionId)   Язык: $imgLang   Билд: $imgVersion   ($winVersion)" "Edition: $($selected.EditionId)   Language: $imgLang   Build: $imgVersion   ($winVersion)")
+if ($buildNumber -eq 28000) {
+    Write-Note (T '26H1 x64: экспериментальная сборка. Обслуживание DISM и установка Home/Pro с локальной учётной записью ещё не проверены в VM; ADK 26100 официально рассчитан на 24H2/25H2.' '26H1 x64: experimental build. DISM servicing and Home/Pro setup with a local account have not been verified in a VM; ADK 26100 officially supports 24H2/25H2.')
+}
 
 $mozLang = $script:MozillaLang[$imgLang]
 if (-not $mozLang) { $mozLang = ($imgLang -split '-')[0] }
@@ -3338,7 +3370,7 @@ $vLang = if ($AddLanguage) {
     $src = if ($DownloadLanguage -and $DryRun) { T ' — скачать' ' - download' } else { (T ' — из ' ' - from ') + (Split-Path $LanguageSource -Leaf) }
     (T 'добавить ' 'add ') + ($AddLanguage -join ', ') + $src
 } else { T "только $imgLang  (добавить: -DownloadLanguage ru-RU)" "$imgLang only  (add with -DownloadLanguage ru-RU)" }
-$vSetup = if ($LegacySetup) { T 'классический (winpeshl.ini /legacy)' 'classic (winpeshl.ini /legacy)' } else { T 'штатный для 24H2 (ConX)' 'stock 24H2 (ConX)' }
+$vSetup = if ($LegacySetup) { T 'классический (winpeshl.ini /legacy)' 'classic (winpeshl.ini /legacy)' } else { T "штатный для $winVersion (ConX)" "stock $winVersion (ConX)" }
 $vWinRE = if ($RemoveWinRE) {
     $copyNote = if ($SaveWinRE) { T ', копия рядом с ISO' ', copy saved next to the ISO' } else { T ', без копии' ', no copy kept' }
     if ($LegacySetup) { (T 'удалить' 'remove') + $copyNote }
@@ -3347,7 +3379,7 @@ $vWinRE = if ($RemoveWinRE) {
 $vSources = if ($TrimSources) { T 'урезать до boot.wim + install + EI.CFG' 'trim to boot.wim + install + EI.CFG' } else { T 'как в оригинале' 'as in the original' }
 $vCleanup = if ($Preset -eq 'safe') { T 'нет' 'none' } elseif ($ResetBase) { 'StartComponentCleanup + ResetBase' } else { 'StartComponentCleanup' }
 $vBypass = if (-not $NoBypass) { T 'да' 'yes' } else { T 'нет' 'no' }
-$vWinget = if ($WithWinget) { T 'встроить' 'embed' } else { T 'нет  (включить: -WithWinget)' 'no  (enable with -WithWinget)' }
+$vWinget = if ($WithWinget) { T 'встроить' 'embed' } else { T 'из исходного образа, если есть  (добавить: -WithWinget)' 'keep the source version if present  (add with -WithWinget)' }
 $vUpd = "$UpdateMode" + $(if ($UpdateMode -eq 'none') { T '  (встроить последние: -WithUpdates)' '  (embed latest with -WithUpdates)' })
 
 Write-Host (T "  Языки          : $vLang" "  Languages      : $vLang")
@@ -3365,6 +3397,7 @@ Write-Host (T "  Очистка склада : $vCleanup" "  Store cleanup  : $v
 Write-Host (T "  Обход TPM/SB   : $vBypass" "  TPM/SB bypass  : $vBypass")
 $vGuard = if ($Guard) { T 'встроить (проверка при каждом входе)' 'embed (checks at every logon)' } else { T 'нет  (включить: -Guard)' 'no  (enable with -Guard)' }
 Write-Host (T "  winget         : $vWinget" "  winget         : $vWinget")
+if ($Preset -ne 'max') { Write-Host (T '  Store / MSIX   : сохранить имеющиеся Store, App Installer и зависимости' '  Store / MSIX   : preserve existing Store, App Installer and dependencies') }
 Write-Host (T "  Сторож         : $vGuard" "  Guard          : $vGuard")
 if ($Guard) { Write-Host (T "  Окно guard     : $([bool]$GuardDebug) (выключить: -GuardDebug:`$false)" "  Guard window   : $([bool]$GuardDebug) (disable: -GuardDebug:`$false)") }
 Write-Host (T "  Обновления     : $vUpd" "  Updates        : $vUpd")
@@ -3739,6 +3772,7 @@ foreach ($rule in $script:AppxRules) {
 
 $removedAppx = 0
 foreach ($app in $appx) {
+    if (Test-Protected $app.DisplayName) { continue }
     foreach ($pattern in $patterns) {
         if ($app.DisplayName -match $pattern) {
             $r = Invoke-Dism -Arguments @("/Image:$mountDir", '/Remove-ProvisionedAppxPackage', "/PackageName:$($app.PackageName)") -AllowFail -Quiet
@@ -4074,7 +4108,7 @@ if ($Guard) {
     $guardAppx = @($script:AppxRules | Where-Object { Test-GroupActive -RulePreset $_.Preset -Group $_.Group } | ForEach-Object { $_.Pattern })
     $guardCaps = @($script:CapabilityRules | Where-Object { Test-GroupActive -RulePreset $_.Preset -Group $_.Group } | ForEach-Object { $_.Pattern }) + @($RemoveExtra)
     if (Test-GroupActive -RulePreset 'balanced' -Group 'AI') { $guardCaps += '^Hello\.Face\.' }
-    $guardProtected = @($script:NeverRemove) + @($script:CapabilityRules + $script:PackageRules | Where-Object { $Keep -contains $_.Group } | ForEach-Object { $_.Pattern })
+    $guardProtected = @(Get-ProtectedPatterns) + @($script:CapabilityRules + $script:PackageRules | Where-Object { $Keep -contains $_.Group } | ForEach-Object { $_.Pattern })
     # Sense сохраняет Permanent-пакет CBS; его службы и файлы проверяются отдельно.
     $guardProtected += '^Microsoft\.Windows\.Sense\.Client~'
 
@@ -4318,21 +4352,12 @@ if ($TrimSources) {
 
 # --- EI.CFG: редакция и канал ---
 # Без него установщик спрашивает ключ продукта, чтобы понять, что ставить.
-# Файл сообщает: редакция такая-то, канал корпоративный — ключ не нужен.
+# Файл задаёт выбранную редакцию; запрос ключа управляется answer-файлом.
 $eiCfgPath = Join-Path $isoDir 'sources\EI.CFG'
 if (-not (Test-Path -LiteralPath $eiCfgPath)) {
-    $eiCfg = @"
-[EditionID]
-$($selected.EditionId)
-
-[Channel]
-Volume
-
-[VL]
-1
-"@
+    $eiCfg = Get-EditionConfig -EditionId $selected.EditionId
     [IO.File]::WriteAllText($eiCfgPath, $eiCfg, [Text.Encoding]::ASCII)
-    Write-Ok (T "EI.CFG создан: редакция $($selected.EditionId), канал Volume" "EI.CFG created: edition $($selected.EditionId), Volume channel")
+    Write-Ok (T "EI.CFG создан для редакции $($selected.EditionId)" "EI.CFG created for edition $($selected.EditionId)")
 } else {
     Write-Ok (T 'EI.CFG уже есть в образе — оставляю как есть' 'EI.CFG already present in the image - left as is')
 }

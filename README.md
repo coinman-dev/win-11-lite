@@ -32,6 +32,8 @@ PowerShell-сборщик облегчённого установочного IS
 
 Индекс зависит от ISO. При запуске без `-Index` скрипт показывает доступные редакции, если их несколько. Вместо индекса можно указать `-Edition`, например `IoTEnterpriseS`.
 
+Для обычных Home/Pro в `balanced` сохраняются имеющиеся Microsoft Store, App Installer (установка `.msix` двойным щелчком), библиотеки и службы приложений. `-WithWinget` добавляет пакет отдельно; его отсутствие не удаляет встроенный App Installer/winget. Проверенный исходный ISO 26H1 содержит эти компоненты в обеих редакциях. Ветка 28000 определяется как 26H1, но полная установка ещё не проверена: [подробный разбор совместимости](COMPATIBILITY.md).
+
 Сборка с русской Windows и русским установщиком:
 
 ```powershell
@@ -124,10 +126,10 @@ Get-Help .\win-11-lite.ps1 -Full
 
 ## Проверки
 
-На 12.09.2026 прошли **567 проверок на каждой версии PowerShell**: 5.1 и 7. Наборы выполняются отдельными процессами; системные API, сеть и DISM в соответствующих тестах подменены. Тест запуска компилирует настоящий GUI EXE и запускает безопасные сценарии с проверкой отсутствия консоли и передачи кодов возврата.
+На 12.09.2026 проект содержит **636 проверок на каждую версию PowerShell**: 5.1 и 7. Последние изменения проверены основным набором (164), guard (41) и совместимостью Home/Pro, Store/MSIX (61); остальные ранее прошедшие наборы не изменены. Наборы выполняются отдельными процессами; системные API, сеть и DISM в соответствующих тестах подменены. Тест запуска компилирует настоящий GUI EXE и запускает безопасные сценарии с проверкой отсутствия консоли и передачи кодов возврата.
 
 ```powershell
-$suites = 'Test-Win11Lite', 'Test-WindowsBatch', 'Test-Guard', 'Test-Downloads', 'Test-SetupLanguage', 'Test-OobeNetwork', 'Test-SetupLauncher'
+$suites = 'Test-Win11Lite', 'Test-WindowsBatch', 'Test-Guard', 'Test-Downloads', 'Test-SetupLanguage', 'Test-OobeNetwork', 'Test-SetupLauncher', 'Test-Compatibility'
 foreach ($suite in $suites) {
     powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ".\tests\$suite.ps1"
     if ($LASTEXITCODE -ne 0) { throw "Не прошёл $suite" }

@@ -7,12 +7,12 @@ $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'win-11
 if($e.Count){throw ($e|Out-String)}
 $script:checks=0
 function Assert([bool]$Value,[string]$Message){if(-not $Value){throw "FAIL: $Message"};$script:checks++}
-foreach($name in @('T','Test-GroupActive','Get-GuardScript','Get-SetupSupportScripts')){
+foreach($name in @('T','Test-GroupActive','Get-ProtectedPatterns','Get-GuardScript','Get-SetupSupportScripts')){
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     . ([scriptblock]::Create($node.Extent.Text))
 }
 $script:Lang='en'; $script:ImageLanguages=@('en-US'); $AddLanguage=@(); $DownloadLanguage=@(); $RemoveExtra=@(); $Keep=@(); $Preset='balanced'; $imgLang='en-US'; $script:StartedAt=Get-Date
-foreach($name in @('CapabilityRules','PackageRules','FolderRules','FileRules','AppxRules','NeverRemove','DisableServices','AiFolderPatterns')){
+foreach($name in @('CapabilityRules','PackageRules','FolderRules','FileRules','AppxRules','NeverRemove','AppPlatformProtected','DisableServices','AiFolderPatterns')){
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq ('$script:'+$name)},$false)
     . ([scriptblock]::Create($node.Extent.Text))
 }
@@ -30,6 +30,10 @@ try{
     Assert (@($cfg.Capabilities | Where-Object {'App.StepsRecorder~~~~0.0.1.0' -match $_}).Count -gt 0) 'Build capability rules reach guard'
     Assert (-not @($cfg.Paths | Where-Object {$_ -match 'EdgeWebView|NativeImages|WinSxS\\Backup'}).Count) 'Balanced guard preserves WebView2, NGEN and component backups'
     Assert (@($cfg.Protected | Where-Object {'Microsoft.Windows.Sense.Client~~~~' -match $_}).Count -gt 0) 'Guard does not repeatedly uninstall permanent Sense capability'
+    foreach($name in 'Microsoft.WindowsStore','Microsoft.StorePurchaseApp','Microsoft.DesktopAppInstaller','Microsoft.UI.Xaml.2.8','Microsoft.VCLibs.140.00.UWPDesktop','Microsoft.NET.Native.Runtime.2.2','Microsoft.WindowsAppRuntime.1.7'){
+        Assert (@($cfg.Protected | Where-Object {$name -match $_}).Count -gt 0) "Balanced app platform protection reaches guard: $name"
+    }
+    Assert (-not @($cfg.Services | Where-Object {$_ -in @('AppXSvc','ClipSVC','InstallService','LicenseManager','StateRepository','AppReadiness','TokenBroker','BITS','wuauserv','DoSvc','mpssvc')}).Count) 'Guard does not disable application deployment, licensing or Store download services'
     $Keep=@('Apps','Speech'); $RemoveExtra=@('^Language')
     & ([scriptblock]::Create($node.Extent.Text))
     $kept=Get-Content -LiteralPath (Join-Path $guardDir 'guard.json') -Raw | ConvertFrom-Json
