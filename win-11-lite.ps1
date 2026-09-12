@@ -1727,6 +1727,18 @@ function Write-WindowsBatchFile {
     [IO.File]::WriteAllText($Path, $text, [Text.UTF8Encoding]::new($false))
 }
 
+function Write-FirefoxInstallerFile {
+    param([string]$Path, [string]$Content)
+    Write-WindowsBatchFile -Path $Path -Content $Content
+    # Общий рабочий стол читается обычными пользователями. Разрешаем удалить
+    # только этот одноразовый файл, чтобы не запрашивать UAC после установки.
+    $acl = Get-Acl -LiteralPath $Path
+    $users = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+    $rule = [Security.AccessControl.FileSystemAccessRule]::new($users, [Security.AccessControl.FileSystemRights]::Delete, [Security.AccessControl.AccessControlType]::Allow)
+    $null = $acl.AddAccessRule($rule)
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
 function Get-FirefoxInstallerCommand {
     param([string]$Language = 'en-US', [ValidatePattern('^[a-zA-Z0-9-]+$')][string]$MozillaLanguage = 'en-US')
     $ru = $Language -like 'ru*'
@@ -1738,7 +1750,7 @@ function Get-FirefoxInstallerCommand {
     $done = if ($ru) { 'Готово.' } else { 'Done.' }
     @"
 @echo off
-setlocal
+setlocal DisableDelayedExpansion
 chcp 65001 >nul
 title Install Firefox
 echo.
@@ -1748,7 +1760,7 @@ where winget >nul 2>&1
 if not errorlevel 1 (
     echo  $tryWinget
     winget install --id Mozilla.Firefox -e --accept-package-agreements --accept-source-agreements
-    if not errorlevel 1 goto :done
+    if errorlevel 0 if not errorlevel 1 goto :done
     echo.
     echo  $fallback
 )
@@ -1772,7 +1784,7 @@ if not "%FFRESULT%"=="0" (
 echo.
 echo  $done
 timeout /t 3 >nul 2>&1
-exit /b 0
+(goto) 2>nul & del /f /q "%~f0" >nul 2>&1
 "@
 }
 
@@ -1987,17 +1999,52 @@ param([switch]$RegisterOnly)
 $ErrorActionPreference = 'Stop'
 function T { param([string]$Ru, [string]$En) if ('__LANG__' -like 'ru*') { $Ru } else { $En } }
 $log = Join-Path $PSScriptRoot 'prepare.log'
-function Write-PrepareLog { param([string]$Message) "$(Get-Date -Format s) $Message" | Add-Content -LiteralPath $log -Encoding UTF8 }
+function Write-PrepareLog {
+    param([string]$Message)
+    try { "$(Get-Date -Format s) $Message" | Add-Content -LiteralPath $log -Encoding UTF8 }
+    catch { Write-Warning $Message }
+}
+Write-PrepareLog (T "START: RegisterOnly=$RegisterOnly; пользователь=$env:USERNAME" "START: RegisterOnly=$RegisterOnly; user=$env:USERNAME")
 # The answer file calls Finalize.ps1 directly at the first real user logon.
 # Scheduler availability during specialize must not prevent network blocking.
-if (-not $RegisterOnly -and __NETWORK__) {
+if (__NETWORK__ -and -not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'oobe-complete'))) {
+    # Блок действует и для интерфейсов, которые PnP добавит после specialize.
+    # SetupComplete повторяет проверку: RegisterOnly больше не пропускает сеть.
+    $firewallName = 'Win11Lite-OOBE-Temporary-Outbound-Block'
+    $firewallReady = $false
+    try {
+        $rule = Get-NetFirewallRule -Name $firewallName -PolicyStore PersistentStore -ErrorAction SilentlyContinue
+        if ($rule) {
+            Set-NetFirewallRule -Name $firewallName -PolicyStore PersistentStore -Enabled True -Direction Outbound -Action Block -Profile Any | Out-Null
+        } else {
+            New-NetFirewallRule -Name $firewallName -DisplayName $firewallName -PolicyStore PersistentStore -Enabled True -Direction Outbound -Action Block -Profile Any | Out-Null
+        }
+        $firewallReady = $true
+        Write-PrepareLog (T 'OOBE: временная блокировка исходящей сети включена' 'OOBE: temporary outbound network block enabled')
+    } catch {
+        Write-PrepareLog (T "OOBE: блокировка брандмауэра недоступна: $($_.Exception.Message); проверяю адаптеры" "OOBE: firewall block unavailable: $($_.Exception.Message); checking adapters")
+    }
     $statePath = Join-Path $PSScriptRoot 'network-state.clixml'
     $saved = @()
     if (Test-Path -LiteralPath $statePath) { $saved = @(Import-Clixml -LiteralPath $statePath) }
-    $adapters = @(Get-NetAdapter -IncludeHidden | Where-Object { [string]$_.AdminStatus -in @('Up', '1') })
+    $allAdapters = @()
+    for ($attempt = 0; $attempt -lt 15; $attempt++) {
+        try { $allAdapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop) }
+        catch {
+            if ($attempt -eq 14) {
+                Write-PrepareLog (T "OOBE: ошибка получения адаптеров: $($_.Exception.Message)" "OOBE: adapter enumeration failed: $($_.Exception.Message)")
+                if ($firewallReady) { break }
+                throw
+            }
+        }
+        if ($allAdapters.Count) { break }
+        if ($attempt -lt 14) { Start-Sleep -Seconds 1 }
+    }
+    $adapters = @($allAdapters | Where-Object { [string]$_.AdminStatus -in @('Up', '1') })
     $saved = @(@($saved) + @($adapters | Select-Object InterfaceGuid) | Sort-Object InterfaceGuid -Unique)
     Export-Clixml -LiteralPath $statePath -InputObject $saved
     foreach ($adapter in $adapters) { $adapter | Disable-NetAdapter -Confirm:$false }
+    foreach ($adapter in $adapters) { Write-PrepareLog (T "OOBE: отключён $($adapter.Name), GUID=$($adapter.InterfaceGuid)" "OOBE: disabled $($adapter.Name), GUID=$($adapter.InterfaceGuid)") }
     $changedIds = @($adapters | ForEach-Object { [string]$_.InterfaceGuid })
     for ($attempt = 0; $attempt -lt 5; $attempt++) {
         $remaining = @(Get-NetAdapter -IncludeHidden | Where-Object { [string]$_.InterfaceGuid -in $changedIds -and [string]$_.AdminStatus -in @('Up','1') })
@@ -2010,16 +2057,21 @@ if (-not $RegisterOnly -and __NETWORK__) {
         throw $message
     }
     Write-PrepareLog (T "OOBE: отключено адаптеров $($adapters.Count); сохранено для восстановления $($saved.Count)" "OOBE: $($adapters.Count) adapters disabled; $($saved.Count) saved for restoration")
+    if (-not $allAdapters.Count) {
+        if (-not $firewallReady) { throw (T 'OOBE: нет доступных адаптеров и не удалось установить сетевой блок; отключение сети не подтверждено' 'OOBE: no adapters are available and firewall blocking failed; network isolation is unconfirmed') }
+        Write-PrepareLog (T 'OOBE: адаптеры пока не появились; остаётся временный сетевой блок, SetupComplete повторит проверку' 'OOBE: no adapters have appeared yet; temporary network block remains and SetupComplete will retry')
+    }
 }
 try {
 $taskName = 'win-11-lite finalize'
 $exe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-$action = New-ScheduledTaskAction -Execute $exe -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}\Finalize.ps1"' -f $PSScriptRoot)
+$action = New-ScheduledTaskAction -Execute $exe -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}\Finalize.ps1" -WaitForOobe' -f $PSScriptRoot)
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $trigger.Delay = 'PT30S'
 $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 20)
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+$finalizeSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 3)
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $finalizeSettings -Force | Out-Null
 if (__GUARD__) {
     $guardAction = New-ScheduledTaskAction -Execute $exe -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}\guard.ps1"' -f $PSScriptRoot)
     Register-ScheduledTask -TaskName 'win-11-lite guard' -Action $guardAction -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
@@ -2043,21 +2095,74 @@ Write-PrepareLog (T 'Задачи первого входа зарегистри
 '@
     $finalize = @'
 #Requires -Version 5.1
-param([switch]$EdgeOnly, [switch]$FirstLogon)
+param([switch]$EdgeOnly, [switch]$FirstLogon, [switch]$WaitForOobe, [ValidateRange(1,86400)][int]$WaitSeconds = 7200)
 $ErrorActionPreference = 'Stop'
 function T { param([string]$Ru, [string]$En) if ('__LANG__' -like 'ru*') { $Ru } else { $En } }
 $log = Join-Path $PSScriptRoot 'finalize.log'
-if ($FirstLogon -and $env:USERNAME -eq 'defaultuser0') { return }
-if (-not $EdgeOnly -and -not $FirstLogon) {
-    # defaultuser0 can log on during OOBE. Keep the task for the real user logon.
-    $setupState = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\Setup' -ErrorAction Stop
-    if ($setupState.OOBEInProgress -eq 1 -or $setupState.SystemSetupInProgress -eq 1) { return }
+function Write-FinalizeLog {
+    param([string]$Message)
+    try { "$(Get-Date -Format s) $Message" | Add-Content -LiteralPath $log -Encoding UTF8 }
+    catch { Write-Warning $Message }
+}
+function Test-OobeComplete {
+    try {
+    if (-not ('Win11Lite.OobeStatus' -as [type])) {
+        Add-Type -TypeDefinition @"
+using System.Runtime.InteropServices;
+namespace Win11Lite {
+    public static class OobeStatus {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool OOBEComplete([MarshalAs(UnmanagedType.Bool)] out bool complete);
+    }
+}
+"@
+    }
+    $complete = $false
+    if (-not [Win11Lite.OobeStatus]::OOBEComplete([ref]$complete)) {
+        throw (T "Не удалось проверить окончание OOBE: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" "Could not query OOBE completion: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())")
+    }
+    return $complete
+    } catch {
+        if ($script:OobeProbeError -ne $_.Exception.Message) {
+            Write-FinalizeLog (T "WAIT: состояние OOBE недоступно: $($_.Exception.Message)" "WAIT: OOBE state unavailable: $($_.Exception.Message)")
+        }
+        $script:OobeProbeError = $_.Exception.Message
+        return $false
+    }
+}
+Write-FinalizeLog (T "START: FirstLogon=$FirstLogon; WaitForOobe=$WaitForOobe; EdgeOnly=$EdgeOnly; пользователь=$env:USERNAME" "START: FirstLogon=$FirstLogon; WaitForOobe=$WaitForOobe; EdgeOnly=$EdgeOnly; user=$env:USERNAME")
+if (-not $EdgeOnly) {
+    if ($env:USERNAME -match '^defaultuser\d+$') { Write-FinalizeLog (T 'SKIP: временный пользователь OOBE' 'SKIP: temporary OOBE user'); return }
+    $complete = Test-OobeComplete
+    if (-not $complete -and $WaitForOobe) {
+        Write-FinalizeLog (T 'WAIT: OOBE ещё выполняется, сеть остаётся заблокирована' 'WAIT: OOBE is still running; network remains blocked')
+        $deadline = (Get-Date).AddSeconds($WaitSeconds)
+        while (-not (Test-OobeComplete)) {
+            if ((Get-Date) -ge $deadline) { throw (T 'Истекло ожидание OOBE; задача сохранена для следующего входа' 'OOBE wait timed out; task retained for next logon') }
+            Start-Sleep -Seconds 2
+        }
+    } elseif (-not $complete) {
+        Write-FinalizeLog (T 'WAIT: первый вход ещё не подтверждает окончание OOBE' 'WAIT: first logon does not yet confirm OOBE completion')
+        if ($FirstLogon) {
+            # Не удерживаем FirstLogonCommands: это может задержать открытие рабочего стола.
+            $exe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+            Start-Process -FilePath $exe -WindowStyle Hidden -ArgumentList ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}\Finalize.ps1" -WaitForOobe' -f $PSScriptRoot) | Out-Null
+        }
+        return
+    }
+    Write-FinalizeLog 'OOBEComplete=True'
 }
 # The logon task and FirstLogonCommands may start together; allow one finalizer.
 try { $finalizeLock = [IO.File]::Open((Join-Path $PSScriptRoot 'finalize.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
 catch [IO.IOException] { return }
 try {
 $failed = $false
+if (-not $EdgeOnly -and __OOBE__) {
+    # Поздний SetupComplete не должен снова отключать сеть после завершения OOBE.
+    try { Set-Content -LiteralPath (Join-Path $PSScriptRoot 'oobe-complete') -Value (Get-Date -Format o) -Encoding ascii }
+    catch { $failed = $true; Write-FinalizeLog (T "Не удалось записать окончание OOBE: $($_.Exception.Message)" "Could not record OOBE completion: $($_.Exception.Message)") }
+}
 try {
     if (__EDGE__) {
         # EdgeUpdate/WebView2 and their shared EdgeCore files are preserved.
@@ -2110,10 +2215,31 @@ try {
             foreach ($adapter in Get-NetAdapter -IncludeHidden) {
                 if ([string]$adapter.InterfaceGuid -in @($saved | ForEach-Object { [string]$_.InterfaceGuid })) {
                     $adapter | Enable-NetAdapter -Confirm:$false
+                    Write-FinalizeLog (T "Сеть: включён GUID=$($adapter.InterfaceGuid)" "Network: enabled GUID=$($adapter.InterfaceGuid)")
                 }
             }
             Remove-Item -LiteralPath $statePath -Force
         }
+    } catch {
+        $failed = $true
+        Write-FinalizeLog (T "Ошибка возврата адаптеров: $($_.Exception.Message)" "Adapter restoration failed: $($_.Exception.Message)")
+    }
+    # Независимо от отказа отдельного адаптера снимаем только собственный сетевой блок.
+    if (__NETWORK__) {
+    try {
+        $firewallName = 'Win11Lite-OOBE-Temporary-Outbound-Block'
+        # Не путать недоступность провайдера с отсутствием правила.
+        $rules = @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop | Where-Object { $_.Name -eq $firewallName })
+        if ($rules.Count) {
+            Remove-NetFirewallRule -Name $firewallName -PolicyStore PersistentStore -ErrorAction Stop
+            Write-FinalizeLog (T 'Сеть: временная блокировка брандмауэра снята' 'Network: temporary firewall block removed')
+        }
+    } catch {
+        $failed = $true
+        Write-FinalizeLog (T "Ошибка снятия сетевого блока: $($_.Exception.Message)" "Network block removal failed: $($_.Exception.Message)")
+    }
+    }
+    try {
         foreach ($entry in @(
             @('HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU', 'NoAutoUpdate'),
             @('HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate', 'DoNotConnectToWindowsUpdateInternetLocations'),
@@ -2137,7 +2263,7 @@ if (-not $failed -and -not $EdgeOnly) {
 if ($failed) { exit 1 }
 '@
     $prepare = $prepare.Replace('__NETWORK__', ('$' + $BlockNetwork.ToString().ToLowerInvariant())).Replace('__GUARD__', ('$' + $EnableGuard.ToString().ToLowerInvariant())).Replace('__GUARDDEBUG__', ('$' + $ShowGuardWindow.ToString().ToLowerInvariant())).Replace('__OOBE__', ('$' + $ManageOobe.ToString().ToLowerInvariant())).Replace('__LANG__', $Language)
-    $finalize = $finalize.Replace('__EDGE__', ('$' + $RemoveEdge.ToString().ToLowerInvariant())).Replace('__OOBE__', ('$' + $ManageOobe.ToString().ToLowerInvariant())).Replace('__LANG__', $Language)
+    $finalize = $finalize.Replace('__EDGE__', ('$' + $RemoveEdge.ToString().ToLowerInvariant())).Replace('__NETWORK__', ('$' + $BlockNetwork.ToString().ToLowerInvariant())).Replace('__OOBE__', ('$' + $ManageOobe.ToString().ToLowerInvariant())).Replace('__LANG__', $Language)
     @{ Prepare = $prepare; Finalize = $finalize }
 }
 
@@ -3962,6 +4088,8 @@ $buildInfo = [ordered]@{
     SkippedDownloads = @($script:SkippedDownloads)
     Guard = [bool]$Guard
     GuardDebug = [bool]($Guard -and $GuardDebug)
+    OobeNetworkBlock = [bool]($script:ManageOobe -and -not $NoOobeNetworkBlock)
+    OobeCompletionCheck = 'OOBEComplete'
 } | ConvertTo-Json -Depth 4
 [IO.File]::WriteAllText((Join-Path $supportDir 'build-info.json'), $buildInfo, [Text.UTF8Encoding]::new($false))
 [IO.File]::WriteAllText((Join-Path $isoDir 'win11-lite-build.json'), $buildInfo, [Text.UTF8Encoding]::new($false))
@@ -3978,7 +4106,7 @@ $publicDesktop = Join-Path $mountDir 'Users\Public\Desktop'
 $null = New-Item -ItemType Directory -Path $publicDesktop -Force
 $firefoxPath = Join-Path $publicDesktop 'Install-Firefox.cmd'
 # CMD переключает кодовую страницу на UTF-8 до вывода локализованного текста.
-Write-WindowsBatchFile -Path $firefoxPath -Content $firefoxCmd
+Write-FirefoxInstallerFile -Path $firefoxPath -Content $firefoxCmd
 Write-Ok (T "Install-Firefox.cmd на общем рабочем столе (язык: $mozLang)" "Install-Firefox.cmd placed on the public desktop (language: $mozLang)")
 
 #endregion

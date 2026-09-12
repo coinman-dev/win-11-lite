@@ -432,6 +432,11 @@ try {
         function Register-ScheduledTask { param($TaskName,$Action,$Trigger,$Principal,$Settings,[switch]$Force) if($taskFailure.Enabled){throw 'Simulated unavailable scheduler'}; $testEvents.Add('register') }
         function Unregister-ScheduledTask { [CmdletBinding(SupportsShouldProcess)]param($TaskName) $testEvents.Add('unregister') }
         function Get-NetAdapter { param([switch]$IncludeHidden) $testAdapters }
+        function Get-NetFirewallRule { param($Name,$PolicyStore,$ErrorAction) $null }
+        function New-NetFirewallRule { param($Name,$DisplayName,$PolicyStore,$Enabled,$Direction,$Action,$Profile) }
+        function Set-NetFirewallRule { param($Name,$PolicyStore,$Enabled,$Direction,$Action,$Profile) }
+        function Remove-NetFirewallRule { param($Name,$PolicyStore,$ErrorAction) }
+        function Start-Process { param($FilePath,$WindowStyle,$ArgumentList) $testEvents.Add('wait-oobe') }
         function Disable-NetAdapter { [CmdletBinding(SupportsShouldProcess)]param([Parameter(ValueFromPipeline)]$InputObject) process { $testEvents.Add('disable:'+$InputObject.InterfaceGuid); $InputObject.AdminStatus='Down' } }
         function Enable-NetAdapter { [CmdletBinding(SupportsShouldProcess)]param([Parameter(ValueFromPipeline)]$InputObject) process { $testEvents.Add('enable:'+$InputObject.InterfaceGuid); $InputObject.AdminStatus='Up' } }
         function Get-ItemProperty { param($LiteralPath,$Name,$ErrorAction) $null }
@@ -441,6 +446,13 @@ try {
         function icacls.exe { $global:LASTEXITCODE=0 }
         function Test-Path { [CmdletBinding()]param([Parameter(Position=0)]$Path,$LiteralPath) $p=if($LiteralPath){$LiteralPath}else{$Path}; if($p -like 'HKLM:*'){$false}else{Microsoft.PowerShell.Management\Test-Path -LiteralPath $p} }
         $oldProgramFiles=$env:ProgramFiles; $oldX86=${env:ProgramFiles(x86)}; $oldPublic=$env:PUBLIC; $oldData=$env:ProgramData
+        if (-not ('Win11Lite.OobeStatus' -as [type])) {
+            $compileTemp=$env:TEMP; $compileTmp=$env:TMP
+            try {
+                $env:TEMP=$testRoot; $env:TMP=$testRoot
+                Add-Type 'namespace Win11Lite { public static class OobeStatus { public static bool Complete = true; public static bool OOBEComplete(out bool complete) { complete = Complete; return true; } } }'
+            } finally { $env:TEMP=$compileTemp; $env:TMP=$compileTmp }
+        }
         try {
             $env:ProgramFiles=Join-Path $testRoot 'pf'; ${env:ProgramFiles(x86)}=Join-Path $testRoot 'pf86'; $env:PUBLIC=Join-Path $testRoot 'public'; $env:ProgramData=Join-Path $testRoot 'data'
             $browser=Join-Path $env:ProgramFiles 'Microsoft\Edge'
@@ -463,6 +475,7 @@ try {
             # A cleanup failure must never leave the machine without connectivity.
             $testEvents.Clear()
             $null=New-Item -ItemType Directory -Path $browser
+            Remove-Item -LiteralPath (Join-Path $testRoot 'oobe-complete') -Force
             function Remove-Item {
                 [CmdletBinding()]param($LiteralPath,[switch]$Recurse,[switch]$Force)
                 if ($LiteralPath -eq $browser) { throw 'Simulated locked browser' }
@@ -474,19 +487,25 @@ try {
             Assert ($testEvents -contains 'enable:adapter-enabled') 'Network restored despite Edge cleanup failure'
             Assert ($testEvents -notcontains 'unregister') 'Failed finalizer retains its retry task'
             $testEvents.Clear()
+            Remove-Item -LiteralPath (Join-Path $testRoot 'oobe-complete') -Force
+            [Win11Lite.OobeStatus]::Complete = $false
             function Get-ItemProperty { param($LiteralPath,$Name,$ErrorAction) if($LiteralPath -eq 'HKLM:\SYSTEM\Setup') { [pscustomobject]@{OOBEInProgress=1;SystemSetupInProgress=0} } }
             & (Join-Path $testRoot 'Prepare.ps1')
             & (Join-Path $testRoot 'Finalize.ps1')
             Assert ($testEvents -notcontains 'enable:adapter-enabled') 'OOBE defaultuser0 logon does not restore network early'
             Assert ($testEvents -notcontains 'unregister') 'OOBE logon retains the task for the real user'
             & (Join-Path $testRoot 'Finalize.ps1') -FirstLogon
-            Assert ($testEvents -contains 'enable:adapter-enabled') 'Explicit real-user logon restores connectivity even while OOBE flags are being cleared'
+            Assert ($testEvents -notcontains 'enable:adapter-enabled' -and $testEvents -contains 'wait-oobe') 'FirstLogon cannot restore connectivity until Windows confirms OOBE completion'
+            [Win11Lite.OobeStatus]::Complete = $true
+            & (Join-Path $testRoot 'Finalize.ps1') -FirstLogon
+            Assert ($testEvents -contains 'enable:adapter-enabled') 'Native OOBE completion permits restoration even if registry flags lag behind'
 
             $support=Get-SetupSupportScripts -BlockNetwork $true -RemoveEdge $true -EnableGuard $false -Language 'ru-RU'
             Assert ($support.Count -eq 2) 'Only preparation and finalization scripts are generated'
             foreach($name in @('Prepare','Finalize')) { [IO.File]::WriteAllText((Join-Path $testRoot "$name.ps1"),$support[$name],[Text.UTF8Encoding]::new($true)) }
             $taskFailure.Enabled = $true
             $testEvents.Clear()
+            Remove-Item -LiteralPath (Join-Path $testRoot 'oobe-complete') -Force
             & (Join-Path $testRoot 'Prepare.ps1')
             Assert ($testAdapters[0].AdminStatus -eq 'Down' -and $testEvents -notcontains 'register') 'Unavailable scheduler cannot leave OOBE online'
             & (Join-Path $testRoot 'Finalize.ps1') -FirstLogon

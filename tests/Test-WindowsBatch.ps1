@@ -5,7 +5,7 @@ $repo = Split-Path $PSScriptRoot -Parent
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'win-11-lite.ps1'), [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors | Out-String) }
-foreach ($name in @('Write-WindowsBatchFile','Get-FirefoxInstallerCommand')) {
+foreach ($name in @('Write-WindowsBatchFile','Write-FirefoxInstallerFile','Get-FirefoxInstallerCommand')) {
     $node = $ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name}, $false)
     . ([scriptblock]::Create($node.Extent.Text))
 }
@@ -28,6 +28,8 @@ try {
         @{Name='winget-success';Where=0;Winget=0;Curl=0;Installer=0;Exit=0;Download=$false;Install=$false}
         @{Name='direct-download';Where=1;Winget=0;Curl=0;Installer=0;Exit=0;Download=$true;Install=$true}
         @{Name='winget-fallback';Where=0;Winget=7;Curl=0;Installer=0;Exit=0;Download=$true;Install=$true}
+        @{Name='winget-hresult-fallback';Where=0;Winget=-1978335217;Curl=0;Installer=0;Exit=0;Download=$true;Install=$true}
+        @{Name='winget-hresult-offline';Where=0;Winget=-1978335217;Curl=22;Installer=0;Exit=1;Download=$true;Install=$false}
         @{Name='download-error';Where=1;Winget=0;Curl=22;Installer=0;Exit=1;Download=$true;Install=$false}
         @{Name='installer-cancel';Where=1;Winget=0;Curl=0;Installer=1602;Exit=1602;Download=$true;Install=$true}
     )
@@ -48,11 +50,15 @@ try {
         $command = $command.Replace('pause', 'rem pause skipped in test')
         Assert ($command -notmatch '(?im)^\s*(?:curl\.exe|winget install|start |where winget)') 'All external side effects replaced before execution'
         foreach ($case in $scenarios) {
-            $caseDir = Join-Path $root ("$tag-$($case.Name) папка с пробелами")
+            $caseDir = Join-Path $root ("$tag-$($case.Name) папка с пробелами & !")
             $null = New-Item -ItemType Directory -Path $caseDir
             $file = Join-Path $caseDir 'Install-Firefox.cmd'
             $trace = Join-Path $caseDir 'trace.txt'
-            Write-WindowsBatchFile -Path $file -Content $command
+            Write-FirefoxInstallerFile -Path $file -Content $command
+            $rules = (Get-Acl -LiteralPath $file).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
+            Assert (@($rules | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-32-545' -and $_.AccessControlType -eq 'Allow' -and ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::Delete) }).Count -gt 0) 'Standard users can remove the single-use launcher'
+            $browserLink = Join-Path $caseDir 'Firefox.lnk'
+            [IO.File]::WriteAllText($browserLink, 'browser shortcut fixture')
             $psi = [Diagnostics.ProcessStartInfo]::new()
             $psi.FileName = "$env:SystemRoot\System32\cmd.exe"
             $psi.Arguments = '/d /s /c ""' + $file + '""'
@@ -78,7 +84,7 @@ try {
                 $errorText = $stderr.GetAwaiter().GetResult()
                 $events = [IO.File]::ReadAllText($trace, [Text.Encoding]::UTF8)
                 $label = "$tag/$($case.Name)"
-                Assert ($process.ExitCode -eq $case.Exit) "Exit code ($label): $($process.ExitCode)"
+                Assert ($process.ExitCode -eq $case.Exit) "Exit code ($label): $($process.ExitCode); stdout=$output; stderr=$errorText"
                 Assert ($errorText.Trim().Length -eq 0) "CMD parsing ($label): $errorText"
                 Assert (($events -match 'DOWNLOAD') -eq $case.Download) "Download branch ($label)"
                 Assert (($events -match 'INSTALL') -eq $case.Install) "Installer branch ($label)"
@@ -88,6 +94,8 @@ try {
                 }
                 $done = if ($tag -eq 'ru') {'Готово.'} else {'Done.'}
                 Assert (($output.Contains($done)) -eq ($case.Exit -eq 0)) "Success message reflects installer result ($label)"
+                Assert ((Test-Path -LiteralPath $file) -eq ($case.Exit -ne 0)) "Launcher deletes itself only after success ($label)"
+                Assert (Test-Path -LiteralPath $browserLink) "Firefox shortcut remains ($label)"
             } finally { $process.Dispose() }
         }
     }
