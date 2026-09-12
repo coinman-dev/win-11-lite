@@ -19,6 +19,10 @@
       * обновления отключаются на время установки и включаются сразу после неё;
       * итоговый ISO собирается через oscdimg.
 
+    Все загрузки выполняются до копирования и обработки образа. При ошибке
+    можно продолжить без компонента или отменить сборку. Полный проверенный
+    кэш позволяет собирать без сети; -ClearCache заставляет скачать его заново.
+
     Только по явным ключам: обновления (-WithUpdates), winget (-WithWinget),
     языки (-DownloadLanguage), классический установщик (-LegacySetup),
     удаление WinRE (-RemoveWinRE), урезание sources (-TrimSources).
@@ -49,6 +53,8 @@
     Скачивает русский языковой пакет с серверов Microsoft (около 37 МБ)
     и делает русский языком системы по умолчанию. Для обновлённого ISO также
     повторно применяется исходный LCU: для 26100.1742 это KB5043080 (~509 МБ).
+    Установщик также переводится на русский: при первом запуске нужен архив
+    WinPE (~305 МБ). Оставить язык установщика исходным: -SetupLanguage original.
 
 .EXAMPLE
     .\win-11-lite.ps1 -InputIso .\iso\original.iso -Index 2 -WithUpdates -WithWinget -Debug
@@ -159,7 +165,7 @@ param(
     [Alias('KeepWinRE')]
     [switch]$SaveWinRE,
 
-    # Оставить в sources только boot.wim, install.* и EI.CFG (~-210 МБ).
+    # Оставить в sources boot.wim, install.*, EI.CFG и ресурсы выбранного установщика.
     # Установка с носителя работает, запуск setup.exe из работающей Windows — нет.
     [switch]$TrimSources,
 
@@ -193,6 +199,16 @@ param(
     # ссылок — через каталог uupdump.net. Проверяются по SHA-256.
     [Alias('DownloadLang')]
     [string[]]$DownloadLanguage,
+
+    # Язык установщика: auto = первый добавляемый язык Windows; original = язык ISO.
+    # Отдельные пакеты WinPE скачиваются заранее (для build 26100, x64).
+    [string]$SetupLanguage = 'auto',
+
+    # Необязательный локальный источник: каталог WinPE_OCs из ADK/LoF.
+    [string]$SetupLanguageSource,
+
+    # LCU для языковых ресурсов boot.wim, если его ревизия не известна сборщику.
+    [string]$SetupLanguageUpdatePath,
 
     # LCU для повторного обслуживания языков (MSU той же или более новой версии).
     # Для исходного LTSC 26100.1742 при -DownloadLanguage автоматически берётся
@@ -426,6 +442,26 @@ function Read-PathOrDefault {
     $answer
 }
 
+# Паспорт всех индексов WIM/ESD через модуль Dism (нужны права администратора).
+# Читаем модулем, а не dism.exe: тот печатает имена в OEM-кодировке (кириллица
+# превращается в мусор), а поле Languages выводит на отдельной строке.
+function Get-WimImageList {
+    param([Parameter(Mandatory)][string]$Path)
+    Import-Module Dism -ErrorAction Stop -Verbose:$false
+    foreach ($b in (Get-WindowsImage -ImagePath $Path)) {
+        $d = Get-WindowsImage -ImagePath $Path -Index $b.ImageIndex
+        [PSCustomObject]@{
+            Index        = $d.ImageIndex
+            Name         = $d.ImageName
+            EditionId    = $d.EditionId
+            Architecture = $d.Architecture
+            Languages    = ($d.Languages -join ',')
+            Version      = $d.Version
+            Size         = $d.ImageSize
+        }
+    }
+}
+
 # Читает список изданий из ISO, чтобы спросить о редакции до начала работы
 function Get-IsoEditions {
     param([string]$Path)
@@ -438,16 +474,7 @@ function Get-IsoEditions {
         $wim = Join-Path $drive 'sources\install.wim'
         if (-not (Test-Path -LiteralPath $wim)) { $wim = Join-Path $drive 'sources\install.esd' }
         if (-not (Test-Path -LiteralPath $wim)) { return @() }
-        Import-Module Dism -ErrorAction Stop -Verbose:$false
-        foreach ($b in (Get-WindowsImage -ImagePath $wim)) {
-            $d = Get-WindowsImage -ImagePath $wim -Index $b.ImageIndex
-            $result += [PSCustomObject]@{
-                Index     = $d.ImageIndex
-                Name      = $d.ImageName
-                EditionId = $d.EditionId
-                Languages = ($d.Languages -join ',')
-            }
-        }
+        $result = @(Get-WimImageList -Path $wim)
     } catch {
         Write-Host (T "  Не удалось прочитать образ: $($_.Exception.Message)" "  Could not read the image: $($_.Exception.Message)") -ForegroundColor Yellow
     } finally {
@@ -711,25 +738,28 @@ function Format-Size {
 $script:CanDrawProgress = $false
 try { $script:CanDrawProgress = -not [Console]::IsOutputRedirected } catch { }
 
+# Вид строки:  [████████····································]  21%  00:01  Экспорт индекса 2
+# Полоса слева шириной до 40 знаков; при узкой консоли она сжимается или
+# убирается совсем, чтобы строка никогда не доходила до столбца переноса.
 function Get-ProgressLine {
     param([string]$Activity, [int]$Percent, [int]$Phase = 1, [TimeSpan]$Elapsed,
           [int]$Width = 80, [switch]$Done, [switch]$Failed)
     $limit = [Math]::Max(1, $Width - 1) # Последний столбец вызывает перенос строки.
     $percent = [Math]::Max(0, [Math]::Min(100, $Percent))
-    $status = if ($Done) { if ($Failed) { T 'ОШИБКА' 'FAILED' } else { T 'Готово' 'Done' } }
-              else { (T 'Этап DISM' 'DISM phase') + " $Phase" }
     $time = '{0:00}:{1:00}' -f [Math]::Floor($Elapsed.TotalMinutes), $Elapsed.Seconds
-    $prefix = "  $status | $percent% | $time | "
     $activityText = ($Activity -replace '[\r\n\t]', ' ')
     # Идентификатор KB полезнее длинного имени MSU с хэшем.
     $activityText = [regex]::Replace($activityText, '(?i)windows[^\s]*?-(kb\d+)[^\s]*\.msu', { param($m) $m.Groups[1].Value.ToUpperInvariant() })
-    $barWidth = [Math]::Min(20, $limit - $prefix.Length - $activityText.Length - 3)
-    $bar = ''
-    if ($barWidth -ge 6) {
+    # Одна операция DISM может несколько раз пройти 0–100% (checkpoint + цель):
+    # номер этапа показываем только со второго, чтобы не шуметь в обычном случае.
+    if ($Done) { $activityText += if ($Failed) { T ' — ОШИБКА' ' - FAILED' } else { T ' — готово' ' - done' } }
+    elseif ($Phase -gt 1) { $activityText += (T ' (этап ' ' (phase ') + "$Phase)" }
+    $tail = ' {0,3}%  {1}  {2}' -f $percent, $time, $activityText
+    $barWidth = [Math]::Min(40, $limit - 2 - 2 - $tail.Length)
+    $line = if ($barWidth -ge 8) {
         $filled = [int][Math]::Round($barWidth * $percent / 100)
-        $bar = '[' + ('#' * $filled) + ('-' * ($barWidth - $filled)) + '] '
-    }
-    $line = $prefix + $bar + $activityText
+        '  [' + ('█' * $filled) + ('·' * ($barWidth - $filled)) + ']' + $tail
+    } else { ' ' + $tail }
     if ($line.Length -gt $limit) { $line = $line.Substring(0, [Math]::Max(0, $limit - 1)) + '…' }
     $line
 }
@@ -745,11 +775,16 @@ function Write-ProgressBar {
     $elapsed = if ($script:ProgressStarted) { (Get-Date) - $script:ProgressStarted } else { [TimeSpan]::Zero }
     $line = Get-ProgressLine -Activity $Activity -Percent $Percent -Phase $Phase -Elapsed $elapsed -Width $width -Done:$Done -Failed:$Failed
     # Прямая запись в консоль не засоряет transcript каждым кадром.
-    [Console]::Write("`r" + $line.PadRight($width - 1))
+    # Цвет ставим на уровне консоли, а не Write-Host, по той же причине.
+    $previous = [Console]::ForegroundColor
+    try {
+        [Console]::ForegroundColor = if ($Failed) { [ConsoleColor]::Red } else { [ConsoleColor]::Cyan }
+        [Console]::Write("`r" + $line.PadRight($width - 1))
+    } finally { [Console]::ForegroundColor = $previous }
     if ($Done) { [Console]::WriteLine() }
 }
 
-function Update-DismProgressState {
+function Update-ProgressState {
     param([hashtable]$State, [string]$Text)
     $text = $Text.Trim()
     if (-not $text) { return }
@@ -779,8 +814,9 @@ function Invoke-Dism {
     Write-Verbose "dism $($all -join ' ')"
 
     if ($Activity -and $script:CanDrawProgress) {
-        $output = Invoke-DismProgress -Exe $script:Dism -Arguments $all -Activity $Activity
-        $code = $script:LastDismExit
+        $run = Invoke-ProgressProcess -Exe $script:Dism -Arguments $all -Activity $Activity -SuccessCodes @(0, 3010)
+        $output = $run.Output
+        $code = $run.ExitCode
     } elseif ($Quiet) {
         $output = & $script:Dism @all 2>&1
         $code = $LASTEXITCODE
@@ -796,18 +832,32 @@ function Invoke-Dism {
     [PSCustomObject]@{ ExitCode = $code; Output = $output }
 }
 
-# DISM перерисовывает свою полосу возвратом каретки, поэтому читаем поток
-# посимвольно: ждать перевода строки бессмысленно, его может не быть минутами
-function Invoke-DismProgress {
-    param([string]$Exe, [string[]]$Arguments, [string]$Activity)
+# Долгий внешний процесс показываем одной полосой вместо его собственного вывода.
+# Источник процентов у каждого свой: dism.exe рисует полосу в stdout, oscdimg
+# пишет строки «N% complete» в stderr, а robocopy с /NP молчит — для него
+# процент считается по данным на диске через -GetPercent.
+# Живой поток читаем посимвольно: полоса перерисовывается возвратом каретки,
+# ждать перевода строки бессмысленно, его может не быть минутами.
+function Invoke-ProgressProcess {
+    param(
+        [Parameter(Mandatory)][string]$Exe,
+        [string[]]$Arguments = @(),
+        [Parameter(Mandatory)][string]$Activity,
+        [string]$WorkingDirectory,   # процесс не наследует Push-Location оболочки
+        [int[]]$SuccessCodes = @(0),
+        [scriptblock]$GetPercent,    # задан — процент берём отсюда, а не из вывода
+        [switch]$ProgressOnStdErr    # проценты в stderr, сообщения в stdout (oscdimg)
+    )
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Exe
     $psi.Arguments = ($Arguments | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join ' '
+    if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
     $psi.UseShellExecute = $false
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.StandardOutputEncoding = [Text.Encoding]::GetEncoding(437)
+    $psi.StandardErrorEncoding = [Text.Encoding]::GetEncoding(437)
 
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
@@ -815,11 +865,13 @@ function Invoke-DismProgress {
     $lines = [System.Collections.Generic.List[string]]::new()
     $buffer = New-Object System.Text.StringBuilder
     $state = @{ Percent = -1; Phase = 1; Lines = $lines }
+    $exitCode = -1
     try {
         $null = $proc.Start()
-        $stderrTask = $proc.StandardError.ReadToEndAsync()
+        # Один поток читаем живым, второй забираем целиком по завершении процесса.
+        $reader = if ($ProgressOnStdErr) { $proc.StandardError } else { $proc.StandardOutput }
+        $restTask = if ($ProgressOnStdErr) { $proc.StandardOutput.ReadToEndAsync() } else { $proc.StandardError.ReadToEndAsync() }
         Write-ProgressBar -Activity $Activity -Percent 0
-        $reader = $proc.StandardOutput
         $chars = New-Object char[] 2048
         $readTask = $reader.ReadAsync($chars, 0, $chars.Length)
         $lastDraw = [DateTime]::MinValue
@@ -830,28 +882,49 @@ function Invoke-DismProgress {
                 for ($i = 0; $i -lt $count; $i++) {
                     $c = $chars[$i]
                     if ($c -eq "`r" -or $c -eq "`n" -or $c -eq [char]8) {
-                        Update-DismProgressState -State $state -Text $buffer.ToString()
+                        Update-ProgressState -State $state -Text $buffer.ToString()
                         $null = $buffer.Clear()
                     } else { $null = $buffer.Append($c) }
                 }
                 $readTask = $reader.ReadAsync($chars, 0, $chars.Length)
             }
             if (((Get-Date) - $lastDraw).TotalMilliseconds -ge 500) {
+                # Отказ внешнего счётчика гасим: индикация не должна ломать сборку.
+                if ($GetPercent) { try { $state.Percent = [int](& $GetPercent) } catch { } }
                 Write-ProgressBar -Activity $Activity -Percent ([Math]::Max(0, $state.Percent)) -Phase $state.Phase
                 $lastDraw = Get-Date
             }
             if (-not $readTask.IsCompleted) { Start-Sleep -Milliseconds 100 }
         }
-        Update-DismProgressState -State $state -Text $buffer.ToString()
-        $errText = $stderrTask.GetAwaiter().GetResult()
+        Update-ProgressState -State $state -Text $buffer.ToString()
+        $restText = $restTask.GetAwaiter().GetResult()
         $proc.WaitForExit()
-        $script:LastDismExit = $proc.ExitCode
-        if ($errText.Trim()) { $lines.Add($errText.Trim()) }
-        $failed = -not (Test-DismSuccess $proc.ExitCode)
+        $exitCode = $proc.ExitCode
+        if ($restText.Trim()) { $lines.Add($restText.Trim()) }
+        $failed = $exitCode -notin $SuccessCodes
         Write-ProgressBar -Activity $Activity -Percent $(if ($failed) { [Math]::Max(0, $state.Percent) } else { 100 }) -Phase $state.Phase -Done -Failed:$failed
-        Write-Verbose (T "DISM завершился: этапов $($state.Phase), код $($proc.ExitCode), операция: $Activity" "DISM finished: $($state.Phase) phases, code $($proc.ExitCode), operation: $Activity")
+        $tool = [IO.Path]::GetFileName($Exe)
+        Write-Verbose (T "$tool завершился: этапов $($state.Phase), код $exitCode, операция: $Activity" "$tool finished: $($state.Phase) phases, code $exitCode, operation: $Activity")
     } finally { $proc.Dispose() }
-    $lines.ToArray()
+    [PSCustomObject]@{ ExitCode = $exitCode; Output = $lines.ToArray() }
+}
+
+# robocopy с /NP не сообщает прогресс, поэтому процент копирования берём с
+# диска: объём источника известен заранее, а приёмник растёт файл за файлом.
+# Дерево перечисляется во время интенсивной записи — опрашиваем не часто.
+$script:CopyPolled = $null
+$script:CopyPercent = 0
+function Get-CopyPercent {
+    param([string]$Path, [int64]$TotalBytes)
+    if ($TotalBytes -le 0) { return $script:CopyPercent }
+    if ($script:CopyPolled -and ((Get-Date) - $script:CopyPolled).TotalSeconds -lt 2) { return $script:CopyPercent }
+    $script:CopyPolled = Get-Date
+    $copied = 0L
+    Get-ChildItem -LiteralPath $Path -Recurse -Force -File -ErrorAction SilentlyContinue |
+        ForEach-Object { $copied += $_.Length }
+    # 100% ставит только завершившийся процесс; счётчик не идёт назад.
+    $script:CopyPercent = [Math]::Max($script:CopyPercent, [Math]::Min(99, [int](100 * $copied / $TotalBytes)))
+    $script:CopyPercent
 }
 
 # Разбирает вывод dism вида "Ключ : Значение" в список объектов.
@@ -917,7 +990,8 @@ function Write-ComponentStoreReport {
     param([string]$Image, [string]$Phase)
     Write-Step (T "Анализ WinSxS: $Phase" "WinSxS analysis: $Phase")
     try {
-        $result = Invoke-Dism -Arguments @("/Image:$Image", '/Cleanup-Image', '/AnalyzeComponentStore') -AllowFail -Quiet
+        $result = Invoke-Dism -Arguments @("/Image:$Image", '/Cleanup-Image', '/AnalyzeComponentStore') -AllowFail -Quiet `
+                              -Activity (T "Анализ хранилища компонентов: $Phase" "Analyzing the component store: $Phase")
     } catch {
         $result = [pscustomobject]@{ ExitCode = -1; Output = @($_.Exception.Message) }
     }
@@ -993,7 +1067,8 @@ function Remove-OfflineRecall {
             Write-Note (T "Recall: $($feature.State) — требуется завершение обслуживания при загрузке Windows" "Recall: $($feature.State) - servicing must complete when Windows boots")
             continue
         }
-        $result = Invoke-Dism -Arguments @("/Image:$Image", '/Disable-Feature', '/FeatureName:Recall', '/Remove') -AllowFail -Quiet
+        $result = Invoke-Dism -Arguments @("/Image:$Image", '/Disable-Feature', '/FeatureName:Recall', '/Remove') -AllowFail -Quiet `
+                              -Activity (T 'Удаление компонента Recall' 'Removing the Recall feature')
         if (Test-DismSuccess $result.ExitCode) { Write-Ok (T 'DISM принял удаление Recall; итоговое состояние будет проверено' 'DISM accepted Recall removal; its final state will be checked') }
         else { Write-ServicingRemovalFailure -Kind 'Feature' -Name 'Recall' -Result $result }
     }
@@ -1028,13 +1103,41 @@ function Write-RemainingRemovalReport {
     } else { Write-Ok (T 'В списках DISM не осталось выбранных компонентов' 'No selected components remain in DISM inventories') }
 }
 
+# Где 24H2 держит встроенный WebView2. Полный runtime — это CBS-компонент
+# Microsoft-Edge-WebView в System32\Microsoft-Edge-WebView; каталог версии в
+# Program Files (x86)\Microsoft\EdgeWebView\Application — жёсткие ссылки на него.
+# Возвращает те корни, в которых сейчас есть msedgewebview2.exe.
+function Get-WebViewRuntimeRoots {
+    param([Parameter(Mandatory)][string]$Image)
+    foreach ($relative in @('Windows\System32\Microsoft-Edge-WebView', 'Program Files (x86)\Microsoft\EdgeWebView', 'Program Files\Microsoft\EdgeWebView')) {
+        $root = Join-Path $Image $relative
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        if (@(Get-ChildItem -LiteralPath $root -Recurse -Filter 'msedgewebview2.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1).Count) { $root }
+    }
+}
+
 function Assert-ImageFileState {
     param([string]$Image)
-    foreach ($root in $script:PreservedWebView) {
-        # LCU может заменить каталог версии WebView2. Проверяем наличие runtime,
-        # а не прежний номер версии, записанный до интеграции обновлений.
-        $runtime = @(Get-ChildItem -LiteralPath $root -Recurse -Filter 'msedgewebview2.exe' -File -ErrorAction SilentlyContinue | Select-Object -First 1)
-        if (-not $runtime.Count) { throw (T "Удалён защищённый компонент WebView2: $root" "A protected WebView2 component was removed: $root") }
+    if (@($script:PreservedWebView).Count) {
+        $present = @(Get-WebViewRuntimeRoots -Image $Image)
+        if (-not $present.Count) {
+            throw (T 'Удалён защищённый компонент WebView2: в образе не осталось msedgewebview2.exe' 'A protected WebView2 component was removed: no msedgewebview2.exe remains in the image')
+        }
+        # LCU заменяет встроенный пакет WebView2 целиком (проверено на KB5124008:
+        # 122.0.2365.106 → 151.0.4129.59). CBS отпроецирует прежний каталог версии
+        # из Program Files (x86), а новый компонент кладёт runtime в System32.
+        # Это обслуживание Windows, а не наша чистка: WebView2 в образе остаётся.
+        $versions = @($present | ForEach-Object {
+            Get-ChildItem -LiteralPath $_ -Recurse -Filter '*.manifest' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.BaseName -match '^\d+(\.\d+){3}$' } | ForEach-Object { $_.BaseName }
+        } | Sort-Object -Unique)
+        foreach ($root in $script:PreservedWebView) {
+            if ($present -contains $root) { continue }
+            Write-Note (T "WebView2 больше не в $root — обслуживание DISM заменило встроенный пакет. Runtime$(if ($versions) { " $($versions -join ', ')" }) остаётся в: $($present -join ', '). Проверьте в VM, что после первого входа приложения с WebView2 работают." "WebView2 is no longer in $root - DISM servicing replaced the in-box package. The runtime$(if ($versions) { " $($versions -join ', ')" }) remains in: $($present -join ', '). Verify in a VM that WebView2 apps work after first logon.")
+        }
+        if ($script:ImageAudit) {
+            $script:ImageAudit['WebView'] = [pscustomobject]@{ Preserved = @($script:PreservedWebView); Present = $present; Versions = $versions }
+        }
     }
     if (Test-GroupActive -RulePreset 'safe' -Group 'Edge') {
         foreach ($relative in @('Program Files (x86)\Microsoft\Edge', 'Program Files\Microsoft\Edge')) {
@@ -1069,6 +1172,34 @@ function Assert-ChildPath {
     $full
 }
 
+# Тихий запуск нативной утилиты с возвратом кода завершения.
+# В Windows PowerShell 5.1 при $ErrorActionPreference = 'Stop' перенаправление
+# stderr (*>&1) превращает первую же строку ошибки в исключение, и код возврата
+# до вызывающего не доходит: reg query по отсутствующему ключу или takeown
+# ронял бы всю сборку. Настройки меняются только в области этой функции.
+function Invoke-NativeQuiet {
+    param([Parameter(Mandatory)][string]$FilePath, [string[]]$Arguments = @())
+    $ErrorActionPreference = 'Continue'
+    $PSNativeCommandUseErrorActionPreference = $false
+    & $FilePath @Arguments *>&1 | Out-Null
+    $LASTEXITCODE
+}
+
+# Снимает владение и даёт полные права администраторам на путь в образе.
+# S-1-5-32-544 = Administrators, не зависит от языка системы.
+# Ключи /R и /T применимы только к каталогам — для файла они игнорируются
+# и владение не меняется, из-за чего удаление падает с «Access denied».
+function Grant-ImagePathAccess {
+    param([Parameter(Mandatory)][string]$Path, [switch]$Recurse)
+    if ($Recurse) {
+        $null = Invoke-NativeQuiet takeown.exe @('/F', $Path, '/R', '/A', '/D', 'Y')
+        $null = Invoke-NativeQuiet icacls.exe @($Path, '/grant', '*S-1-5-32-544:(F)', '/T', '/C', '/Q')
+    } else {
+        $null = Invoke-NativeQuiet takeown.exe @('/F', $Path, '/A')
+        $null = Invoke-NativeQuiet icacls.exe @($Path, '/grant', '*S-1-5-32-544:(F)', '/C', '/Q')
+    }
+}
+
 # Снимает владение и права, затем удаляет путь внутри смонтированного образа.
 function Remove-ImagePath {
     param([string]$FullPath, [string]$Description)
@@ -1084,9 +1215,6 @@ function Remove-ImagePath {
         } else { $item.Length }
     } catch { }
 
-    # S-1-5-32-544 = Administrators, не зависит от языка системы.
-    # Ключи /R и /T применимы только к каталогам — для файла они игнорируются
-    # и владение не меняется, из-за чего удаление падает с «Access denied».
     $isLeafReparse = [bool]($item.Attributes -band [IO.FileAttributes]::ReparsePoint)
     if ($isLeafReparse -and $item.PSIsContainer) {
         # Remove-Item -Recurse для junction/symlink каталога может затронуть цель.
@@ -1094,13 +1222,7 @@ function Remove-ImagePath {
         Write-Note (T "$Description — ссылка-каталог пропущена" "$Description - directory reparse point skipped")
         return $false
     }
-    if ($item.PSIsContainer) {
-        & takeown.exe /F $FullPath /R /A /D Y *>&1 | Out-Null
-        & icacls.exe $FullPath /grant '*S-1-5-32-544:(F)' /T /C /Q *>&1 | Out-Null
-    } else {
-        & takeown.exe /F $FullPath /A *>&1 | Out-Null
-        & icacls.exe $FullPath /grant '*S-1-5-32-544:(F)' /C /Q *>&1 | Out-Null
-    }
+    Grant-ImagePathAccess -Path $FullPath -Recurse:([bool]$item.PSIsContainer)
     try {
         if ($isLeafReparse) {
             # WIM/WOF file reparse point: remove the file entry, never traverse it.
@@ -1123,6 +1245,7 @@ function Remove-ImagePath {
 
 function Search-Catalog {
     param([Parameter(Mandatory)][string]$Query)
+    if ($script:DownloadsClosed) { throw (T 'Поиск в сети после подготовки запрещён' 'Network lookup is closed after preparation') }
     $url = 'https://www.catalog.update.microsoft.com/Search.aspx?q=' + [uri]::EscapeDataString($Query)
     $resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 60
     $rows = [regex]::Matches($resp.Content, '(?s)<tr[^>]*id="([0-9a-f\-]{36})_R\d+".*?</tr>')
@@ -1147,6 +1270,7 @@ function Search-Catalog {
 # обновлением ещё и checkpoint — оба нужны, DISM разберётся сам.
 function Get-CatalogLinks {
     param([Parameter(Mandatory)][string]$UpdateId)
+    if ($script:DownloadsClosed) { throw (T 'Поиск в сети после подготовки запрещён' 'Network lookup is closed after preparation') }
     $payload = '[{"size":0,"languages":"","uidInfo":"' + $UpdateId + '","updateID":"' + $UpdateId + '"}]'
     $resp = Invoke-WebRequest -Uri 'https://www.catalog.update.microsoft.com/DownloadDialog.aspx' `
                               -Method Post -Body @{ updateIDs = $payload } -UseBasicParsing -TimeoutSec 60
@@ -1156,23 +1280,196 @@ function Get-CatalogLinks {
 
 function Save-Url {
     param([string]$Url, [string]$Destination)
+    if ($script:DownloadsClosed) { throw (T 'Загрузка после начала обработки образа запрещена' 'Downloads are closed after image processing starts') }
     $name = Split-Path $Destination -Leaf
     $marker = "$Destination.size"
-    if ((Test-Path -LiteralPath $Destination) -and (Test-Path -LiteralPath $marker)) {
-        $expected = [int64](Get-Content -LiteralPath $marker -Raw).Trim()
-        $actual = (Get-Item -LiteralPath $Destination).Length
-        if ($expected -eq $actual -and $actual -gt 0) {
-            Write-Ok (T "$name — уже в кэше ($(Format-Size $actual))" "$name - already cached ($(Format-Size $actual))")
-            return
-        }
+    if (Test-SavedUrl $Destination) {
+        Write-Ok (T "$name — уже в кэше" "$name - already cached")
+        return
     }
     Write-Step (T "Загрузка $name ..." "Downloading $name ...")
-    # curl.exe надёжнее и заметно быстрее Invoke-WebRequest на файлах в гигабайты
-    & curl.exe -L --fail --retry 3 --retry-delay 5 -o $Destination $Url
-    if ($LASTEXITCODE -ne 0) { throw (T "Не удалось скачать $Url (curl код $LASTEXITCODE)" "Failed to download $Url (curl code $LASTEXITCODE)") }
-    $size = (Get-Item -LiteralPath $Destination).Length
-    Set-Content -LiteralPath $marker -Value $size -Encoding ascii
+    # Незавершённая загрузка никогда не становится готовым файлом кэша.
+    $partial = "$Destination.part"
+    try {
+        & curl.exe -L --fail --connect-timeout 15 --speed-limit 1024 --speed-time 60 --retry 2 --retry-delay 3 -o $partial $Url
+        if ($LASTEXITCODE -ne 0) { throw (T "Не удалось скачать $Url (curl код $LASTEXITCODE)" "Failed to download $Url (curl code $LASTEXITCODE)") }
+        $size = (Get-Item -LiteralPath $partial).Length
+        if ($size -le 0) { throw (T "Получен пустой файл: $name" "Downloaded file is empty: $name") }
+        Remove-Item -LiteralPath $marker, "$Destination.sha256" -Force -ErrorAction SilentlyContinue
+        Move-Item -LiteralPath $partial -Destination $Destination -Force
+        Set-Content -LiteralPath "$Destination.sha256" -Value (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash -Encoding ascii
+        Set-Content -LiteralPath $marker -Value $size -Encoding ascii
+    } finally {
+        if (Test-Path -LiteralPath $partial) { Remove-Item -LiteralPath $partial -Force }
+    }
     Write-Ok (T "$name — загружено ($(Format-Size $size))" "$name - downloaded ($(Format-Size $size))")
+}
+
+function Test-SavedUrl {
+    param([string]$Path)
+    try {
+        $expected = [int64](Get-Content -LiteralPath "$Path.size" -Raw -ErrorAction Stop).Trim()
+        $file = Get-Item -LiteralPath $Path -ErrorAction Stop
+        if ($file.PSIsContainer -or $expected -le 0 -or $file.Length -ne $expected) { return $false }
+        if (Test-Path -LiteralPath "$Path.sha256") {
+            $hash = (Get-Content -LiteralPath "$Path.sha256" -Raw -ErrorAction Stop).Trim()
+            if ($hash -notmatch '^[a-f0-9]{64}$' -or (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash -ne $hash) { return $false }
+        }
+        return $true
+    } catch { return $false }
+}
+
+# Манифест записывается только для полного комплекта, включая checkpoint MSU.
+# Хэши позволяют пользоваться кэшем без GitHub/UUP/Update Catalog.
+function Read-PreparedCache {
+    param([string]$Directory, [string]$Key)
+    try {
+        $manifest = Get-Content -LiteralPath (Join-Path $Directory "$Key.ready.json") -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ($manifest.Schema -ne 1 -or $manifest.Key -ne $Key -or -not @($manifest.Files).Count) { return }
+        foreach ($entry in $manifest.Files) {
+            $path = Assert-ChildPath -Path (Join-Path $Directory $entry.Name) -Root $Directory
+            $file = Get-Item -LiteralPath $path -ErrorAction Stop
+            if ($file.PSIsContainer -or $file.Length -le 0 -or $file.Length -ne $entry.Size -or
+                (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $entry.SHA256) { return }
+        }
+        return $manifest
+    } catch { return }
+}
+
+function Write-PreparedCache {
+    param([string]$Directory, [string]$Key, [string[]]$Files, $Data)
+    if (-not $Files.Count) { throw (T 'Пустой комплект загрузки' 'Empty download set') }
+    $root = [IO.Path]::GetFullPath($Directory).TrimEnd('\')
+    $entries = @(foreach ($path in $Files) {
+        $full = Assert-ChildPath -Path $path -Root $root
+        $file = Get-Item -LiteralPath $full
+        if ($file.PSIsContainer -or $file.Length -le 0) { throw (T "Пустой файл: $full" "Empty file: $full") }
+        [ordered]@{ Name = $full.Substring($root.Length + 1); Size = $file.Length; SHA256 = (Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash }
+    })
+    $manifest = [ordered]@{ Schema = 1; Key = $Key; Files = $entries; Data = $Data }
+    $path = Join-Path $Directory "$Key.ready.json"
+    $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath "$path.part" -Encoding UTF8
+    Move-Item -LiteralPath "$path.part" -Destination $path -Force
+}
+
+function Confirm-SkipDownload {
+    param([string]$Component, [string]$Reason)
+    Write-Note (T "Не удалось подготовить ${Component}: $Reason" "Could not prepare ${Component}: $Reason")
+    if (-not (Test-CanPrompt)) {
+        throw (T "Сборка отменена: нельзя спросить, продолжать ли без $Component. Повторите запуск в интерактивной консоли или уберите этот компонент из параметров." "Build cancelled: cannot ask whether to continue without $Component. Run in an interactive console or remove this component from the options.")
+    }
+    if (-not (Read-YesNo -Question (T "Продолжить без «$Component»? Нет — отменить сборку" "Continue without '$Component'? No cancels the build") -Default $false)) {
+        throw (T 'Сборка отменена до обработки образа' 'Build cancelled before image processing')
+    }
+    $script:SkippedDownloads += $Component
+    Write-Note (T "Продолжаю без: $Component" "Continuing without: $Component")
+}
+
+function Remove-ForeignUpdateFiles {
+    param([string]$Directory, [string[]]$Expected)
+    foreach ($file in @(Get-ChildItem -LiteralPath $Directory -Filter *.msu -File | Where-Object { $_.Name -notin $Expected })) {
+        $null = Assert-ChildPath -Path $file.FullName -Root $Directory
+        Remove-Item -LiteralPath $file.FullName -Force
+        Remove-Item -LiteralPath "$($file.FullName).size" -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath "$($file.FullName).sha256" -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-LocalUpdatePayload {
+    param([string]$Directory, [string]$FileName)
+    $target = Get-UpdateTarget -Directory $Directory -FileName $FileName
+    if ($target.PSIsContainer -or $target.Length -le 0) { throw (T "Пустой локальный MSU: $($target.FullName)" "Empty local MSU: $($target.FullName)") }
+    if (Test-Path -LiteralPath (Join-Path $Directory 'update.ready.json')) {
+        if (-not (Read-PreparedCache -Directory $Directory -Key 'update')) {
+            throw (T "Неполный или повреждённый комплект обновлений: $Directory" "Incomplete or corrupt update set: $Directory")
+        }
+    }
+    foreach ($file in @(Get-ChildItem -LiteralPath $Directory -Filter *.msu -File)) {
+        if ($file.Length -le 0 -or ((Test-Path -LiteralPath "$($file.FullName).size") -and -not (Test-SavedUrl $file.FullName))) {
+            throw (T "Неполный или повреждённый MSU: $($file.Name)" "Incomplete or corrupt MSU: $($file.Name)")
+        }
+    }
+    $target
+}
+
+function Save-CatalogPayload {
+    param([string]$Query, [string]$Directory, [string]$TitlePattern = 'Cumulative Update', [switch]$CacheFirst)
+    if ($script:DownloadsClosed) { throw (T 'Подготовка загрузок уже завершена' 'Download preparation is already complete') }
+    $cached = Read-PreparedCache -Directory $Directory -Key 'update'
+    if (-not ($CacheFirst -and $cached)) {
+        try {
+            $update = Search-Catalog -Query $Query | Where-Object {
+                $_.Title -match $TitlePattern -and $_.Title -notmatch 'Dynamic|Preview' -and
+                ($TitlePattern -eq '\.NET Framework' -or $_.Title -notmatch '\.NET')
+            } | Sort-Object Date -Descending | Select-Object -First 1
+            if (-not $update) { throw (T "Обновление не найдено: $Query" "Update not found: $Query") }
+            if ($update.Title -notmatch '\((KB\d+)\)') { throw (T 'В названии обновления нет KB' 'Update title has no KB identifier') }
+            $kb = $matches[1]
+            Write-Ok $update.Title
+            $null = New-Item -ItemType Directory -Path $Directory -Force
+            $files = @(foreach ($url in @(Get-CatalogLinks -UpdateId $update.Id)) {
+                $name = [IO.Path]::GetFileName(([uri]$url).LocalPath)
+                if ($name -notmatch '\.msu$') { continue }
+                $path = Join-Path $Directory $name
+                Save-Url -Url $url -Destination $path
+                $path
+            })
+            $targets = @($files | Where-Object { (Split-Path $_ -Leaf) -match "$kb(?:_|\.|-)" })
+            if ($targets.Count -ne 1) { throw (T "Не найден единственный MSU для $kb" "Cannot identify a unique MSU for $kb") }
+            $targetName = Split-Path $targets[0] -Leaf
+            Remove-ForeignUpdateFiles -Directory $Directory -Expected @($files | ForEach-Object { Split-Path $_ -Leaf })
+            Set-Content -LiteralPath (Join-Path $Directory 'target.txt') -Value $targetName -Encoding ascii
+            Write-PreparedCache -Directory $Directory -Key 'update' -Files $files -Data @{ Target = $targetName; Title = $update.Title }
+            return $targets[0]
+        } catch {
+            $reason = $_.Exception.Message
+            # Проверяем заново: неудачный новый комплект мог изменить файлы старого.
+            $cached = Read-PreparedCache -Directory $Directory -Key 'update'
+            if (-not $cached) { throw }
+            Write-Note (T "Новые обновления недоступны: $reason" "New updates are unavailable: $reason")
+        }
+    }
+    if ($cached.Data.Target -notin @($cached.Files.Name)) { throw (T 'В кэше нет целевого MSU' 'Cached target MSU is missing') }
+    Remove-ForeignUpdateFiles -Directory $Directory -Expected @($cached.Files.Name)
+    Set-Content -LiteralPath (Join-Path $Directory 'target.txt') -Value $cached.Data.Target -Encoding ascii
+    Write-Ok (T "Использую полный проверенный кэш: $($cached.Data.Title)" "Using the complete verified cache: $($cached.Data.Title)")
+    Join-Path $Directory $cached.Data.Target
+}
+
+function Save-WingetPayload {
+    param([string]$Directory)
+    if ($script:DownloadsClosed) { throw (T 'Подготовка загрузок уже завершена' 'Download preparation is already complete') }
+    $cached = Read-PreparedCache -Directory $Directory -Key 'winget'
+    if (-not $cached) {
+        $null = New-Item -ItemType Directory -Path $Directory -Force
+        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/microsoft/winget-cli/releases/latest' -Headers @{ 'User-Agent' = 'win-11-lite' } -TimeoutSec 30
+        $bundleAsset = $release.assets | Where-Object { $_.name -like '*.msixbundle' } | Select-Object -First 1
+        $licenseAsset = $release.assets | Where-Object { $_.name -like '*License1.xml' } | Select-Object -First 1
+        $depsAsset = $release.assets | Where-Object { $_.name -eq 'DesktopAppInstaller_Dependencies.zip' } | Select-Object -First 1
+        $assets = @($bundleAsset, $licenseAsset, $depsAsset)
+        foreach ($asset in $assets) {
+            if (-not $asset -or -not $asset.browser_download_url -or [IO.Path]::GetFileName($asset.name) -ne $asset.name) {
+                throw (T 'В релизе winget нет полного комплекта: bundle, лицензия, зависимости' 'Winget release is missing its bundle, license or dependencies')
+            }
+            Save-Url -Url $asset.browser_download_url -Destination (Join-Path $Directory $asset.name)
+        }
+        $data = @{ Bundle = $bundleAsset.name; License = $licenseAsset.name; Dependencies = $depsAsset.name; Version = $release.tag_name }
+    } else {
+        $data = $cached.Data
+        Write-Ok (T "winget $($data.Version) — полный комплект в кэше" "winget $($data.Version) - complete set cached")
+    }
+    $bundle = Assert-ChildPath -Path (Join-Path $Directory $data.Bundle) -Root $Directory
+    $license = Assert-ChildPath -Path (Join-Path $Directory $data.License) -Root $Directory
+    $deps = Assert-ChildPath -Path (Join-Path $Directory $data.Dependencies) -Root $Directory
+    $depsDir = Assert-ChildPath -Path (Join-Path $Directory 'deps') -Root $Directory
+    if (Test-Path -LiteralPath $depsDir) { Remove-Item -LiteralPath $depsDir -Recurse -Force }
+    Expand-Archive -LiteralPath $deps -DestinationPath $depsDir -Force
+    $depFiles = @(Get-ChildItem -LiteralPath $depsDir -Recurse -File |
+        Where-Object { $_.Extension -in @('.appx', '.msix') -and $_.FullName -match '\\(x64|neutral)\\' })
+    if (-not $depFiles.Count) { throw (T 'В архиве winget нет зависимостей x64/neutral' 'Winget archive has no x64/neutral dependencies') }
+    $null = [xml](Get-Content -LiteralPath $license -Raw)
+    Write-PreparedCache -Directory $Directory -Key 'winget' -Files @($bundle, $license, $deps) -Data $data
+    [pscustomobject]@{ Bundle = $bundle; License = $license; Dependencies = @($depFiles.FullName); Version = $data.Version }
 }
 
 #endregion
@@ -1183,6 +1480,164 @@ function Save-Url {
 #   LoF ISO : Microsoft-Windows-Client-Language-Pack_x64_ru-ru.cab
 #   UUP     : Microsoft-Windows-Client-LanguagePack-Package-amd64-ru-RU.esd
 # Поэтому подбираем регулярным выражением, а не точным именем.
+function Get-SetupFontPackage {
+    param([string]$Tag)
+    if ($Tag -in @('ja-JP','ko-KR','zh-CN','zh-HK','zh-TW')) { return "WinPE-FontSupport-$($Tag.ToUpperInvariant()).cab" }
+    if ($Tag -eq 'th-TH') { return 'WinPE-FontSupport-WinRE.cab' }
+}
+
+function Get-CabIdentity {
+    param([string]$Path, [string]$Scratch)
+    $null = New-Item -ItemType Directory -Path $Scratch -Force
+    $mum = Join-Path $Scratch 'update.mum'
+    if (Test-Path -LiteralPath $mum) { Remove-Item -LiteralPath $mum -Force }
+    $result = Invoke-NativeQuiet expand.exe @($Path, '-F:update.mum', $Scratch)
+    if ($result -ne 0 -or -not (Test-Path -LiteralPath $mum)) { throw (T "Не удалось прочитать CAB: $Path" "Could not read CAB: $Path") }
+    ([xml](Get-Content -LiteralPath $mum -Raw)).assembly.assemblyIdentity
+}
+
+function Save-SetupLanguagePayload {
+    param([string]$Tag, [int]$Build, [string]$Directory, [string]$Source)
+    if ($script:DownloadsClosed) { throw (T 'Подготовка загрузок уже завершена' 'Download preparation is already complete') }
+    $tagLower = $Tag.ToLowerInvariant()
+    if ($tagLower -notmatch '^[a-z]{2}-[a-z]{2}$') { throw (T "Язык WinPE не поддерживается: $Tag" "Unsupported WinPE language: $Tag") }
+    $required = @('lp.cab', "WinPE-Setup_$tagLower.cab", "WinPE-Setup-Client_$tagLower.cab")
+    $font = Get-SetupFontPackage $Tag
+    $key = "setup-$Build-$tagLower"
+    $dir = Join-Path $Directory $key
+    $localeDir = Join-Path $dir $tagLower
+    $cached = Read-PreparedCache -Directory $dir -Key 'setup'
+    if ($cached -and @($required | Where-Object { "$tagLower/$_" -notin @($cached.Files.Name -replace '\\','/') }).Count -eq 0 -and
+        (-not $font -or $font -in @($cached.Files.Name))) {
+        Write-Ok (T "Установщик $Tag — полный комплект WinPE в кэше" "Setup $Tag - complete WinPE set cached")
+        return [pscustomobject]@{ Tag=$Tag; Build=$Build; Directory=$dir; LocaleDirectory=$localeDir; Font=$font }
+    }
+    $null = New-Item -ItemType Directory -Path $localeDir -Force
+    $files = @()
+    if ($Source) {
+        $sourceLocale = Join-Path $Source $tagLower
+        foreach ($name in $required) {
+            if (-not (Test-Path -LiteralPath (Join-Path $sourceLocale $name) -PathType Leaf)) { throw (T "Нет $name в $sourceLocale" "Missing $name in $sourceLocale") }
+        }
+        foreach ($file in @(Get-ChildItem -LiteralPath $sourceLocale -Filter *.cab -File)) {
+            $dest = Join-Path $localeDir $file.Name
+            Copy-Item -LiteralPath $file.FullName -Destination $dest -Force
+            $files += $dest
+        }
+        if ($font) {
+            $dest = Join-Path $dir $font
+            Copy-Item -LiteralPath (Join-Path $Source $font) -Destination $dest -Force
+            $files += $dest
+        }
+    } else {
+        if ($Build -ne 26100) { throw (T "Автозагрузка WinPE для билда $Build не настроена. Укажите совместимый каталог -SetupLanguageSource <WinPE_OCs>." "WinPE downloads for build $Build are not configured. Supply matching -SetupLanguageSource <WinPE_OCs>.") }
+        $catalog = Get-Content -LiteralPath (Join-Path $script:ScriptRoot "data\winpe-$Build.json") -Raw | ConvertFrom-Json
+        if ($catalog.Build -ne $Build -or $catalog.Architecture -ne 'amd64') { throw (T 'Несовместимый каталог WinPE' 'Incompatible WinPE catalog') }
+        $selected = @($catalog.Files | Where-Object { $_.Path -like "$tagLower/*" -or ($font -and $_.Path -eq $font) })
+        foreach ($name in $required) {
+            if ("$tagLower/$name" -notin @($selected.Path)) { throw (T "Microsoft WinPE не содержит $name" "Microsoft WinPE does not contain $name") }
+        }
+        if ($font -and $font -notin @($selected.Path)) { throw (T "Нет обязательных шрифтов $font" "Required fonts missing: $font") }
+        $archiveDir = Join-Path $Directory "winpe-$Build-archives"
+        $null = New-Item -ItemType Directory -Path $archiveDir -Force
+        foreach ($archiveName in @($selected.Archive | Sort-Object -Unique)) {
+            $archive = $catalog.Archives | Where-Object { $_.Name -eq $archiveName } | Select-Object -First 1
+            if (-not $archive -or [IO.Path]::GetFileName($archiveName) -ne $archiveName) { throw (T 'Неверный архив WinPE' 'Invalid WinPE archive') }
+            $archivePath = Join-Path $archiveDir $archiveName
+            # SHA1 взят из манифеста подписанного Microsoft bootstrapper, не с сайта-зеркала.
+            $valid = (Test-Path -LiteralPath $archivePath) -and (Get-Item -LiteralPath $archivePath).Length -eq $archive.Size -and
+                (Get-FileHash -LiteralPath $archivePath -Algorithm SHA1).Hash -eq $archive.SHA1
+            if (-not $valid) {
+                Remove-Item -LiteralPath "$archivePath.size" -Force -ErrorAction SilentlyContinue
+                Write-Step (T "Загружаю комплект языков WinPE ($(Format-Size $archive.Size)); повторно он не скачивается" "Downloading WinPE language archive ($(Format-Size $archive.Size)); it will be reused")
+                Save-Url -Url ($catalog.BaseUrl + $archiveName) -Destination $archivePath
+                if ((Get-Item -LiteralPath $archivePath).Length -ne $archive.Size -or (Get-FileHash -LiteralPath $archivePath -Algorithm SHA1).Hash -ne $archive.SHA1) {
+                    throw (T "Контрольная сумма архива WinPE не совпала: $archiveName" "WinPE archive checksum mismatch: $archiveName")
+                }
+            }
+            $extractDir = Join-Path $archiveDir 'extract'
+            $null = New-Item -ItemType Directory -Path $extractDir -Force
+            # Один проход по CAB: последовательная распаковка каждого файла повторяла бы чтение 305 МБ.
+            $result = Invoke-NativeQuiet expand.exe @($archivePath, '-F:*', $extractDir)
+            if ($result -ne 0) { throw (T 'Не удалось распаковать архив WinPE' 'Failed to extract WinPE archive') }
+            foreach ($entry in @($selected | Where-Object { $_.Archive -eq $archiveName })) {
+                if ($entry.Member -notmatch '^fil[a-f0-9]{32}$') { throw (T 'Неверное имя файла WinPE' 'Invalid WinPE member name') }
+                $dest = Assert-ChildPath -Path (Join-Path $dir $entry.Path) -Root $dir
+                $file = Get-Item -LiteralPath (Join-Path $extractDir $entry.Member)
+                if ($file.Length -ne $entry.Size) { throw (T "Неполный файл WinPE: $($entry.Path)" "Incomplete WinPE file: $($entry.Path)") }
+                Copy-Item -LiteralPath $file.FullName -Destination $dest -Force
+                $files += $dest
+            }
+            $null = Assert-ChildPath -Path $extractDir -Root $archiveDir
+            Remove-Item -LiteralPath $extractDir -Recurse -Force
+        }
+    }
+    foreach ($name in $required) {
+        $identity = Get-CabIdentity -Path (Join-Path $localeDir $name) -Scratch (Join-Path $dir 'metadata')
+        $expectedName = if ($name -eq 'lp.cab') { 'Microsoft-Windows-WinPE-LanguagePack-Package' } else { ($name -split '_')[0] + '-Package' }
+        if ($identity.name -ne $expectedName -or $identity.processorArchitecture -ne 'amd64' -or
+            $identity.language -ne $Tag -or ([version]$identity.version).Build -ne $Build) {
+            throw (T "Несовместимый пакет WinPE: $name ($($identity.OuterXml))" "Incompatible WinPE package: $name ($($identity.OuterXml))")
+        }
+    }
+    foreach ($stale in @(Get-ChildItem -LiteralPath $localeDir -Filter *.cab -File | Where-Object { $_.FullName -notin $files })) {
+        $null = Assert-ChildPath -Path $stale.FullName -Root $dir
+        Remove-Item -LiteralPath $stale.FullName -Force
+    }
+    Write-PreparedCache -Directory $dir -Key 'setup' -Files $files -Data @{Tag=$Tag;Build=$Build}
+    [pscustomobject]@{ Tag=$Tag; Build=$Build; Directory=$dir; LocaleDirectory=$localeDir; Font=$font }
+}
+
+function Add-SetupLanguage {
+    param([string]$Image, [string]$WindowsImage, [string]$Distribution, $Payload, [string]$RepairUpdate, [switch]$Legacy)
+    $tag = $Payload.Tag
+    $inventory = Invoke-Dism -Arguments @("/Image:$Image", '/Get-Packages') -Quiet
+    $packages = @(ConvertFrom-DismList -Lines $inventory.Output -Key 'Package Identity')
+    $names = @($packages | Where-Object { $_.'Package Identity' -match '^WinPE-.+-Package~[^~]+~amd64~~' } |
+        ForEach-Object { ($_.'Package Identity' -split '-Package~')[0] } | Sort-Object -Unique)
+    foreach ($required in @('WinPE-Setup','WinPE-Setup-Client')) {
+        if ($required -notin $names) { throw (T "В boot.wim нет $required" "boot.wim does not contain $required") }
+    }
+    $paths = @((Join-Path $Payload.LocaleDirectory 'lp.cab'))
+    foreach ($name in $names) {
+        $file = Join-Path $Payload.LocaleDirectory "${name}_$tag.cab"
+        if (Test-Path -LiteralPath $file -PathType Leaf) { $paths += $file }
+        elseif ($name -in @('WinPE-Setup','WinPE-Setup-Client','WinPE-LegacySetup')) { throw (T "Нет языкового пакета $name для $tag" "Missing $name language package for $tag") }
+    }
+    if ($Payload.Font) { $paths += Join-Path $Payload.Directory $Payload.Font }
+    foreach ($path in $paths) {
+        Invoke-Dism -Arguments @("/Image:$Image", '/Add-Package', "/PackagePath:$path") -Activity (T "Язык установщика: $(Split-Path $path -Leaf)" "Setup language: $(Split-Path $path -Leaf)") | Out-Null
+    }
+    if ($RepairUpdate) {
+        Invoke-Dism -Arguments @("/Image:$Image", '/Add-Package', "/PackagePath:$RepairUpdate") -Activity (T 'Обновление языковых ресурсов WinPE' 'Servicing WinPE language resources') | Out-Null
+    }
+    Invoke-Dism -Arguments @("/Image:$Image", "/Set-AllIntl:$tag") -Quiet | Out-Null
+    # Ресурсы обоих установщиков доставлены пакетами WinPE. Копируем уже
+    # обслуженные файлы из boot.wim; русскоязычный ISO-донор не требуется.
+    $resources = Join-Path $Image "sources\$tag"
+    $requiredMui = @('setup.exe.mui', 'spwizres.dll.mui')
+    if (-not $Legacy -and $Payload.Build -ge 26100) { $requiredMui += 'mediasetupuimgr.dll.mui' }
+    foreach ($name in $requiredMui) {
+        $file = Get-Item -LiteralPath (Join-Path $resources $name) -ErrorAction Stop
+        if ($file.Length -le 0) { throw (T "Пустой ресурс установщика: $name" "Empty Setup resource: $name") }
+    }
+    $dest = Join-Path $Distribution "sources\$tag"
+    $null = New-Item -ItemType Directory -Path $dest -Force
+    Get-ChildItem -LiteralPath $resources -Force | Copy-Item -Destination $dest -Recurse -Force
+    foreach ($name in @('setup.exe','setuphost.exe')) {
+        $file = Join-Path $Image "sources\$name"
+        if (Test-Path -LiteralPath $file) { Copy-Item -LiteralPath $file -Destination (Join-Path $Distribution "sources\$name") -Force }
+    }
+    Invoke-Dism -Arguments @("/Image:$WindowsImage", '/Gen-LangINI', "/Distribution:$Distribution") -Quiet | Out-Null
+    Invoke-Dism -Arguments @("/Image:$Image", "/Set-SetupUILang:$tag", "/Distribution:$Distribution") -Quiet | Out-Null
+    Copy-Item -LiteralPath (Join-Path $Distribution 'sources\lang.ini') -Destination (Join-Path $Image 'sources\lang.ini') -Force
+    $intl = Invoke-Dism -Arguments @("/Image:$Image", '/Get-Intl') -Quiet
+    if (-not @($intl.Output | Where-Object { $_ -match ('Default system UI language\s*:\s*' + [regex]::Escape($tag) + '\s*$') }).Count) {
+        throw (T "Язык WinPE $tag не подтверждён DISM" "WinPE language $tag was not confirmed by DISM")
+    }
+    Write-Ok (T "Установщик переведён на $tag" "Setup translated to $tag")
+}
+
 function Get-LanguagePattern {
     param([string]$Tag, [string]$Kind)
     $t = [regex]::Escape($Tag)
@@ -1358,6 +1813,20 @@ function Write-GuardLog {
     param([string]$Level, [string]$Message)
     "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Message" | Add-Content -LiteralPath $logFile -Encoding UTF8
 }
+# takeown/icacls report problems on stderr. Under Windows PowerShell 5.1 with
+# ErrorActionPreference=Stop a redirected stderr line becomes an exception
+# before Remove-Item runs, so the preference is relaxed only inside this helper.
+function Grant-SystemAccess {
+    param([string]$Path, [switch]$Recurse)
+    $ErrorActionPreference = 'Continue'
+    if ($Recurse) {
+        & takeown.exe /F $Path /R /A /D Y *> $null
+        & icacls.exe $Path /grant '*S-1-5-18:(OI)(CI)F' /T /C /Q *> $null
+    } else {
+        & takeown.exe /F $Path /A *> $null
+        & icacls.exe $Path /grant '*S-1-5-18:F' /C /Q *> $null
+    }
+}
 function Test-GuardMatch {
     param([string]$Name, [string[]]$Patterns)
     foreach ($pattern in @($config.Protected)) { if ($pattern -and $Name -match $pattern) { return $false } }
@@ -1486,13 +1955,10 @@ try {
                         if ((Get-Item -LiteralPath $cursor -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) { return 'skipped' }
                         $cursor = Split-Path $cursor -Parent
                     }
+                    Grant-SystemAccess -Path $full -Recurse:$item.PSIsContainer
                     if ($item.PSIsContainer) {
-                        & takeown.exe /F $full /R /A /D Y *> $null
-                        & icacls.exe $full /grant '*S-1-5-18:(OI)(CI)F' /T /C /Q *> $null
                         Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
                     } else {
-                        & takeown.exe /F $full /A *> $null
-                        & icacls.exe $full /grant '*S-1-5-18:F' /C /Q *> $null
                         Remove-Item -LiteralPath $full -Force -ErrorAction Stop
                     }
                     if (Test-Path -LiteralPath $full) { throw (T 'Объект остался после удаления' 'Object remains after removal') }
@@ -1608,8 +2074,12 @@ try {
                 Get-Process -Name msedge -ErrorAction SilentlyContinue | Where-Object {
                     $_.Path -and $_.Path.StartsWith("$browser\", [StringComparison]::OrdinalIgnoreCase)
                 } | Stop-Process -Force
-                & takeown.exe /F $browser /A /R /D Y *> $null
-                & icacls.exe $browser /grant '*S-1-5-18:(OI)(CI)F' /T /C /Q *> $null
+                & {
+                    # takeown/icacls write to stderr; under PowerShell 5.1 with Stop that would throw before Remove-Item.
+                    $ErrorActionPreference = 'Continue'
+                    & takeown.exe /F $browser /A /R /D Y *> $null
+                    & icacls.exe $browser /grant '*S-1-5-18:(OI)(CI)F' /T /C /Q *> $null
+                }
                 Remove-Item -LiteralPath $browser -Recurse -Force
                 if (Test-Path -LiteralPath $browser) { throw (T "Не удалось удалить Edge: $browser" "Edge removal failed: $browser") }
             }
@@ -1629,7 +2099,7 @@ try {
     }
 } catch {
     $failed = $true
-    "$(Get-Date -Format s) $($_.Exception.Message)" | Add-Content -LiteralPath $log
+    "$(Get-Date -Format s) $($_.Exception.Message)" | Add-Content -LiteralPath $log -Encoding UTF8
 } finally {
     # Always restore connectivity, even if optional cleanup failed.
     if (-not $EdgeOnly -and __OOBE__) {
@@ -1655,12 +2125,12 @@ try {
         }
     } catch {
         $failed = $true
-        "$(Get-Date -Format s) $(T 'Ошибка восстановления' 'Restore failed'): $($_.Exception.Message)" | Add-Content -LiteralPath $log
+        "$(Get-Date -Format s) $(T 'Ошибка восстановления' 'Restore failed'): $($_.Exception.Message)" | Add-Content -LiteralPath $log -Encoding UTF8
     }
     }
 }
 if (-not $failed -and -not $EdgeOnly) {
-    "$(Get-Date -Format s) $(T 'Завершение установки выполнено' 'Finalization completed')" | Add-Content -LiteralPath $log
+    "$(Get-Date -Format s) $(T 'Завершение установки выполнено' 'Finalization completed')" | Add-Content -LiteralPath $log -Encoding UTF8
     Unregister-ScheduledTask -TaskName 'win-11-lite finalize' -Confirm:$false -ErrorAction SilentlyContinue
 }
 } finally { $finalizeLock.Dispose() }
@@ -1679,23 +2149,7 @@ function Get-LanguageRepairUpdate {
     if (-not $kb) {
         throw (T "Языковым ресурсам нужно повторное применение LCU ($Revision). Задайте -LanguageUpdatePath <MSU> или -WithUpdates, либо возьмите исходный ISO на нужном языке." "Language resources require the source LCU again ($Revision). Supply -LanguageUpdatePath <MSU> or -WithUpdates, or use a native language ISO.")
     }
-    $update = Search-Catalog -Query "$kb x64" | Where-Object {
-        $_.Title -match 'Windows 11' -and $_.Title -match 'x64' -and $_.Title -match $kb -and
-        $_.Title -notmatch 'Dynamic|Preview|\.NET'
-    } | Sort-Object Date -Descending | Select-Object -First 1
-    if (-not $update) { throw (T "Обновление $kb для обслуживания языка не найдено" "Language repair update $kb was not found") }
-    $dir = Join-Path $Destination "language-repair-$Revision"
-    $null = New-Item -ItemType Directory -Path $dir -Force
-    $files = @()
-    foreach ($url in @(Get-CatalogLinks -UpdateId $update.Id)) {
-        $name = [IO.Path]::GetFileName(([uri]$url).LocalPath)
-        if ($name -notmatch '\.msu$') { continue }
-        $file = Join-Path $dir $name
-        Save-Url -Url $url -Destination $file
-        if ($name -match $kb) { $files += $file }
-    }
-    if ($files.Count -ne 1) { throw (T "Нельзя однозначно определить MSU для $kb" "Cannot identify the target MSU for $kb") }
-    $files[0]
+    Save-CatalogPayload -Query "$kb x64" -Directory (Join-Path $Destination "language-repair-$Revision") -TitlePattern "Windows 11.*$kb.*x64|Windows 11.*x64.*$kb" -CacheFirst
 }
 
 # Скачивание языковых пакетов через каталог UUP. Сами файлы лежат на CDN
@@ -1708,7 +2162,14 @@ function Save-LanguageFromCatalog {
         # Полная ревизия образа, например 26100.1742
         [string]$Revision
     )
+    if ($script:DownloadsClosed) { throw (T 'Подготовка загрузок уже завершена' 'Download preparation is already complete') }
     $null = New-Item -ItemType Directory -Path $Destination -Force
+    $Tags = @($Tags | Where-Object {
+        $ready = Read-PreparedCache -Directory $Destination -Key "language-$_-$Revision"
+        if ($ready) { Write-Ok (T "Язык $_ — полный комплект в кэше" "Language $_ - complete set cached") }
+        -not $ready
+    })
+    if (-not $Tags.Count) { return }
 
     Write-Step (T "Ищу сборку $Build в каталоге обновлений" "Looking for build $Build in the update catalog")
     $list = Invoke-RestMethod -Uri "https://api.uupdump.net/listid.php?search=$Build" -TimeoutSec 60
@@ -1747,6 +2208,7 @@ function Save-LanguageFromCatalog {
         if (-not $info.response.files) { throw (T "Нет файлов языка $tag" "No language files for $tag") }
 
         $entries = @($info.response.files.PSObject.Properties)
+        $languageFiles = @()
         foreach ($kind in $kinds) {
             $pattern = Get-LanguagePattern -Tag $tag -Kind $kind
             $hit = $entries | Where-Object { $_.Name -match $pattern } | Select-Object -First 1
@@ -1756,23 +2218,30 @@ function Save-LanguageFromCatalog {
             if ([IO.Path]::GetFileName($hit.Name) -ne $hit.Name) { throw (T 'Неверное имя скачиваемого файла' 'Invalid download filename') }
             if (-not $hit.Value.sha256) { throw (T "Нет SHA256 для $($hit.Name)" "No SHA256 for $($hit.Name)") }
             $dest = Join-Path $Destination $hit.Name
+            $languageFiles += $dest
             if ((Test-Path -LiteralPath $dest) -and (Get-Item -LiteralPath $dest).Length -eq $hit.Value.size -and
                 (Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash -eq $hit.Value.sha256) {
                 Write-Ok (T "  $($hit.Name) — уже в кэше" "  $($hit.Name) - already cached")
                 continue
             }
             Write-Step (T "  Загрузка $($hit.Name) ($(Format-Size $hit.Value.size)) ..." "  Downloading $($hit.Name) ($(Format-Size $hit.Value.size)) ...")
-            & curl.exe -L --fail --retry 3 --retry-delay 5 -o $dest $hit.Value.url
-            if ($LASTEXITCODE -ne 0) { throw (T "Ошибка загрузки: $($hit.Name)" "Download failed: $($hit.Name)") }
+            # Неверный файл не должен пройти проверку Save-Url по старой .size.
+            Remove-Item -LiteralPath "$dest.size" -Force -ErrorAction SilentlyContinue
+            Save-Url -Url $hit.Value.url -Destination $dest
+            if ((Get-Item -LiteralPath $dest).Length -ne $hit.Value.size) {
+                Remove-Item -LiteralPath $dest, "$dest.size" -Force
+                throw (T "Размер $($hit.Name) не совпал" "Size mismatch for $($hit.Name)")
+            }
             if ($hit.Value.sha256) {
                 $actual = (Get-FileHash -LiteralPath $dest -Algorithm SHA256).Hash
                 if ($actual -ne $hit.Value.sha256.ToUpper()) {
-                    Remove-Item -LiteralPath $dest -Force
+                    Remove-Item -LiteralPath $dest, "$dest.size" -Force
                     throw (T "Контрольная сумма $($hit.Name) не совпала — файл удалён" "Checksum mismatch for $($hit.Name) - file deleted")
                 }
             }
             Write-Ok (T "  $($hit.Name) — загружено, SHA-256 совпал" "  $($hit.Name) - downloaded, SHA-256 matches")
         }
+        Write-PreparedCache -Directory $Destination -Key "language-$tag-$Revision" -Files $languageFiles -Data @{ Revision = $Revision; Tag = $tag }
     }
 }
 
@@ -1807,8 +2276,10 @@ function Mount-Hive {
 }
 
 function Dismount-Hives {
+    if (-not $script:LoadedHives.Count) { return }
+    # Открытые дескрипторы реестра мешают выгрузке — освобождаем их один раз до цикла
+    [gc]::Collect(); [gc]::WaitForPendingFinalizers()
     foreach ($name in @($script:LoadedHives)) {
-        [gc]::Collect(); [gc]::WaitForPendingFinalizers()
         $result = Invoke-RegCommand -Arguments @('unload', "HKLM\$name")
         if ($result.ExitCode -eq 0) {
             $script:LoadedHives = @($script:LoadedHives | Where-Object { $_ -ne $name })
@@ -1829,9 +2300,10 @@ function Set-Reg {
     }
 }
 
+# Отсутствующий ключ — штатная ситуация, поэтому код возврата не проверяется.
 function Remove-Reg {
     param([string]$Path)
-    & reg.exe delete $Path /f *>&1 | Out-Null
+    $null = Invoke-RegCommand -Arguments @('delete', $Path, '/f')
 }
 
 #endregion
@@ -1839,7 +2311,11 @@ function Remove-Reg {
 #region ── Стадия 0. Preflight ─────────────────────────────────────────────────
 
 $script:FreedBytes = 0
+$script:DownloadsClosed = $false
+$script:SkippedDownloads = @()
+$script:WorkPrepared = $false
 $script:Mounted = $false
+$script:BootMounted = $false
 $script:IsoMounted = $null
 $script:LangIso = $null
 # --- права администратора ---
@@ -1890,7 +2366,7 @@ if ($script:WizardMode) {
 
     # 3. Рабочая папка
     Write-Host ''
-    $defaultWork = Join-Path ([IO.Path]::GetTempPath()) 'win-11-lite-work'
+    $defaultWork = $WorkDir
     $WorkDir = Read-PathOrDefault -Question (T 'Рабочая папка для сборки (нужно ~30 ГБ)' 'Work folder for the build (about 30 GB needed)') -Default $defaultWork
     $script:WorkDirExplicit = $true
 
@@ -1988,6 +2464,9 @@ if ($script:WizardMode) {
     if ($Preset -ne 'balanced') { $cmd += " -Preset $Preset" }
     if ($WorkDir -ne $defaultWork) { $cmd += " -WorkDir `"$WorkDir`"" }
     if ($DownloadLanguage)   { $cmd += " -DownloadLanguage $($DownloadLanguage -join ',')" }
+    if ($SetupLanguage -ne 'auto') { $cmd += " -SetupLanguage $SetupLanguage" }
+    if ($SetupLanguageSource) { $cmd += " -SetupLanguageSource `"$SetupLanguageSource`"" }
+    if ($SetupLanguageUpdatePath) { $cmd += " -SetupLanguageUpdatePath `"$SetupLanguageUpdatePath`"" }
     if ($WithUpdates)        { $cmd += ' -WithUpdates' }
     if ($WithWinget)         { $cmd += ' -WithWinget' }
     if ($LegacySetup)        { $cmd += ' -LegacySetup' }
@@ -2028,6 +2507,9 @@ if ($Unattend -and $Unattend -ne 'none') {
     $null = [xml](Get-Content -LiteralPath $Unattend -Raw)
 }
 if ($LanguageUpdatePath) { $LanguageUpdatePath = (Resolve-Path -LiteralPath $LanguageUpdatePath).Path }
+if ($SetupLanguageUpdatePath) { $SetupLanguageUpdatePath = (Resolve-Path -LiteralPath $SetupLanguageUpdatePath).Path }
+if ($SetupLanguageSource) { $SetupLanguageSource = (Resolve-Path -LiteralPath $SetupLanguageSource).Path }
+if ($SetupLanguage -notin @('auto','original') -and $SetupLanguage -notmatch '^[a-z]{2}-[a-z]{2}$') { throw (T "Неверный язык установщика: $SetupLanguage" "Invalid Setup language: $SetupLanguage") }
 foreach ($tag in @($AddLanguage) + @($DownloadLanguage)) {
     if ($tag -and $tag -notmatch '^[a-z]{2,3}(?:-[a-z0-9]{2,8})+$') { throw (T "Неверный код языка: $tag" "Invalid language tag: $tag") }
 }
@@ -2104,7 +2586,7 @@ function Test-SafeToWipe {
     if ($full -eq [IO.Path]::GetFullPath($env:SystemRoot).TrimEnd('\')) { return $false }
 
     # каталог с исходным ISO и папка результатов тоже под запретом
-    foreach ($protectedPath in @($InputIso, $OutputIso, $UpdatesDir, $script:ScriptRoot, $Unattend, $LanguageSource, $DriversDir, $LanguageUpdatePath, $LogFile)) {
+    foreach ($protectedPath in @($InputIso, $OutputIso, $UpdatesDir, $script:ScriptRoot, $Unattend, $LanguageSource, $DriversDir, $LanguageUpdatePath, $SetupLanguageSource, $SetupLanguageUpdatePath, $LogFile)) {
         if (-not $protectedPath -or $protectedPath -eq 'none') { continue }
         $k = [IO.Path]::GetFullPath($protectedPath).TrimEnd('\')
         if ($full -eq $k -or $k.StartsWith("$full\", [StringComparison]::OrdinalIgnoreCase)) { return $false }
@@ -2239,7 +2721,7 @@ if ($isAdmin -and -not $DryRun -and $script:Dism) {
         $wimSetup = Join-Path (Split-Path $script:Dism -Parent) 'WimMountAdkSetupAmd64.exe'
         if (Test-Path $wimSetup) {
             Write-Step (T 'Регистрирую драйвер монтирования WIMMount из ADK ...' 'Registering WIMMount driver from ADK ...')
-            & $wimSetup /Install *>&1 | Out-Null
+            $null = Invoke-NativeQuiet $wimSetup @('/Install')
             Start-Sleep -Seconds 2
             if (Test-Path $wimMountKey) { Write-Ok (T 'Драйвер WIMMount зарегистрирован' 'WIMMount driver registered') }
             else { Write-Note (T 'Не удалось зарегистрировать WIMMount — монтирование образа может не сработать' 'Failed to register WIMMount - mounting the image may fail') }
@@ -2275,16 +2757,7 @@ if ($null -eq $freeGB) {
 if ($DownloadLanguage -and -not $AddLanguage) { $AddLanguage = $DownloadLanguage }
 
 if ($AddLanguage) {
-    if ($DownloadLanguage) {
-        if (-not $DryRun) {
-            try {
-                $null = Invoke-WebRequest -Uri 'https://api.uupdump.net/' -UseBasicParsing -TimeoutSec 30 -Method Head
-                Write-Ok (T 'Каталог языковых пакетов доступен' 'Language package catalog is reachable')
-            } catch {
-                throw (T "Нет доступа к каталогу языковых пакетов: $($_.Exception.Message)`nИспользуйте -LanguageSource с локальным LoF-образом." "No access to the language package catalog: $($_.Exception.Message)`nUse -LanguageSource with a local LoF image.")
-            }
-        }
-    } elseif (-not $LanguageSource) {
+    if (-not $DownloadLanguage -and -not $LanguageSource) {
         throw (T @'
 Указан -AddLanguage, но не задан ни -LanguageSource, ни -DownloadLanguage.
 
@@ -2319,29 +2792,6 @@ Or download the packages automatically:
     }
 }
 
-# --- сеть ---
-if ($UpdateMode -eq 'download' -and -not $DryRun) {
-    try {
-        $null = Invoke-WebRequest -Uri 'https://www.catalog.update.microsoft.com/' -UseBasicParsing -TimeoutSec 30 -Method Head
-        Write-Ok (T 'Microsoft Update Catalog доступен' 'Microsoft Update Catalog is reachable')
-    } catch {
-        throw (T "Нет доступа к Microsoft Update Catalog: $($_.Exception.Message)`nЗапустите с -UpdateMode local или -UpdateMode none." "No access to Microsoft Update Catalog: $($_.Exception.Message)`nRun with -UpdateMode local or -UpdateMode none.")
-    }
-}
-
-# --- висящие точки монтирования ---
-if ($isAdmin -and -not $DryRun) {
-    $mountInfo = Invoke-Dism -Arguments @('/Get-MountedImageInfo') -AllowFail -Quiet
-    $stale = @($mountInfo.Output | Select-String -Pattern '^\s*Mount Dir\s*:\s*(.+?)\s*$' |
-               ForEach-Object { $_.Matches[0].Groups[1].Value })
-    foreach ($dir in $stale) {
-        if ($dir -notin @($mountDir, $bootMountDir)) { continue }
-        if (-not (Test-Path -LiteralPath (Join-Path $WorkDir $script:WorkDirMarker))) { throw (T "Чужая точка монтирования: $dir" "Unowned mount: $dir") }
-        Write-Note (T "Отцепляю оставшийся с прошлого раза образ: $dir" "Discarding image left over from a previous run: $dir")
-        Invoke-Dism -Arguments @('/Unmount-Image', "/MountDir:$dir", '/Discard') -Quiet | Out-Null
-    }
-    Write-Ok (T 'Проверены точки монтирования этой сборки' 'Checked mount points belonging to this build')
-}
 
 #endregion
 
@@ -2349,57 +2799,7 @@ try {
 
 #region ── Стадия 1. Распаковка ISO ────────────────────────────────────────────
 
-Write-Stage (T 'Распаковка исходного ISO' 'Extracting the source ISO')
-
-if (-not $DryRun) {
-    if ($ClearCache -and (Test-Path $UpdatesDir)) {
-        if (-not (Test-Path -LiteralPath (Join-Path $UpdatesDir '.win-11-lite-cache'))) { throw (T 'Отказ от очистки кэша без метки принадлежности скрипту' 'Refusing to clear an unmarked cache directory') }
-        $null = Assert-ChildPath -Path $UpdatesDir -Root (Split-Path $UpdatesDir -Parent)
-        foreach ($protectedPath in @($InputIso, $OutputIso, $WorkDir, $script:ScriptRoot, $LanguageSource, $Unattend, $DriversDir, $LanguageUpdatePath)) {
-            if (-not $protectedPath -or $protectedPath -eq 'none') { continue }
-            $fullProtected = [IO.Path]::GetFullPath($protectedPath)
-            if ($fullProtected -eq $UpdatesDir -or $fullProtected.StartsWith("$UpdatesDir\", [StringComparison]::OrdinalIgnoreCase)) {
-                throw (T "В кэше находятся защищённые файлы: $fullProtected" "Cache contains protected files: $fullProtected")
-            }
-        }
-        Write-Step (T 'Очищаю кэш обновлений' 'Clearing the update cache')
-        Remove-Item -LiteralPath $UpdatesDir -Recurse -Force
-    }
-    $null = New-Item -ItemType Directory -Path $UpdatesDir -Force
-    if (-not @(Get-ChildItem -LiteralPath $UpdatesDir -Force).Count) {
-        Set-Content -LiteralPath (Join-Path $UpdatesDir '.win-11-lite-cache') -Value 'win-11-lite cache' -Encoding ascii
-    }
-
-    if (Test-Path $WorkDir) {
-        # Три независимые проверки, и все должны пройти: путь ведёт в нашу
-        # подпапку, это не системный каталог, и внутри лежит наша метка.
-        if (-not (Test-SafeToWipe $WorkDir)) {
-            throw (T "Отказываюсь очищать $WorkDir — путь не похож на рабочий каталог скрипта. Укажите другой через -WorkDir." `
-                     "Refusing to wipe $WorkDir - the path does not look like this script's work folder. Pick another one with -WorkDir.")
-        }
-        $markerPath = Join-Path $WorkDir $script:WorkDirMarker
-        $hasContent = @(Get-ChildItem -LiteralPath $WorkDir -Force -ErrorAction SilentlyContinue).Count -gt 0
-        if ($hasContent -and -not (Test-Path -LiteralPath $markerPath)) {
-            throw (T @"
-Рабочий каталог $WorkDir не пуст и не помечен как созданный этим скриптом.
-
-Перед сборкой он очищается целиком, поэтому удалять чужие файлы скрипт не станет.
-Укажите пустую или несуществующую папку через -WorkDir, либо удалите содержимое вручную.
-"@ @"
-The work folder $WorkDir is not empty and was not created by this script.
-
-It is wiped before every build, so the script refuses to delete files it does not own.
-Point -WorkDir at an empty or non-existent folder, or clear it manually.
-"@)
-        }
-        Write-Step (T 'Очищаю рабочий каталог от предыдущего прогона' 'Clearing the work folder from a previous run')
-        Remove-Item -LiteralPath $WorkDir -Recurse -Force
-    }
-    $null = New-Item -ItemType Directory -Path $isoDir, $mountDir, $bootMountDir -Force
-    # Метка: по ней следующий прогон поймёт, что каталог наш и его можно чистить
-    Set-Content -LiteralPath (Join-Path $WorkDir $script:WorkDirMarker) `
-                -Value "win-11-lite work folder, safe to delete`r`n$(Get-Date -Format s)" -Encoding ascii
-}
+Write-Stage (T 'Чтение исходного ISO' 'Reading the source ISO')
 
 Write-Step (T "Монтирую $([IO.Path]::GetFileName($InputIso))" "Mounting $([IO.Path]::GetFileName($InputIso))")
 $diskImage = Get-DiskImage -ImagePath $InputIso
@@ -2413,17 +2813,7 @@ $srcDrive = "$($vol.DriveLetter):"
 $isoLabel = $vol.FileSystemLabel
 Write-Ok (T "Смонтирован как $srcDrive  (метка: $isoLabel)" "Mounted as $srcDrive  (label: $isoLabel)")
 
-if ($DryRun) {
-    $srcSources = Join-Path $srcDrive 'sources'
-} else {
-    Write-Step (T 'Копирую содержимое ISO в рабочий каталог ...' 'Copying ISO contents to the work folder ...')
-    & robocopy.exe "$srcDrive\" $isoDir /E /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
-    if ($LASTEXITCODE -ge 8) { throw (T "robocopy завершился с кодом $LASTEXITCODE" "robocopy exited with code $LASTEXITCODE") }
-    Get-ChildItem -LiteralPath $isoDir -Recurse -Force -File | ForEach-Object { $_.IsReadOnly = $false }
-    $copied = (Get-ChildItem -LiteralPath $isoDir -Recurse -Force -File | Measure-Object -Property Length -Sum).Sum
-    Write-Ok (T "Скопировано $(Format-Size $copied)" "Copied $(Format-Size $copied)")
-    $srcSources = Join-Path $isoDir 'sources'
-}
+$srcSources = Join-Path $srcDrive 'sources'
 
 #endregion
 
@@ -2442,23 +2832,8 @@ Write-Ok (T "Образ: $(Split-Path $srcInstall -Leaf)  ($(Format-Size (Get-It
 
 $images = @()
 if ($isAdmin) {
-    # Метаданные читаем через модуль Dism, а не dism.exe: тот печатает имена в
-    # OEM-кодировке (кириллица превращается в мусор), а поле Languages выводит
-    # на отдельной строке, что ломает разбор. Обслуживание образа всё равно
-    # идёт через dism.exe из ADK — здесь только чтение.
-    Import-Module Dism -ErrorAction Stop -Verbose:$false
-    foreach ($b in (Get-WindowsImage -ImagePath $srcInstall)) {
-        $d = Get-WindowsImage -ImagePath $srcInstall -Index $b.ImageIndex
-        $images += [PSCustomObject]@{
-            Index     = $d.ImageIndex
-            Name      = $d.ImageName
-            EditionId = $d.EditionId
-            Architecture = $d.Architecture
-            Languages = ($d.Languages -join ',')
-            Version   = $d.Version
-            Size      = $d.ImageSize
-        }
-    }
+    # Обслуживание образа идёт через dism.exe из ADK — здесь только чтение модулем.
+    $images = @(Get-WimImageList -Path $srcInstall)
 } else {
     # DryRun без прав: читаем XML-заголовок образа через 7-Zip
     $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
@@ -2466,7 +2841,7 @@ if ($isAdmin) {
         # Имя уникально для процесса: каталог от прошлого запуска мог остаться
         # с правами администратора и оказаться недоступным
         $tmpXml = Join-Path $env:TEMP "win11lite-meta-$PID"
-        & $sevenZip e $srcInstall '[1].xml' "-o$tmpXml" -y *>&1 | Out-Null
+        $null = Invoke-NativeQuiet $sevenZip @('e', $srcInstall, '[1].xml', "-o$tmpXml", '-y')
         $xmlFile = Join-Path $tmpXml '[1].xml'
         if (Test-Path -LiteralPath $xmlFile) {
             $xml = [xml](Get-Content -LiteralPath $xmlFile -Raw -Encoding Unicode)
@@ -2529,6 +2904,9 @@ if ([string]$selected.Architecture -notin @('9', 'x64', 'amd64')) { throw (T 'С
 $imgLang = if ($selected.PSObject.Properties['Languages']) { $selected.Languages } else { '' }
 if ($imgLang -match '([a-z]{2}-[A-Z]{2})') { $imgLang = $matches[1] } else { $imgLang = 'en-US' }
 $setupLang = $imgLang
+$sourceImageLanguage = $imgLang
+$setupPayload = $null
+$setupRepair = $null
 $script:ImageLanguages = @($selected.Languages -split ',')
 $imgVersion = if ($selected.PSObject.Properties['Version']) { $selected.Version } else { '' }
 if (-not $imgVersion -and $selected.PSObject.Properties['ServicePack Build']) { $imgVersion = $selected.'ServicePack Build' }
@@ -2558,6 +2936,180 @@ Write-Ok (T "Язык для загрузки Firefox: $mozLang" "Firefox downlo
 
 #endregion
 
+#region ── Подготовка загрузок до обработки образа ────────────────────────────
+if (-not $DryRun) {
+    Write-Stage (T 'Подготовка всех загрузок перед сборкой' 'Preparing all downloads before building')
+    if ($ClearCache -and (Test-Path $UpdatesDir)) {
+        if (-not (Test-Path -LiteralPath (Join-Path $UpdatesDir '.win-11-lite-cache'))) { throw (T 'Отказ от очистки кэша без метки принадлежности скрипту' 'Refusing to clear an unmarked cache directory') }
+        $null = Assert-ChildPath -Path $UpdatesDir -Root (Split-Path $UpdatesDir -Parent)
+        foreach ($protectedPath in @($InputIso, $OutputIso, $WorkDir, $script:ScriptRoot, $LanguageSource, $Unattend, $DriversDir, $LanguageUpdatePath, $SetupLanguageSource, $SetupLanguageUpdatePath)) {
+            if (-not $protectedPath -or $protectedPath -eq 'none') { continue }
+            $fullProtected = [IO.Path]::GetFullPath($protectedPath)
+            if ($fullProtected -eq $UpdatesDir -or $fullProtected.StartsWith("$UpdatesDir\", [StringComparison]::OrdinalIgnoreCase)) {
+                throw (T "В кэше находятся защищённые файлы: $fullProtected" "Cache contains protected files: $fullProtected")
+            }
+        }
+        Write-Step (T 'Очищаю кэш обновлений' 'Clearing the update cache')
+        Remove-Item -LiteralPath $UpdatesDir -Recurse -Force
+    }
+    $null = New-Item -ItemType Directory -Path $UpdatesDir -Force
+    if (-not @(Get-ChildItem -LiteralPath $UpdatesDir -Force).Count) {
+        Set-Content -LiteralPath (Join-Path $UpdatesDir '.win-11-lite-cache') -Value 'win-11-lite cache' -Encoding ascii
+    }
+    $lcuDir = Join-Path $UpdatesDir "lcu-$winVersion"
+    $netDir = Join-Path $UpdatesDir "dotnet-$winVersion"
+    $requestedUpdateMode = $UpdateMode
+    $lcuPayload = $null
+    $dotNetPayload = $null
+    $wingetPayload = $null
+    $langIsoMounted = $null
+
+    if ($UpdateMode -ne 'none') {
+        try {
+            if ($UpdateMode -eq 'download') {
+                $target = Save-CatalogPayload -Query "Cumulative Update for Windows 11 version $winVersion x64" -Directory $lcuDir
+                $LcuFile = Split-Path $target -Leaf
+            } else {
+                $target = Get-LocalUpdatePayload -Directory $lcuDir -FileName $LcuFile
+                $LcuFile = $target.Name
+            }
+            $lcuPayload = Join-Path $lcuDir $LcuFile
+        } catch {
+            Confirm-SkipDownload -Component (T 'накопительное обновление Windows (LCU)' 'Windows cumulative update (LCU)') -Reason $_.Exception.Message
+            $UpdateMode = 'none'
+            $WithUpdates = $false
+            $LcuFile = $null
+        }
+    }
+    if ($requestedUpdateMode -ne 'none' -and $IncludeDotNetUpdate) {
+        try {
+            if ($requestedUpdateMode -eq 'download') {
+                $target = Save-CatalogPayload -Query "Cumulative Update for .NET Framework Windows 11 version $winVersion x64" -Directory $netDir -TitlePattern '\.NET Framework'
+                $DotNetUpdateFile = Split-Path $target -Leaf
+            } else {
+                $target = Get-LocalUpdatePayload -Directory $netDir -FileName $DotNetUpdateFile
+                $DotNetUpdateFile = $target.Name
+            }
+            $dotNetPayload = Join-Path $netDir $DotNetUpdateFile
+        } catch {
+            Confirm-SkipDownload -Component (T 'обновление .NET Framework' '.NET Framework update') -Reason $_.Exception.Message
+            $IncludeDotNetUpdate = $false
+            $DotNetUpdateFile = $null
+        }
+    }
+
+    if ($AddLanguage) {
+        if ($DownloadLanguage) {
+            $langCache = Join-Path $UpdatesDir "lang-$(if ($imgRevision) { $imgRevision } else { $buildNumber })"
+            foreach ($tag in @($AddLanguage)) {
+                try {
+                    Save-LanguageFromCatalog -Tags @($tag) -Build $buildNumber -Revision $imgRevision -Destination $langCache
+                } catch {
+                    Confirm-SkipDownload -Component (T "язык $tag (Pack + Basic)" "language $tag (Pack + Basic)") -Reason $_.Exception.Message
+                    $AddLanguage = @($AddLanguage | Where-Object { $_ -ne $tag })
+                }
+            }
+            $DownloadLanguage = @($AddLanguage)
+            $LanguageSource = $langCache
+        }
+        if ($AddLanguage) {
+            $langRoot = $LanguageSource
+            $langIsoMounted = $null
+            if ($LanguageSource -match '\.iso$') {
+                Write-Step (T "Монтирую источник языков: $(Split-Path $LanguageSource -Leaf)" "Mounting the language source: $(Split-Path $LanguageSource -Leaf)")
+                $langImage = Get-DiskImage -ImagePath (Resolve-Path -LiteralPath $LanguageSource).Path
+                if (-not $langImage.Attached) {
+                    $langImage = Mount-DiskImage -ImagePath (Resolve-Path -LiteralPath $LanguageSource).Path -PassThru -Access ReadOnly
+                    $langIsoMounted = (Resolve-Path -LiteralPath $LanguageSource).Path
+                    $script:LangIso = $langIsoMounted
+                }
+                Start-Sleep -Seconds 2
+                $langRoot = "$(($langImage | Get-Volume).DriveLetter):\"
+                Write-Ok (T "Источник смонтирован как $langRoot" "Source mounted as $langRoot")
+            }
+                    foreach ($tag in @($AddLanguage)) {
+                try {
+                    foreach ($kind in @('Pack', 'Basic')) {
+                        $package = Find-LanguagePackage -Root $langRoot -Tag $tag -Kind $kind
+                        if (-not $package -or $package.Length -le 0) { throw (T "Нет обязательного пакета $kind в $langRoot" "Required package $kind missing from $langRoot") }
+                    }
+                } catch {
+                    Confirm-SkipDownload -Component (T "язык $tag (Pack + Basic)" "language $tag (Pack + Basic)") -Reason $_.Exception.Message
+                    $AddLanguage = @($AddLanguage | Where-Object { $_ -ne $tag })
+                }
+            }
+        }
+        # Полная ревизия читается с исходного ISO; до монтирования WIM выбираем
+        # LCU для всех добавляемых языков. Неизвестная ревизия требует явного MSU.
+        $needsLanguageRepair = -not $imgRevision -or ([version]$imgRevision).Minor -gt 1
+        if ($AddLanguage -and $needsLanguageRepair -and $UpdateMode -eq 'none' -and -not $LanguageUpdatePath) {
+            try {
+                if (-not $DownloadLanguage) { throw (T 'Задайте -LanguageUpdatePath или -WithUpdates для обслуживания новых языков' 'Use -LanguageUpdatePath or -WithUpdates to service added languages') }
+                $LanguageUpdatePath = Get-LanguageRepairUpdate -Revision $imgRevision -Destination $UpdatesDir
+            } catch {
+                Confirm-SkipDownload -Component (T "добавление языков $($AddLanguage -join ', ') — нет обязательного LCU" "added languages $($AddLanguage -join ', ') - required LCU unavailable") -Reason $_.Exception.Message
+                $AddLanguage = @()
+                $DownloadLanguage = @()
+            }
+        }
+        $DownloadLanguage = @($DownloadLanguage | Where-Object { $_ -in $AddLanguage })
+    }
+    if ($WithWinget) {
+        try { $wingetPayload = Save-WingetPayload -Directory (Join-Path $UpdatesDir 'winget') }
+        catch {
+            Confirm-SkipDownload -Component 'winget (App Installer)' -Reason $_.Exception.Message
+            $WithWinget = $false
+        }
+    }
+    $desiredSetupLang = if ($SetupLanguage -eq 'original') { $sourceImageLanguage }
+        elseif ($SetupLanguage -and $SetupLanguage -ne 'auto') { $SetupLanguage }
+        elseif ($AddLanguage) { $AddLanguage[0] } else { $sourceImageLanguage }
+    if ($desiredSetupLang -ne $sourceImageLanguage) {
+        try {
+            $bootImage = @(Get-WimImageList -Path (Join-Path $srcSources 'boot.wim') | Where-Object { [int]$_.Index -eq 2 })
+            if ($bootImage.Count -ne 1 -or [string]$bootImage[0].Architecture -notin @('9','x64','amd64')) { throw (T 'Не найден стандартный установщик x64 в boot.wim (индекс 2)' 'Standard x64 Setup image not found in boot.wim (index 2)') }
+            $bootVersion = [version]$bootImage[0].Version
+            $peSource = $SetupLanguageSource
+            if (-not $peSource) {
+                $candidates = @(
+                    "${env:ProgramFiles(x86)}\Windows Kits\10\Assessment and Deployment Kit\Windows Preinstallation Environment\amd64\WinPE_OCs",
+                    "$env:ProgramFiles\Windows Kits\10\Assessment and Deployment Kit\Windows Preinstallation Environment\amd64\WinPE_OCs"
+                )
+                if ($langRoot) { $candidates += @((Join-Path $langRoot 'Windows Preinstallation Environment\x64\WinPE_OCs'), $langRoot) }
+                $peSource = $candidates | Where-Object { Test-Path -LiteralPath (Join-Path $_ "$desiredSetupLang\lp.cab") } | Select-Object -First 1
+            }
+            try {
+                $setupPayload = Save-SetupLanguagePayload -Tag $desiredSetupLang -Build $bootVersion.Build -Directory $UpdatesDir -Source $peSource
+            } catch {
+                if (-not $peSource -or $SetupLanguageSource) { throw }
+                Write-Note (T "Локальный WinPE не подошёл: $($_.Exception.Message). Загружаю совместимый комплект." "Local WinPE was unsuitable: $($_.Exception.Message). Downloading a matching set.")
+                $setupPayload = Save-SetupLanguagePayload -Tag $desiredSetupLang -Build $bootVersion.Build -Directory $UpdatesDir
+            }
+            if ($SetupLanguageUpdatePath) { $setupRepair = $SetupLanguageUpdatePath }
+            elseif ($bootVersion.Revision -gt 1) {
+                $bootRevision = "$($bootVersion.Build).$($bootVersion.Revision)"
+                if ($LanguageUpdatePath -and $bootRevision -eq $imgRevision) { $setupRepair = $LanguageUpdatePath }
+                elseif ($bootRevision -eq '26100.1742') { $setupRepair = Get-LanguageRepairUpdate -Revision $bootRevision -Destination $UpdatesDir }
+                elseif ($lcuPayload -and $bootVersion.Build -eq $buildNumber) { $setupRepair = $lcuPayload }
+                else { throw (T "Для языка boot.wim $bootRevision нужен -SetupLanguageUpdatePath <MSU> или совместимый -WithUpdates" "Language resources for boot.wim $bootRevision need -SetupLanguageUpdatePath <MSU> or matching -WithUpdates") }
+            }
+            if ($setupRepair) {
+                $repairFile = Get-Item -LiteralPath $setupRepair
+                if ($repairFile.PSIsContainer -or $repairFile.Length -le 0 -or $repairFile.Extension -ne '.msu') { throw (T 'Неверный LCU для boot.wim' 'Invalid boot.wim LCU') }
+            }
+            $setupLang = $desiredSetupLang
+        } catch {
+            Confirm-SkipDownload -Component (T "перевод установщика на $desiredSetupLang (останется $sourceImageLanguage)" "Setup translation to $desiredSetupLang (keeping $sourceImageLanguage)") -Reason $_.Exception.Message
+            $setupPayload = $null
+            $setupRepair = $null
+            $setupLang = $sourceImageLanguage
+        }
+    }
+    $script:DownloadsClosed = $true
+    Write-Ok (T 'Все компоненты подготовлены. Дальнейшая сборка не требует интернета.' 'All components are prepared. The remaining build requires no internet connection.')
+    if ($script:SkippedDownloads.Count) { Write-Note (T "Исключено по вашему выбору: $($script:SkippedDownloads -join '; ')" "Skipped by your choice: $($script:SkippedDownloads -join '; ')") }
+}
+#endregion
 # ── План работ (и точка выхода для DryRun) ──────────────────────────────────
 Write-Stage (T 'План удаления при текущем пресете' 'Removal plan for the selected preset')
 
@@ -2581,12 +3133,13 @@ if (Test-GroupActive -RulePreset 'balanced' -Group 'AI') {
     }
 }
 
-$allGroups = @('Defender', 'WinRE', 'Edge', 'Fonts', 'Speech', 'WMP', 'IE', 'Sandbox', 'AI')
+# WinRE показан отдельной строкой ниже (зависит от -RemoveWinRE, а не от пресета)
+$allGroups = @('Defender', 'Edge', 'Fonts', 'Speech', 'WMP', 'IE', 'AI')
 $skipped = $allGroups | Where-Object { -not (Test-GroupActive -RulePreset 'balanced' -Group $_) }
 if ($skipped) { Write-Host ''; Write-Note (T "Не трогаем: $($skipped -join ', ')" "Kept as is: $($skipped -join ', ')") }
 Write-Host ''
 $vLang = if ($AddLanguage) {
-    $src = if ($DownloadLanguage) { T ' — скачать' ' - download' } else { (T ' — из ' ' - from ') + (Split-Path $LanguageSource -Leaf) }
+    $src = if ($DownloadLanguage -and $DryRun) { T ' — скачать' ' - download' } else { (T ' — из ' ' - from ') + (Split-Path $LanguageSource -Leaf) }
     (T 'добавить ' 'add ') + ($AddLanguage -join ', ') + $src
 } else { T "только $imgLang  (добавить: -DownloadLanguage ru-RU)" "$imgLang only  (add with -DownloadLanguage ru-RU)" }
 $vSetup = if ($LegacySetup) { T 'классический (winpeshl.ini /legacy)' 'classic (winpeshl.ini /legacy)' } else { T 'штатный для 24H2 (ConX)' 'stock 24H2 (ConX)' }
@@ -2606,6 +3159,10 @@ if ($AddLanguage -and $UpdateMode -eq 'none') {
     Write-Note (T 'Добавление языка в обновлённый ISO требует повторного LCU исходного билда. Для 26100.1742 с -DownloadLanguage автоматически скачивается KB5043080 (~509 МБ загрузки).' 'Adding a language to updated media requires reapplying the source LCU. For 26100.1742, -DownloadLanguage automatically downloads KB5043080 (about 509 MB download).')
 }
 Write-Host (T "  Установщик     : $vSetup" "  Setup          : $vSetup")
+$plannedSetupLang = if ($DryRun -and $SetupLanguage -ne 'original') {
+    if ($SetupLanguage -ne 'auto') { $SetupLanguage } elseif ($AddLanguage) { $AddLanguage[0] } else { $setupLang }
+} else { $setupLang }
+Write-Host (T "  Язык установки : $plannedSetupLang" "  Setup language : $plannedSetupLang")
 Write-Host (T "  WinRE          : $vWinRE" "  WinRE          : $vWinRE")
 Write-Host (T "  sources        : $vSources" "  sources        : $vSources")
 Write-Host (T "  Очистка склада : $vCleanup" "  Store cleanup  : $vCleanup")
@@ -2615,6 +3172,7 @@ Write-Host (T "  winget         : $vWinget" "  winget         : $vWinget")
 Write-Host (T "  Сторож         : $vGuard" "  Guard          : $vGuard")
 if ($Guard) { Write-Host (T "  Окно guard     : $([bool]$GuardDebug) (выключить: -GuardDebug:`$false)" "  Guard window   : $([bool]$GuardDebug) (disable: -GuardDebug:`$false)") }
 Write-Host (T "  Обновления     : $vUpd" "  Updates        : $vUpd")
+if (-not $DryRun -and $dotNetPayload) { Write-Host (T "  .NET           : $DotNetUpdateFile" "  .NET           : $DotNetUpdateFile") }
 $vOobeNet = if ($NoOobeNetworkBlock) { T 'сеть включена  (OOBE скачает обновления)' 'network on  (OOBE will download updates)' }
             else { T 'сеть выключена, вернётся при первом входе' 'network off, restored at first logon' }
 Write-Host (T "  OOBE           : $vOobeNet" "  OOBE           : $vOobeNet")
@@ -2626,6 +3184,68 @@ if ($DryRun) {
     return
 }
 
+#region ── Распаковка ISO после подготовки загрузок ──────────────────────────
+Write-Stage (T 'Распаковка исходного ISO' 'Extracting the source ISO')
+# --- висящие точки монтирования ---
+if ($isAdmin -and -not $DryRun) {
+    $mountInfo = Invoke-Dism -Arguments @('/Get-MountedImageInfo') -AllowFail -Quiet
+    $stale = @($mountInfo.Output | Select-String -Pattern '^\s*Mount Dir\s*:\s*(.+?)\s*$' |
+               ForEach-Object { $_.Matches[0].Groups[1].Value })
+    foreach ($dir in $stale) {
+        if ($dir -notin @($mountDir, $bootMountDir)) { continue }
+        if (-not (Test-Path -LiteralPath (Join-Path $WorkDir $script:WorkDirMarker))) { throw (T "Чужая точка монтирования: $dir" "Unowned mount: $dir") }
+        Write-Note (T "Отцепляю оставшийся с прошлого раза образ: $dir" "Discarding image left over from a previous run: $dir")
+        Invoke-Dism -Arguments @('/Unmount-Image', "/MountDir:$dir", '/Discard') -Quiet | Out-Null
+    }
+    Write-Ok (T 'Проверены точки монтирования этой сборки' 'Checked mount points belonging to this build')
+}
+
+if (-not $DryRun) {
+    if (Test-Path $WorkDir) {
+        # Три независимые проверки, и все должны пройти: путь ведёт в нашу
+        # подпапку, это не системный каталог, и внутри лежит наша метка.
+        if (-not (Test-SafeToWipe $WorkDir)) {
+            throw (T "Отказываюсь очищать $WorkDir — путь не похож на рабочий каталог скрипта. Укажите другой через -WorkDir." `
+                     "Refusing to wipe $WorkDir - the path does not look like this script's work folder. Pick another one with -WorkDir.")
+        }
+        $markerPath = Join-Path $WorkDir $script:WorkDirMarker
+        $hasContent = @(Get-ChildItem -LiteralPath $WorkDir -Force -ErrorAction SilentlyContinue).Count -gt 0
+        if ($hasContent -and -not (Test-Path -LiteralPath $markerPath)) {
+            throw (T @"
+Рабочий каталог $WorkDir не пуст и не помечен как созданный этим скриптом.
+
+Перед сборкой он очищается целиком, поэтому удалять чужие файлы скрипт не станет.
+Укажите пустую или несуществующую папку через -WorkDir, либо удалите содержимое вручную.
+"@ @"
+The work folder $WorkDir is not empty and was not created by this script.
+
+It is wiped before every build, so the script refuses to delete files it does not own.
+Point -WorkDir at an empty or non-existent folder, or clear it manually.
+"@)
+        }
+        Write-Step (T 'Очищаю рабочий каталог от предыдущего прогона' 'Clearing the work folder from a previous run')
+        Remove-Item -LiteralPath $WorkDir -Recurse -Force
+    }
+    $null = New-Item -ItemType Directory -Path $isoDir, $mountDir, $bootMountDir -Force
+    $script:WorkPrepared = $true
+    # Метка: по ней следующий прогон поймёт, что каталог наш и его можно чистить
+    Set-Content -LiteralPath (Join-Path $WorkDir $script:WorkDirMarker) `
+                -Value "win-11-lite work folder, safe to delete`r`n$(Get-Date -Format s)" -Encoding ascii
+}
+Write-Step (T 'Копирую содержимое ISO в рабочий каталог ...' 'Copying ISO contents to the work folder ...')
+# Знаменатель для полосы: объём тома ISO, при отказе — размер самого файла.
+$script:CopyTotal = if ($vol.Size -gt 0) { [int64]$vol.Size } else { (Get-Item -LiteralPath $InputIso).Length }
+$copyRun = Invoke-ProgressProcess -Exe 'robocopy.exe' -Activity (T 'Копирование файлов ISO' 'Copying ISO files') `
+    -Arguments @("$srcDrive\", $isoDir, '/E', '/R:2', '/W:2', '/NFL', '/NDL', '/NJH', '/NJS', '/NP') `
+    -SuccessCodes (0..7) -GetPercent { Get-CopyPercent -Path $isoDir -TotalBytes $script:CopyTotal }
+if ($copyRun.ExitCode -ge 8) { throw (T "robocopy завершился с кодом $($copyRun.ExitCode)" "robocopy exited with code $($copyRun.ExitCode)") }
+# Один проход по дереву: снимаем «только чтение» с носителя и считаем объём
+$copied = 0
+Get-ChildItem -LiteralPath $isoDir -Recurse -Force -File | ForEach-Object { $_.IsReadOnly = $false; $copied += $_.Length }
+Write-Ok (T "Скопировано $(Format-Size $copied)" "Copied $(Format-Size $copied)")
+$srcSources = Join-Path $isoDir 'sources'
+$srcInstall = Join-Path $srcSources $(if ($srcIsEsd) { 'install.esd' } else { 'install.wim' })
+#endregion
 #region ── Стадия 3. Экспорт выбранного индекса ────────────────────────────────
 
 Write-Stage (T 'Экспорт выбранного индекса в отдельный WIM' 'Exporting the selected index to a separate WIM')
@@ -2644,73 +3264,6 @@ Write-Ok (T "install.wim: $(Format-Size (Get-Item -LiteralPath $wimPath).Length)
 
 #endregion
 
-#region ── Стадия 4. Загрузка обновлений ───────────────────────────────────────
-
-$lcuDir = Join-Path $UpdatesDir "lcu-$winVersion"
-$netDir = Join-Path $UpdatesDir "dotnet-$winVersion"
-
-if ($UpdateMode -eq 'download') {
-    Write-Stage (T 'Поиск и загрузка обновлений в Microsoft Update Catalog' 'Searching and downloading updates from Microsoft Update Catalog')
-
-    # LCU. Отбрасываем Dynamic Update (это для установщика, не для образа) и Preview.
-    Write-Step (T "Ищу накопительное обновление для Windows 11 $winVersion x64" "Looking for the cumulative update for Windows 11 $winVersion x64")
-    $lcu = Search-Catalog -Query "Cumulative Update for Windows 11 version $winVersion x64" |
-           Where-Object { $_.Title -notmatch 'Dynamic Update|Preview|\.NET Framework' -and $_.Title -match 'Cumulative Update' } |
-           Sort-Object Date -Descending | Select-Object -First 1
-    if (-not $lcu) { throw (T "В каталоге не найдено накопительное обновление для Windows 11 $winVersion" "No cumulative update found for Windows 11 $winVersion in the catalog") }
-    Write-Ok (T "$($lcu.Title)  [$($lcu.Date.ToString('yyyy-MM-dd')), $($lcu.SizeMB) МБ]" "$($lcu.Title)  [$($lcu.Date.ToString('yyyy-MM-dd')), $($lcu.SizeMB) MB]")
-
-    $null = New-Item -ItemType Directory -Path $lcuDir -Force
-
-    $links = Get-CatalogLinks -UpdateId $lcu.Id
-    Write-Step (T "Каталог вернул файлов: $($links.Count) (целевой LCU + checkpoint-обновления)" "Catalog returned $($links.Count) files (target LCU plus checkpoint updates)")
-    $expected = @()
-    foreach ($link in $links) {
-        $name = [IO.Path]::GetFileName(([uri]$link).LocalPath)
-        $expected += $name
-        Save-Url -Url $link -Destination (Join-Path $lcuDir $name)
-    }
-    if ($lcu.Title -notmatch '\((KB\d+)\)') { throw (T 'В названии LCU нет номера KB' 'LCU title has no KB identifier') }
-    $lcuKb = $matches[1]
-    $targets = @($expected | Where-Object { $_ -match $lcuKb -and $_ -match '\.msu$' })
-    if ($targets.Count -ne 1) { throw (T "Не найден единственный MSU для $lcuKb" "Cannot identify a unique MSU for $lcuKb") }
-    $LcuFile = $targets[0]
-    Set-Content -LiteralPath (Join-Path $lcuDir 'target.txt') -Value $LcuFile -Encoding ascii
-
-    # В папке с целевым LCU должны лежать только он и его чекпоинты — иначе DISM
-    # может подхватить постороннее обновление. Кэш при этом не трогаем.
-    foreach ($stale in (Get-ChildItem -LiteralPath $lcuDir -Filter *.msu | Where-Object { $_.Name -notin $expected })) {
-        Write-Note (T "Убираю лишний файл из папки LCU: $($stale.Name)" "Removing a foreign file from the LCU folder: $($stale.Name)")
-        Remove-Item -LiteralPath $stale.FullName -Force
-        Remove-Item -LiteralPath "$($stale.FullName).size" -Force -ErrorAction SilentlyContinue
-    }
-
-    if ($IncludeDotNetUpdate) {
-        Write-Step (T 'Ищу накопительное обновление для .NET Framework' 'Looking for the .NET Framework cumulative update')
-        $net = Search-Catalog -Query "Cumulative Update for .NET Framework Windows 11 version $winVersion x64" |
-               Where-Object { $_.Title -match '\.NET Framework' -and $_.Title -notmatch 'Preview' } |
-               Sort-Object Date -Descending | Select-Object -First 1
-        if ($net) {
-            Write-Ok "$($net.Title)  [$($net.Date.ToString('yyyy-MM-dd'))]"
-            $null = New-Item -ItemType Directory -Path $netDir -Force
-            foreach ($link in (Get-CatalogLinks -UpdateId $net.Id)) {
-                Save-Url -Url $link -Destination (Join-Path $netDir ([IO.Path]::GetFileName(([uri]$link).LocalPath)))
-                if ($link -match '\.msu(?:\?|$)') { $DotNetUpdateFile = [IO.Path]::GetFileName(([uri]$link).LocalPath) }
-            }
-            if (-not $DotNetUpdateFile) { throw (T 'Каталог не вернул MSU для .NET' 'Catalog returned no .NET MSU') }
-            Set-Content -LiteralPath (Join-Path $netDir 'target.txt') -Value $DotNetUpdateFile -Encoding ascii
-        } else {
-            Write-Note (T 'Обновление для .NET Framework не найдено — пропускаю' '.NET Framework update not found - skipping')
-        }
-    }
-} elseif ($UpdateMode -eq 'local') {
-    Write-Stage (T 'Обновления из локального кэша' 'Updates from the local cache')
-    if (-not (Test-Path $lcuDir)) { throw (T "Нет папки $lcuDir. Положите туда .msu или используйте -UpdateMode download." "Folder $lcuDir is missing. Put .msu files there or use -UpdateMode download.") }
-    Write-Ok (T "LCU: $((Get-ChildItem $lcuDir -Filter *.msu).Count) файлов" "LCU: $((Get-ChildItem $lcuDir -Filter *.msu).Count) files")
-}
-
-#endregion
-
 #region ── Стадия 5. Монтирование образа ───────────────────────────────────────
 
 Write-Stage (T 'Монтирование образа' 'Mounting the image')
@@ -2719,15 +3272,9 @@ Invoke-Dism -Arguments @('/Mount-Image', "/ImageFile:$wimPath", '/Index:1', "/Mo
 $script:Mounted = $true
 Write-Ok (T "Образ смонтирован в $mountDir" "Image mounted at $mountDir")
 if ($Preset -eq 'balanced') { Write-ComponentStoreReport -Image $mountDir -Phase 'source' }
+# Запоминаем, где WebView2 лежал до обслуживания: финальная проверка сравнит
 $script:PreservedWebView = @()
-if ($Preset -ne 'max') {
-    foreach ($root in @('Program Files (x86)\Microsoft\EdgeWebView', 'Program Files\Microsoft\EdgeWebView', 'Windows\System32\Microsoft-Edge-WebView')) {
-        $webRoot = Join-Path $mountDir $root
-        if (Test-Path -LiteralPath $webRoot) {
-            if (@(Get-ChildItem -LiteralPath $webRoot -Recurse -Filter 'msedgewebview2.exe' -File | Select-Object -First 1).Count) { $script:PreservedWebView += $webRoot }
-        }
-    }
-}
+if ($Preset -ne 'max') { $script:PreservedWebView = @(Get-WebViewRuntimeRoots -Image $mountDir) }
 
 #endregion
 
@@ -2739,30 +3286,6 @@ if ($Preset -ne 'max') {
 if ($AddLanguage) {
     Write-Stage (T "Интеграция языков: $($AddLanguage -join ', ')" "Adding languages: $($AddLanguage -join ', ')")
 
-    # Скачивание идёт в кэш рядом с обновлениями и переживает следующие прогоны
-    if ($DownloadLanguage) {
-        # Кэш разводим по полной ревизии: пакеты разных ревизий несовместимы,
-        # и общая папка приводила бы к повторному использованию чужих файлов
-        $langCache = Join-Path $UpdatesDir "lang-$(if ($imgRevision) { $imgRevision } else { $buildNumber })"
-        Save-LanguageFromCatalog -Tags $DownloadLanguage -Build $buildNumber -Revision $imgRevision -Destination $langCache
-        $LanguageSource = $langCache
-    }
-
-    $langRoot = $LanguageSource
-    $langIsoMounted = $null
-    if ($LanguageSource -match '\.iso$') {
-        Write-Step (T "Монтирую источник языков: $(Split-Path $LanguageSource -Leaf)" "Mounting the language source: $(Split-Path $LanguageSource -Leaf)")
-        $langImage = Get-DiskImage -ImagePath (Resolve-Path -LiteralPath $LanguageSource).Path
-        if (-not $langImage.Attached) {
-            $langImage = Mount-DiskImage -ImagePath (Resolve-Path -LiteralPath $LanguageSource).Path -PassThru -Access ReadOnly
-            $langIsoMounted = (Resolve-Path -LiteralPath $LanguageSource).Path
-            $script:LangIso = $langIsoMounted
-        }
-        Start-Sleep -Seconds 2
-        $langRoot = "$(($langImage | Get-Volume).DriveLetter):\"
-        Write-Ok (T "Источник смонтирован как $langRoot" "Source mounted as $langRoot")
-    }
-
     $kinds = @('Pack', 'Basic')
 
     # FoD lookup requires CBS identity filenames, not UUP download filenames.
@@ -2772,15 +3295,13 @@ if ($AddLanguage) {
     $sourcePackages = Invoke-Dism -Arguments @("/Image:$mountDir", '/Get-Packages') -Quiet
     $needsLanguageRepair = @($sourcePackages.Output | Where-Object { $_ -match 'Package_for_RollupFix' }).Count -gt 0
     if ($needsLanguageRepair -and $UpdateMode -eq 'none' -and -not $LanguageUpdatePath) {
-        if (-not $DownloadLanguage) { throw (T 'Повторно примените исходный LCU через -LanguageUpdatePath либо используйте -WithUpdates' 'Reapply the source LCU using -LanguageUpdatePath, or use -WithUpdates') }
-        Write-Step (T "Загружаю LCU исходного билда $imgRevision для обслуживания новых языков" "Downloading the source LCU $imgRevision to service new languages")
-        $LanguageUpdatePath = Get-LanguageRepairUpdate -Revision $imgRevision -Destination $UpdatesDir
+        throw (T 'Для языков не подготовлен обязательный LCU. Повторите подготовку с -LanguageUpdatePath или -WithUpdates.' 'Required language LCU was not prepared. Run preparation with -LanguageUpdatePath or -WithUpdates.')
     }
-
     $addedLangs = @()
     foreach ($tag in $AddLanguage) {
         Write-Step (T "Язык $tag" "Language $tag")
-        $found = 0
+        # Pack и Basic обязательны: любой отказ DISM здесь останавливает сборку
+        # (Invoke-Dism без -AllowFail бросает исключение сам).
         foreach ($kind in $kinds) {
             $pkg = Find-LanguagePackage -Root $langRoot -Tag $tag -Kind $kind
             if (-not $pkg) {
@@ -2798,7 +3319,8 @@ if ($AddLanguage) {
                 }
                 $lpBuild = [int]$matches[1]
                 if ($lpBuild -ne $buildNumber -and -not ($buildNumber -eq 26200 -and $lpBuild -eq 26100)) { throw (T "Несовместимый языковой пакет: $identity" "Incompatible language package: $identity") }
-                $r = Invoke-Dism -Arguments @("/Image:$mountDir", '/Add-Package', "/PackagePath:$($pkg.FullName)") -Quiet
+                Invoke-Dism -Arguments @("/Image:$mountDir", '/Add-Package', "/PackagePath:$($pkg.FullName)") -Quiet `
+                            -Activity (T "Языковой пакет $tag" "Language pack $tag") | Out-Null
             } else {
                 $capSource = $pkg.DirectoryName
                 if ($pkg.Extension -eq '.cab') {
@@ -2807,14 +3329,12 @@ if ($AddLanguage) {
                     $capSource = $fodSource
                 }
                 $capName = "Language.$kind~~~$tag~0.0.1.0"
-                $r = Invoke-Dism -Arguments @(
+                Invoke-Dism -Arguments @(
                     "/Image:$mountDir", '/Add-Capability', "/CapabilityName:$capName",
                     "/Source:$capSource", "/Source:$langRoot", '/LimitAccess'
-                ) -Quiet
+                ) -Quiet -Activity (T "Языковой компонент $kind для $tag" "Language capability $kind for $tag") | Out-Null
             }
-
-            if (Test-DismSuccess $r.ExitCode) { Write-Ok "  $kind — $($pkg.Name) ($(Format-Size $pkg.Length))"; $found++ }
-            else { throw (T "Ошибка $kind для ${tag}: $($r.ExitCode)" "$kind for $tag failed: $($r.ExitCode)") }
+            Write-Ok "  $kind — $($pkg.Name) ($(Format-Size $pkg.Length))"
         }
 
         # Local Experience Pack локализует интерфейс современных приложений.
@@ -2824,31 +3344,26 @@ if ($AddLanguage) {
             $lic = Get-ChildItem -LiteralPath $lxp.DirectoryName -Filter '*.xml' -File -ErrorAction SilentlyContinue | Select-Object -First 1
             $lxpArgs = @("/Image:$mountDir", '/Add-ProvisionedAppxPackage', "/PackagePath:$($lxp.FullName)")
             if ($lic) { $lxpArgs += "/LicensePath:$($lic.FullName)" } else { $lxpArgs += '/SkipLicense' }
-            $r = Invoke-Dism -Arguments $lxpArgs -Quiet
-            if (Test-DismSuccess $r.ExitCode) { Write-Ok "  LXP — $($lxp.Name)" }
+            Invoke-Dism -Arguments $lxpArgs -Quiet -Activity (T "Local Experience Pack $tag" "Local Experience Pack $tag") | Out-Null
+            Write-Ok "  LXP — $($lxp.Name)"
         }
-
-        if ($found -ne $kinds.Count) { throw (T "Язык $tag установлен не полностью" "Language $tag is incomplete") }
         $addedLangs += $tag
     }
 
     if ($addedLangs) {
-        # Первый язык из списка становится языком интерфейса, локалью и раскладкой
+        # Первый язык из списка становится языком интерфейса, локалью и раскладкой.
+        # Отказ DISM здесь фатален: иначе answer-файл и система разойдутся в языке.
         $primary = $addedLangs[0]
         Write-Step (T "Делаю $primary языком по умолчанию" "Setting $primary as the default language")
-        $r = Invoke-Dism -Arguments @("/Image:$mountDir", "/Set-AllIntl:$primary") -Quiet
+        Invoke-Dism -Arguments @("/Image:$mountDir", "/Set-AllIntl:$primary") -Quiet | Out-Null
         Invoke-Dism -Arguments @("/Image:$mountDir", "/Set-SysUILang:$primary") -Quiet | Out-Null
-        if (Test-DismSuccess $r.ExitCode) {
-            Write-Ok (T "Язык интерфейса, локаль и раскладка: $primary" "Display language, locale and keyboard layout: $primary")
-            # autounattend и ярлык Firefox должны говорить на новом языке
-            $imgLang = $primary
-            $mozLang = $script:MozillaLang[$primary]
-            if (-not $mozLang) { $mozLang = ($primary -split '-')[0] }
-            Write-Ok (T "Язык для загрузки Firefox: $mozLang" "Firefox download language: $mozLang")
-        } else {
-            Write-Note (T "Set-AllIntl вернул $($r.ExitCode) — язык добавлен, но по умолчанию остался $imgLang" "Set-AllIntl returned $($r.ExitCode) - the language was added but $imgLang remains the default")
-        }
-        Write-Note (T 'Языки установщика (boot.wim) не меняются — экраны установки останутся на языке исходного образа' 'Setup language (boot.wim) is left untouched - installation screens stay in the original image language')
+        Write-Ok (T "Язык интерфейса, локаль и раскладка: $primary" "Display language, locale and keyboard layout: $primary")
+        # autounattend и ярлык Firefox должны говорить на новом языке
+        $imgLang = $primary
+        $mozLang = $script:MozillaLang[$primary]
+        if (-not $mozLang) { $mozLang = ($primary -split '-')[0] }
+        Write-Ok (T "Язык для загрузки Firefox: $mozLang" "Firefox download language: $mozLang")
+        Write-Ok (T "Язык установщика: $setupLang" "Setup language: $setupLang")
     } else {
         throw (T 'Ни один запрошенный язык не установлен' 'No requested language was installed')
     }
@@ -2867,29 +3382,23 @@ if ($AddLanguage) {
 
 #region ── Стадия 6. Интеграция обновлений ─────────────────────────────────────
 
-if ($UpdateMode -ne 'none') {
+if ($lcuPayload -or $dotNetPayload) {
     Write-Stage (T 'Интеграция обновлений (самая долгая стадия, 30–60 минут)' 'Applying updates (the longest stage, 30-60 minutes)')
 
     # Порядок принципиален: сначала обновления, потом удаления — LCU способен
     # вернуть в образ то, что мы вырежем раньше времени.
-    $lcuFiles = @(Get-ChildItem -LiteralPath $lcuDir -Filter *.msu -ErrorAction SilentlyContinue)
-    if ($lcuFiles) {
+    if ($lcuPayload) {
         # Цель записана по номеру KB каталога или указана пользователем;
         # checkpoint-обновления DISM найдёт в этой же папке самостоятельно.
-        $target = Get-UpdateTarget -Directory $lcuDir -FileName $LcuFile
+        $target = Get-Item -LiteralPath $lcuPayload
         Invoke-Dism -Arguments @("/Image:$mountDir", '/Add-Package', "/PackagePath:$($target.FullName)") -Activity (T "Интеграция $($target.Name)" "Applying $($target.Name)") | Out-Null
         Write-Ok (T 'Накопительное обновление интегрировано' 'Cumulative update applied')
-    } else {
-        throw (T "В $lcuDir нет файлов LCU" "No LCU files found in $lcuDir")
     }
 
-    if ($IncludeDotNetUpdate -and (Test-Path $netDir)) {
-        $netFiles = @(Get-ChildItem -LiteralPath $netDir -Filter *.msu -ErrorAction SilentlyContinue)
-        if ($netFiles) {
-            $target = Get-UpdateTarget -Directory $netDir -FileName $DotNetUpdateFile
-            Invoke-Dism -Arguments @("/Image:$mountDir", '/Add-Package', "/PackagePath:$($target.FullName)") -Activity (T "Интеграция $($target.Name)" "Applying $($target.Name)") | Out-Null
-            Write-Ok (T 'Обновление .NET интегрировано' '.NET update applied')
-        }
+    if ($dotNetPayload) {
+        $target = Get-Item -LiteralPath $dotNetPayload
+        Invoke-Dism -Arguments @("/Image:$mountDir", '/Add-Package', "/PackagePath:$($target.FullName)") -Activity (T "Интеграция $($target.Name)" "Applying $($target.Name)") | Out-Null
+        Write-Ok (T 'Обновление .NET интегрировано' '.NET update applied')
     }
 
     Write-Ok (T 'Образ обновлён' 'Image updated')
@@ -2897,7 +3406,8 @@ if ($UpdateMode -ne 'none') {
 
 if ($DriversDir -and (Test-Path $DriversDir)) {
     Write-Step (T "Интегрирую драйверы из $DriversDir" "Adding drivers from $DriversDir")
-    Invoke-Dism -Arguments @("/Image:$mountDir", '/Add-Driver', "/Driver:$DriversDir", '/Recurse') | Out-Null
+    Invoke-Dism -Arguments @("/Image:$mountDir", '/Add-Driver', "/Driver:$DriversDir", '/Recurse') `
+                -Activity (T 'Интеграция драйверов' 'Adding drivers') | Out-Null
     Write-Ok (T 'Драйверы интегрированы' 'Drivers added')
 }
 
@@ -2910,7 +3420,8 @@ if ($Preset -eq 'balanced') {
 
 #region ── Стадия 7. Сохранение и удаление WinRE ───────────────────────────────
 
-if ($RemoveWinRE -and (Test-GroupActive -RulePreset 'balanced' -Group 'WinRE')) {
+# Ключ задан явно, поэтому пресет роли не играет: удаление блокирует только -Keep WinRE
+if ($RemoveWinRE -and (Test-GroupActive -RulePreset 'safe' -Group 'WinRE')) {
     Write-Stage (T 'Удаление среды восстановления' 'Removing the recovery environment')
     if (-not $LegacySetup) {
         Write-Note (T 'Без -LegacySetup установка упадёт с 0x80070003: новый установщик извлекает winre.wim в SafeOS' 'Without -LegacySetup the installation fails with 0x80070003: the new setup extracts winre.wim into SafeOS')
@@ -2939,8 +3450,9 @@ if ($RemoveWinRE -and (Test-GroupActive -RulePreset 'balanced' -Group 'WinRE')) 
 Write-Stage (T 'Удаление возможностей Windows' 'Removing Windows capabilities')
 
 $capsRaw = Invoke-Dism -Arguments @("/Image:$mountDir", '/Get-Capabilities') -Quiet
-$caps = ConvertFrom-DismList -Lines $capsRaw.Output -Key 'Capability Identity' |
-        Where-Object { $_.State -eq 'Installed' -or ($Preset -eq 'balanced' -and $_.State -in @('Staged', 'Install Pending', 'Uninstall Pending')) }
+# @(): у одиночного PSCustomObject в Windows PowerShell 5.1 нет свойства Count
+$caps = @(ConvertFrom-DismList -Lines $capsRaw.Output -Key 'Capability Identity' |
+        Where-Object { $_.State -eq 'Installed' -or ($Preset -eq 'balanced' -and $_.State -in @('Staged', 'Install Pending', 'Uninstall Pending')) })
 Write-Step (T "Возможностей с файлами или ожидающими действиями: $($caps.Count)" "Capabilities with payload or pending actions: $($caps.Count)")
 
 $patterns = @()
@@ -2976,8 +3488,8 @@ Write-Ok (T "Удалено возможностей: $removedCaps" "Capabilitie
 Write-Stage (T 'Удаление пакетов компонентов' 'Removing component packages')
 
 $pkgRaw = Invoke-Dism -Arguments @("/Image:$mountDir", '/Get-Packages') -Quiet
-$pkgs = ConvertFrom-DismList -Lines $pkgRaw.Output -Key 'Package Identity' |
-        Where-Object { $_.State -eq 'Installed' -or ($Preset -eq 'balanced' -and $_.State -in @('Staged', 'Install Pending', 'Uninstall Pending')) }
+$pkgs = @(ConvertFrom-DismList -Lines $pkgRaw.Output -Key 'Package Identity' |
+        Where-Object { $_.State -eq 'Installed' -or ($Preset -eq 'balanced' -and $_.State -in @('Staged', 'Install Pending', 'Uninstall Pending')) })
 Write-Step (T "Пакетов с файлами или ожидающими действиями: $($pkgs.Count)" "Packages with payload or pending actions: $($pkgs.Count)")
 
 $patterns = @()
@@ -3021,7 +3533,7 @@ Write-Ok (T "Удалено пакетов: $removedPkgs; не удалось у
 Write-Stage (T 'Удаление встроенных приложений' 'Removing provisioned apps')
 
 $appxRaw = Invoke-Dism -Arguments @("/Image:$mountDir", '/Get-ProvisionedAppxPackages') -Quiet
-$appx = ConvertFrom-DismList -Lines $appxRaw.Output -Key 'DisplayName'
+$appx = @(ConvertFrom-DismList -Lines $appxRaw.Output -Key 'DisplayName')
 Write-Step (T "Встроенных приложений: $($appx.Count)" "Provisioned apps: $($appx.Count)")
 
 $patterns = @()
@@ -3063,8 +3575,7 @@ foreach ($rule in $script:TaskFiles) {
     if (-not (Test-GroupActive -RulePreset $rule.Preset -Group $rule.Group)) { continue }
     $p = Join-Path $mountDir $rule.Path
     if (Test-Path -LiteralPath $p) {
-        & takeown.exe /F $p /A *>&1 | Out-Null
-        & icacls.exe $p /grant '*S-1-5-32-544:(F)' /C /Q *>&1 | Out-Null
+        Grant-ImagePathAccess -Path $p
         try { Remove-Item -LiteralPath $p -Force -ErrorAction Stop; $tasksRemoved++ } catch { }
     }
 }
@@ -3089,8 +3600,7 @@ if (Test-GroupActive -RulePreset 'balanced' -Group 'Fonts') {
         foreach ($f in $fontFiles) {
             # Владение берём на каждый файл: takeown на папку без /R прав на
             # содержимое не даёт, и удаление падает с «Access denied»
-            & takeown.exe /F $f.FullName /A *>&1 | Out-Null
-            & icacls.exe $f.FullName /grant '*S-1-5-32-544:(F)' /C /Q *>&1 | Out-Null
+            Grant-ImagePathAccess -Path $f.FullName
             try {
                 $size = $f.Length
                 Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
@@ -3151,8 +3661,8 @@ foreach ($group in $script:DisableServices) {
     if ($group.Group -eq 'Defender' -and -not (Test-GroupActive -RulePreset 'balanced' -Group 'Defender')) { continue }
     foreach ($svc in $group.Names) {
         $key = "HKLM\LITE_SYSTEM\ControlSet001\Services\$svc"
-        & reg.exe query $key *>&1 | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        # Службы нет в образе — reg query возвращает 1, и это не ошибка
+        if ((Invoke-RegCommand -Arguments @('query', $key)).ExitCode -eq 0) {
             Set-Reg -Path $key -Name 'Start' -Type REG_DWORD -Value 4
             $svcCount++
         }
@@ -3229,16 +3739,16 @@ if (Test-GroupActive -RulePreset 'safe' -Group 'Edge') {
     Set-Reg -Path $eu -Name 'Install{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -Type REG_DWORD -Value 1  # WebView2 — разрешён
     Set-Reg -Path $eu -Name 'Update{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'  -Type REG_DWORD -Value 1
     Set-Reg -Path $eu -Name 'DoNotUpdateToEdgeWithChromium' -Type REG_DWORD -Value 1
-    Remove-Reg -Path 'HKLM\LITE_SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge'
-    Remove-Reg -Path 'HKLM\LITE_SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe'
-    Remove-Reg -Path 'HKLM\LITE_SOFTWARE\Clients\StartMenuInternet\Microsoft Edge'
+    # Тот же набор ключей, что чистит Finalize.ps1 после OOBE
     $stableGuid = '{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}'
     foreach ($view in @('', '\WOW6432Node')) {
-        foreach ($key in @('Clients', 'ClientState', 'ClientStateMedium')) {
-            Remove-Reg -Path "HKLM\LITE_SOFTWARE$view\Microsoft\EdgeUpdate\$key\$stableGuid"
+        foreach ($suffix in @("Microsoft\EdgeUpdate\Clients\$stableGuid", "Microsoft\EdgeUpdate\ClientState\$stableGuid",
+                              "Microsoft\EdgeUpdate\ClientStateMedium\$stableGuid",
+                              'Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge',
+                              'Microsoft\Windows\CurrentVersion\App Paths\msedge.exe',
+                              'Clients\StartMenuInternet\Microsoft Edge')) {
+            Remove-Reg -Path "HKLM\LITE_SOFTWARE$view\$suffix"
         }
-        Remove-Reg -Path "HKLM\LITE_SOFTWARE$view\Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge"
-        Remove-Reg -Path "HKLM\LITE_SOFTWARE$view\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe"
     }
     Write-Ok (T 'Регистрация браузера Edge удалена; политики дополнены очисткой после OOBE' 'Edge browser registration removed; policies supplemented by post-OOBE cleanup')
 }
@@ -3246,11 +3756,11 @@ if (Test-GroupActive -RulePreset 'safe' -Group 'Edge') {
 # --- записи об удалённых шрифтах ---
 if ($script:RemovedFonts) {
     $fontKey = 'HKLM\LITE_SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts'
-    $raw = & reg.exe query $fontKey 2>&1
+    $raw = (Invoke-RegCommand -Arguments @('query', $fontKey)).Output -split '\r?\n'
     foreach ($line in $raw) {
         if ($line -match '^\s{4}(.+?)\s{4}REG_SZ\s{4}(.+?)\s*$') {
             if ($script:RemovedFonts -contains $matches[2].Trim()) {
-                & reg.exe delete $fontKey /v $matches[1].Trim() /f *>&1 | Out-Null
+                $null = Invoke-RegCommand -Arguments @('delete', $fontKey, '/v', $matches[1].Trim(), '/f')
             }
         }
     }
@@ -3269,7 +3779,7 @@ if ($script:ManageOobe) {
     Set-Reg -Path 'HKLM\LITE_SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE' -Name 'DisableOOBEUpdate' -Type REG_DWORD -Value 1
 }
 if (Test-GroupActive -RulePreset 'balanced' -Group 'OneDrive') {
-    & reg.exe delete 'HKLM\LITE_DEFAULT\Software\Microsoft\Windows\CurrentVersion\Run' /v OneDriveSetup /f *>&1 | Out-Null
+    $null = Invoke-RegCommand -Arguments @('delete', 'HKLM\LITE_DEFAULT\Software\Microsoft\Windows\CurrentVersion\Run', '/v', 'OneDriveSetup', '/f')
 }
 
 # --- зарезервированное хранилище: до 7 ГБ на системном диске ---
@@ -3326,48 +3836,16 @@ Write-Ok (T 'Кусты реестра выгружены' 'Registry hives unloa
 Write-Stage (T "Добавление ярлыка Install-Firefox$(if ($WithWinget) { ' и winget' })" "Adding Install-Firefox$(if ($WithWinget) { ' and winget' })")
 
 if ($WithWinget) {
-    $wingetDir = Join-Path $UpdatesDir 'winget'
-    $null = New-Item -ItemType Directory -Path $wingetDir -Force
     try {
-        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/microsoft/winget-cli/releases/latest' `
-                                     -Headers @{ 'User-Agent' = 'win-11-lite' } -TimeoutSec 60
-        Write-Ok "App Installer $($release.tag_name)"
-
-        $bundleAsset = $release.assets | Where-Object { $_.name -like '*.msixbundle' } | Select-Object -First 1
-        $licenseAsset = $release.assets | Where-Object { $_.name -like '*License1.xml' } | Select-Object -First 1
-        $depsAsset = $release.assets | Where-Object { $_.name -eq 'DesktopAppInstaller_Dependencies.zip' } | Select-Object -First 1
-
-        $bundle = Join-Path $wingetDir $bundleAsset.name
-        $license = Join-Path $wingetDir $licenseAsset.name
-        $deps = Join-Path $wingetDir $depsAsset.name
-        Save-Url -Url $bundleAsset.browser_download_url  -Destination $bundle
-        Save-Url -Url $licenseAsset.browser_download_url -Destination $license
-        Save-Url -Url $depsAsset.browser_download_url    -Destination $deps
-
-        $depsDir = Join-Path $wingetDir 'deps'
-        if (Test-Path $depsDir) {
-            $null = Assert-ChildPath -Path $depsDir -Root $wingetDir
-            Remove-Item -LiteralPath $depsDir -Recurse -Force
-        }
-        Expand-Archive -LiteralPath $deps -DestinationPath $depsDir -Force
-        $depFiles = @(Get-ChildItem -LiteralPath $depsDir -Recurse -File |
-                      Where-Object { $_.Extension -in @('.appx', '.msix') -and $_.FullName -match '\\(x64|neutral)\\' })
-
-        $wingetArgs = @("/Image:$mountDir", '/Add-ProvisionedAppxPackage', "/PackagePath:$bundle")
-        foreach ($dep in $depFiles) { $wingetArgs += "/DependencyPackagePath:$($dep.FullName)" }
-        $wingetArgs += "/LicensePath:$license"
-
-        $r = Invoke-Dism -Arguments $wingetArgs -Quiet
-        if (Test-DismSuccess $r.ExitCode) {
-            Write-Ok (T "winget встроен (зависимостей: $($depFiles.Count))" "winget added (dependencies: $($depFiles.Count))")
-        } else {
-            Write-Note (T "Не удалось встроить winget (код $($r.ExitCode)). Ярлык Install-Firefox всё равно сработает через curl." "Failed to add winget (code $($r.ExitCode)). The Install-Firefox shortcut will still work via curl.")
-        }
+        $wingetArgs = @("/Image:$mountDir", '/Add-ProvisionedAppxPackage', "/PackagePath:$($wingetPayload.Bundle)")
+        foreach ($dep in $wingetPayload.Dependencies) { $wingetArgs += "/DependencyPackagePath:$dep" }
+        $wingetArgs += "/LicensePath:$($wingetPayload.License)"
+        Invoke-Dism -Arguments $wingetArgs -Quiet | Out-Null
+        Write-Ok (T "winget встроен (зависимостей: $($wingetPayload.Dependencies.Count))" "winget added (dependencies: $($wingetPayload.Dependencies.Count))")
     } catch {
         throw (T "Не удалось встроить запрошенный winget: $($_.Exception.Message)" "Failed to add requested winget: $($_.Exception.Message)")
     }
 }
-
 # --- ярлык Install-Firefox ---
 # Тексты внутри ярлыка — на языке, который получит установленная система
 $firefoxCmd = Get-FirefoxInstallerCommand -Language $imgLang -MozillaLanguage $mozLang
@@ -3473,10 +3951,18 @@ $buildInfo = [ordered]@{
     OutputIso = $OutputIso
     Preset = $Preset
     Language = $imgLang
+    SetupLanguage = $setupLang
+    SetupLanguageUpdate = $(if ($setupRepair) { Split-Path $setupRepair -Leaf } else { $null })
     UpdateMode = $UpdateMode
+    WithWinget = [bool]$WithWinget
+    AddedLanguages = @($AddLanguage)
+    IncludeDotNetUpdate = [bool]$dotNetPayload
+    LcuFile = $LcuFile
+    DotNetUpdateFile = $(if ($dotNetPayload) { $DotNetUpdateFile } else { $null })
+    SkippedDownloads = @($script:SkippedDownloads)
     Guard = [bool]$Guard
     GuardDebug = [bool]($Guard -and $GuardDebug)
-} | ConvertTo-Json
+} | ConvertTo-Json -Depth 4
 [IO.File]::WriteAllText((Join-Path $supportDir 'build-info.json'), $buildInfo, [Text.UTF8Encoding]::new($false))
 [IO.File]::WriteAllText((Join-Path $isoDir 'win11-lite-build.json'), $buildInfo, [Text.UTF8Encoding]::new($false))
 Write-Ok (T "ID сборки: $($script:StartedAt.ToString('yyyyMMdd-HHmmss')) — записан в ISO и установленную Windows" "Build ID: $($script:StartedAt.ToString('yyyyMMdd-HHmmss')) - recorded in the ISO and installed Windows")
@@ -3502,7 +3988,7 @@ Write-Ok (T "Install-Firefox.cmd на общем рабочем столе (яз
 Write-Stage (T 'Очистка хранилища компонентов и фиксация образа' 'Cleaning the component store and committing the image')
 
 if ($AddLanguage) {
-    Assert-ImageLanguages -Image $mountDir -Languages $AddLanguage -SourceLanguage $setupLang
+    Assert-ImageLanguages -Image $mountDir -Languages $AddLanguage -SourceLanguage $sourceImageLanguage
     Write-Ok (T 'Базовые языковые возможности и ресурсы Параметров проверены' 'Basic language capabilities and Settings resources verified')
 }
 if ($Preset -ne 'balanced') { Assert-ImageFileState -Image $mountDir }
@@ -3527,7 +4013,7 @@ if ($Preset -eq 'balanced') {
     Write-RemainingRemovalReport -Image $mountDir
     Write-Step (T 'Повторная файловая очистка после последнего обслуживания DISM' 'Repeating file cleanup after the final DISM servicing operation')
     Remove-SelectedImageFiles
-    if ($RemoveWinRE -and (Test-GroupActive -RulePreset 'balanced' -Group 'WinRE')) {
+    if ($RemoveWinRE -and (Test-GroupActive -RulePreset 'safe' -Group 'WinRE')) {
         Remove-ImagePath -FullPath (Join-Path $mountDir 'Windows\System32\Recovery\Winre.wim') -Description 'WinRE (final)' | Out-Null
     }
 }
@@ -3535,12 +4021,8 @@ if ($Preset -eq 'balanced') {
 # В balanced проверяем файлы после всех действий DISM, которые могли их восстановить.
 if ($Preset -eq 'balanced') { Assert-ImageFileState -Image $mountDir }
 
-Invoke-Dism -Arguments @('/Unmount-Image', "/MountDir:$mountDir", '/Commit') -Activity (T 'Сохранение изменений в образе' 'Committing changes to the image') | Out-Null
-$script:Mounted = $false
-Write-Ok (T "install.wim после фиксации: $(Format-Size (Get-Item -LiteralPath $wimPath).Length)" "install.wim after commit: $(Format-Size (Get-Item -LiteralPath $wimPath).Length)")
-
 # --- boot.wim: обход требований и выбор установщика ---
-if (-not $NoBypass -or $LegacySetup) {
+if (-not $NoBypass -or $LegacySetup -or $setupPayload) {
     $bootWim = Join-Path $isoDir 'sources\boot.wim'
     if (Test-Path -LiteralPath $bootWim) {
         $bootInfo = Invoke-Dism -Arguments @('/Get-ImageInfo', "/ImageFile:$bootWim") -Quiet
@@ -3548,9 +4030,13 @@ if (-not $NoBypass -or $LegacySetup) {
         foreach ($bi in $bootImages) {
             $idx = [int]$bi.Index
             Write-Step (T "boot.wim индекс $idx — правлю" "boot.wim index $idx - patching")
-            Invoke-Dism -Arguments @('/Mount-Image', "/ImageFile:$bootWim", "/Index:$idx", "/MountDir:$bootMountDir") | Out-Null
+            Invoke-Dism -Arguments @('/Mount-Image', "/ImageFile:$bootWim", "/Index:$idx", "/MountDir:$bootMountDir") `
+                        -Activity (T "Монтирование boot.wim (индекс $idx)" "Mounting boot.wim (index $idx)") | Out-Null
             $script:BootMounted = $true
             try {
+                if ($setupPayload -and $idx -eq 2) {
+                    Add-SetupLanguage -Image $bootMountDir -WindowsImage $mountDir -Distribution $isoDir -Payload $setupPayload -RepairUpdate $setupRepair -Legacy:$LegacySetup
+                }
                 if (-not $NoBypass) {
                     Mount-Hive -Name 'LITE_BOOT' -File (Join-Path $bootMountDir 'Windows\System32\config\SYSTEM')
                     foreach ($n in 'BypassTPMCheck', 'BypassSecureBootCheck', 'BypassRAMCheck', 'BypassStorageCheck', 'BypassCPUCheck') {
@@ -3569,7 +4055,8 @@ if (-not $NoBypass -or $LegacySetup) {
                     $peLaunch = "[LaunchApps]`r`n%SystemDrive%\sources\setup.exe, /legacy`r`n"
                     [IO.File]::WriteAllText((Join-Path $bootMountDir 'Windows\System32\winpeshl.ini'), $peLaunch, [Text.Encoding]::ASCII)
                 }
-                Invoke-Dism -Arguments @('/Unmount-Image', "/MountDir:$bootMountDir", '/Commit') | Out-Null
+                Invoke-Dism -Arguments @('/Unmount-Image', "/MountDir:$bootMountDir", '/Commit') `
+                            -Activity (T "Сохранение boot.wim (индекс $idx)" "Committing boot.wim (index $idx)") | Out-Null
                 $script:BootMounted = $false
             } catch {
                 Dismount-Hives
@@ -3581,6 +4068,11 @@ if (-not $NoBypass -or $LegacySetup) {
         Write-Ok (T "boot.wim обработан$(if ($LegacySetup) { ' — установщик переключён на классический' })" "boot.wim processed$(if ($LegacySetup) { ' — classic setup enabled' })")
     }
 }
+
+Invoke-Dism -Arguments @('/Unmount-Image', "/MountDir:$mountDir", '/Commit') -Activity (T 'Сохранение изменений в образе' 'Committing changes to the image') | Out-Null
+$script:Mounted = $false
+Write-Ok (T "install.wim после фиксации: $(Format-Size (Get-Item -LiteralPath $wimPath).Length)" "install.wim after commit: $(Format-Size (Get-Item -LiteralPath $wimPath).Length)")
+
 
 #endregion
 
@@ -3608,6 +4100,7 @@ if ($TrimSources) {
     $srcDir = Join-Path $isoDir 'sources'
     # Имя $keep занято параметром -Keep с ValidateSet — присваивание в него падает
     $keepFiles = @($destName, 'boot.wim', 'EI.CFG', 'ei.cfg', 'setup.exe')
+    if ($setupPayload) { $keepFiles += @('lang.ini', $setupLang, $sourceImageLanguage) }
     $trimmed = 0; $trimmedBytes = 0
     foreach ($item in (Get-ChildItem -LiteralPath $srcDir -Force)) {
         if ($item.Name -in $keepFiles) { continue }
@@ -3766,18 +4259,21 @@ if ($SkipIso) {
     $buildingIso = "$OutputIso.building"
     if (Test-Path -LiteralPath $buildingIso) { Remove-Item -LiteralPath $buildingIso -Force }
 
-    # Пути к загрузчикам передаём относительными и без кавычек: PowerShell
-    # добавляет к закавыченному аргументу свои кавычки, и oscdimg получает ""path""
+    # Пути к загрузчикам передаём относительными и без кавычек: кавычки вокруг
+    # аргумента без пробелов oscdimg получил бы как часть значения.
+    # Каталог-источник '.' задаётся рабочим каталогом процесса: Push-Location
+    # оболочки на запущенный процесс не влияет.
     $bootData = '2#p0,e,bboot\etfsboot.com#pEF,e,befi\microsoft\boot\efisys.bin'
     Write-Step (T "oscdimg → $OutputIso" "oscdimg -> $OutputIso")
-    Push-Location $isoDir
-    try {
-        & $script:Oscdimg -m -o -u2 -udfver102 "-l$label" "-bootdata:$bootData" '.' $buildingIso
-        $isoExitCode = $LASTEXITCODE
-    } finally {
-        Pop-Location
+    $isoRun = Invoke-ProgressProcess -Exe $script:Oscdimg -WorkingDirectory $isoDir -ProgressOnStdErr `
+        -Activity (T 'Запись ISO' 'Writing the ISO') `
+        -Arguments @('-m', '-o', '-u2', '-udfver102', "-l$label", "-bootdata:$bootData", '.', $buildingIso)
+    if ($isoRun.ExitCode -ne 0) {
+        $tail = ($isoRun.Output | Select-Object -Last 12) -join "`n"
+        throw (T "oscdimg завершился с кодом $($isoRun.ExitCode)`n$tail" "oscdimg exited with code $($isoRun.ExitCode)`n$tail")
     }
-    if ($isoExitCode -ne 0) { throw (T "oscdimg завершился с кодом $isoExitCode" "oscdimg exited with code $isoExitCode") }
+    # Полоса заменила живой вывод oscdimg; его отчёт сохраняем в подробном логе.
+    Write-Verbose (($isoRun.Output -join "`n").Trim())
     if (Test-Path -LiteralPath $OutputIso) { [IO.File]::Replace($buildingIso, $OutputIso, $null) }
     else { [IO.File]::Move($buildingIso, $OutputIso) }
 
@@ -3820,6 +4316,7 @@ if ($Preset -eq 'balanced' -and $script:ImageAudit.RemainingRemovals.Count) {
     Write-Note (T "  После проверки DISM осталось выбранных компонентов: $($script:ImageAudit.RemainingRemovals.Count); состояния и причины — в отчёте образа" "  Selected components still present after DISM verification: $($script:ImageAudit.RemainingRemovals.Count); see the image audit for states and failures")
 }
 Write-Host (T "  Объём удалённых файлов до сжатия: $(Format-Size $script:FreedBytes) (не экономия ISO; возможен повторный учёт hard links)" "  Deleted file lengths before compression: $(Format-Size $script:FreedBytes) (not ISO savings; hard links may be counted more than once)")
+if ($script:SkippedDownloads.Count) { Write-Note (T "  Сборка выполнена без: $($script:SkippedDownloads -join '; ')" "  Built without: $($script:SkippedDownloads -join '; ')") }
 if ($script:ImageAuditPath -and (Test-Path -LiteralPath $script:ImageAuditPath)) {
     $script:ImageAudit['SourceIsoBytes'] = $srcSize
     $script:ImageAudit['ResultIsoBytes'] = $dstSize
@@ -3868,7 +4365,7 @@ if ($LogFile) { Write-Host (T "  Лог: $LogFile" "  Log: $LogFile") }
         try { Dismount-DiskImage -ImagePath $script:LangIso | Out-Null } catch { }
     }
 
-    if (-not $DryRun) {
+    if (-not $DryRun -and $script:WorkPrepared) {
         if ($KeepWorkDir -or $SkipIso -or $script:Mounted -or $script:BootMounted -or $script:LoadedHives.Count) {
             Write-Note (T "Рабочий каталог сохранён: $WorkDir" "Work folder kept: $WorkDir")
         } elseif ((Test-Path -LiteralPath $WorkDir) -and (Test-SafeToWipe $WorkDir) -and

@@ -7,11 +7,26 @@
 # Downloaded servicing packages and generated build output
 *.msu
 *.cab
+*.msix
+*.msixbundle
+*.appx
+*.appxbundle
 /out/
 /iso/
 /updates/
 /log/
 /tmp/
+/win-11-lite-work/
+/win-11-lite-updates/
+
+# Local snapshots and raw validation output; keep maintained notes and audit summary
+/.ai/*before*.ps1
+/.ai/*.recovered.ps1
+/.ai/*-validation/
+/.ai/*dryrun*.txt
+/.ai/guard-*-plan-*.txt
+/.ai/windows-reference/
+/.ai/windows-history/
 
 # Operating-system metadata and transient logs
 *.log

@@ -19,7 +19,7 @@ function Assert-Throws([scriptblock]$Action, [string]$Message) {
     Assert $thrown $Message
 }
 # Load declarations and pure configuration only, never execute the build pipeline.
-foreach ($name in @('T','Test-DismSuccess','ConvertFrom-DismList','Test-GroupActive','Test-Protected','Assert-ChildPath','Test-SafeToWipe','Get-FodSourceName','Get-UpdateTarget','Get-SetupSupportScripts','Get-ElevationCommand','Invoke-RegCommand','Set-Reg','Mount-Hive','Dismount-Hives','Remove-Reg','Save-ImageAudit','Write-ComponentStoreReport','Write-ServicingRemovalFailure','Get-PackageRemovalSkipReason','Get-RequestedRemovalItems','Remove-OfflineRecall','Write-RemainingRemovalReport','Assert-ImageFileState','Get-ProgressLine','Update-DismProgressState','Invoke-DismProgress','Assert-ImageLanguages','Write-WindowsBatchFile')) {
+foreach ($name in @('T','Test-DismSuccess','ConvertFrom-DismList','Test-GroupActive','Test-Protected','Assert-ChildPath','Test-SafeToWipe','Get-FodSourceName','Get-UpdateTarget','Get-SetupSupportScripts','Get-GuardScript','Get-ElevationCommand','Invoke-RegCommand','Invoke-NativeQuiet','Set-Reg','Mount-Hive','Dismount-Hives','Remove-Reg','Save-ImageAudit','Write-ComponentStoreReport','Write-ServicingRemovalFailure','Get-PackageRemovalSkipReason','Get-RequestedRemovalItems','Remove-OfflineRecall','Write-RemainingRemovalReport','Get-WebViewRuntimeRoots','Assert-ImageFileState','Get-ProgressLine','Update-ProgressState','Invoke-ProgressProcess','Get-CopyPercent','Assert-ImageLanguages','Write-WindowsBatchFile')) {
     $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
     if (-not $node) { throw "Missing function: $name" }
     . ([scriptblock]::Create($node.Extent.Text))
@@ -36,7 +36,7 @@ try {
     Assert (-not (Test-DismSuccess 5)) 'DISM access denied is failure'
     & {
         $state = @{Percent=-1;Phase=1;Lines=[Collections.Generic.List[string]]::new()}
-        foreach ($sample in @('36%','100%','1%','100%','The operation completed successfully.')) { Update-DismProgressState -State $state -Text $sample }
+        foreach ($sample in @('36%','100%','1%','100%','The operation completed successfully.')) { Update-ProgressState -State $state -Text $sample }
         Assert ($state.Phase -eq 2 -and $state.Percent -eq 100 -and $state.Lines.Count -eq 1) 'Checkpoint percentage reset creates another DISM phase'
         foreach ($width in @(20,80,120)) {
             $line = Get-ProgressLine -Activity ('Applying windows11.0-kb5124008-x64_' + ('a' * 40) + '.msu') -Percent 36 -Phase 2 -Elapsed ([TimeSpan]::FromSeconds(4000)) -Width $width
@@ -48,10 +48,35 @@ try {
         $payload = '[Console]::Write("36%`r"); [Console]::Out.Flush(); Start-Sleep -Milliseconds 650; [Console]::Write("100%`r1%`r100%`r"); [Console]::Error.WriteLine("Simulated failure after progress reached 100%."); exit 5'
         $progressFixture = Join-Path $testRoot 'progress-simulation.ps1'
         [IO.File]::WriteAllText($progressFixture, $payload, [Text.UTF8Encoding]::new($true))
-        $output = Invoke-DismProgress -Exe ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -Arguments @('-NoProfile','-NonInteractive','-File',$progressFixture) -Activity 'Native progress test'
-        Assert ($script:LastDismExit -eq 5 -and $output -match 'Simulated failure') 'Native progress preserves stderr and failure status'
+        $psExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $run = Invoke-ProgressProcess -Exe $psExe -Arguments @('-NoProfile','-NonInteractive','-File',$progressFixture) -Activity 'Native progress test'
+        Assert ($run.ExitCode -eq 5 -and $run.Output -match 'Simulated failure') 'Native progress preserves stderr and failure status'
         Assert ($frames[-1].Done -and $frames[-1].Failed -and $frames[-1].Phase -eq 2) 'Reported 100 percent cannot turn a failed process into success'
         Assert (@($frames | Where-Object { $_.Percent -eq 36 -and -not $_.Done }).Count -gt 0) 'Native stream is processed before the child process exits'
+        # oscdimg сообщает проценты в stderr, а сообщения печатает в stdout.
+        $frames.Clear()
+        $stderrPayload = '[Console]::Out.WriteLine("Writing files from " + $PWD.Path); [Console]::Error.WriteLine("7% complete"); [Console]::Error.Flush(); Start-Sleep -Milliseconds 650; [Console]::Error.WriteLine("100% complete"); exit 3'
+        $stderrFixture = Join-Path $testRoot 'progress-stderr.ps1'
+        [IO.File]::WriteAllText($stderrFixture, $stderrPayload, [Text.UTF8Encoding]::new($true))
+        $run = Invoke-ProgressProcess -Exe $psExe -Arguments @('-NoProfile','-NonInteractive','-File',$stderrFixture) `
+                                      -Activity 'StdErr progress test' -WorkingDirectory $testRoot -SuccessCodes @(0,3) -ProgressOnStdErr
+        Assert ($run.ExitCode -eq 3 -and $frames[-1].Done -and -not $frames[-1].Failed) 'Success codes of the tool decide the outcome of the bar'
+        Assert (@($run.Output | Where-Object { $_ -match [regex]::Escape($testRoot) }).Count -eq 1) 'Working directory reaches the process and its stdout is preserved'
+        Assert (@($frames | Where-Object { $_.Percent -eq 7 -and -not $_.Done }).Count -gt 0) 'Percentages are read from stderr when the tool reports them there'
+        # robocopy с /NP не печатает прогресс: процент приходит извне.
+        $frames.Clear()
+        $run = Invoke-ProgressProcess -Exe $psExe -Arguments @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Milliseconds 650') `
+                                      -Activity 'External percentage test' -GetPercent { 42 }
+        Assert ($run.ExitCode -eq 0 -and @($frames | Where-Object { $_.Percent -eq 42 -and -not $_.Done }).Count -gt 0) 'Silent tools take their percentage from -GetPercent'
+        $copyRoot = Join-Path $testRoot 'copy-progress'
+        $null = New-Item -ItemType Directory -Path $copyRoot
+        [IO.File]::WriteAllBytes((Join-Path $copyRoot 'part.bin'), (New-Object byte[] 500))
+        $script:CopyPercent = 0; $script:CopyPolled = $null
+        Assert ((Get-CopyPercent -Path $copyRoot -TotalBytes 1000) -eq 50) 'Copy percentage is measured by bytes already on disk'
+        [IO.File]::WriteAllBytes((Join-Path $copyRoot 'rest.bin'), (New-Object byte[] 500))
+        Assert ((Get-CopyPercent -Path $copyRoot -TotalBytes 1000) -eq 50) 'The copied tree is not walked more often than every two seconds'
+        $script:CopyPolled = (Get-Date).AddSeconds(-3)
+        Assert ((Get-CopyPercent -Path $copyRoot -TotalBytes 1000) -eq 99) 'Only the finished process reports 100 percent'
     }
     $parsed = @(ConvertFrom-DismList -Key 'Capability Identity' -Lines @('Capability Identity : Language.Basic~~~ru-RU~0.0.1.0','State : Installed','Capability Identity : Test~~~~0.0.1.0','State : Not Present'))
     Assert ($parsed.Count -eq 2 -and $parsed[0].State -eq 'Installed') 'DISM multi-record parsing'
@@ -102,11 +127,12 @@ try {
     Assert ((Get-UpdateTarget $updateDir).Name -eq 'target.msu') 'Explicit target wins over larger checkpoint'
     Assert-Throws { Get-UpdateTarget $updateDir '..\outside.msu' } 'Update target traversal rejected'
     $receiver = Join-Path $testRoot "parameter receiver's.ps1"
-    [IO.File]::WriteAllText($receiver, 'param([string[]]$Keep,[bool]$IncludeDotNetUpdate,[switch]$Guard,[switch]$Elevated) [pscustomobject]@{Keep=$Keep;DotNet=$IncludeDotNetUpdate;Guard=[bool]$Guard;Elevated=[bool]$Elevated}')
-    $encoded = Get-ElevationCommand -ScriptPath $receiver -Parameters @{Keep=@('Edge','Fonts');IncludeDotNetUpdate=$false;Guard=[switch]$false}
+    [IO.File]::WriteAllText($receiver, 'param([string[]]$Keep,[bool]$IncludeDotNetUpdate,[switch]$Guard,[switch]$Elevated,[switch]$GuardDebug=$true) [pscustomobject]@{Keep=$Keep;DotNet=$IncludeDotNetUpdate;Guard=[bool]$Guard;Elevated=[bool]$Elevated;GuardDebug=[bool]$GuardDebug}')
+    $encoded = Get-ElevationCommand -ScriptPath $receiver -Parameters @{Keep=@('Edge','Fonts');IncludeDotNetUpdate=$false;Guard=[switch]$false;GuardDebug=[switch]$false}
     $received = & ([scriptblock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded))))
     Assert ($received.Keep.Count -eq 2 -and $received.Keep[1] -eq 'Fonts') 'Elevation preserves array parameters and quoted paths'
     Assert (-not $received.DotNet -and -not $received.Guard -and $received.Elevated) 'Elevation preserves false bool/switch values'
+    Assert (-not $received.GuardDebug) 'Elevation preserves an explicit GuardDebug false value'
 
     # Real native stderr/exit handling, read-only: PS 5.1 emits ErrorRecord objects.
     & {
@@ -116,6 +142,14 @@ try {
         $native = Invoke-RegCommand -Arguments @('/?')
         Assert ($native.ExitCode -eq 0 -and $native.Output.Length -gt 0) 'Native registry success preserves stdout and exit code'
         Assert ($ErrorActionPreference -eq 'Stop' -and $PSNativeCommandUseErrorActionPreference) 'Native wrapper does not change caller error preferences'
+    }
+    # Native tools that write to stderr (takeown, icacls, reg delete on a missing
+    # key) must not abort the build under Windows PowerShell 5.1 with Stop.
+    & {
+        $code = Invoke-NativeQuiet cmd.exe @('/c', 'echo simulated stderr 1>&2 & exit 3')
+        Assert ($code -eq 3 -and $ErrorActionPreference -eq 'Stop') 'Quiet native wrapper returns the exit code despite stderr output'
+        Remove-Reg -Path ('HKCU\win-11-lite-missing-' + [guid]::NewGuid().ToString('N'))
+        Assert $true 'Deleting a missing registry key is not an error'
     }
     # Run the actual offline-registry stage. Reject the reported protected value
     # and record the replacement policy, without loading hives or writing HKLM.
@@ -302,8 +336,9 @@ try {
         }
         $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Remove-SelectedImageFiles' }, $true)
         . ([scriptblock]::Create($node.Extent.Text))
-        $commitStage = [regex]::Match($ast.Extent.Text, '(?ms)^Write-Stage \(T ''Очистка хранилища компонентов и фиксация образа''.*?(?=^# --- boot\.wim)').Value
+        $commitStage = [regex]::Match($ast.Extent.Text, '(?ms)^Write-Stage \(T ''Очистка хранилища компонентов и фиксация образа''.*?(?=^#endregion)').Value
         if (-not $commitStage) { throw 'Final servicing stage not found' }
+        $NoBypass = $true; $LegacySetup = $false; $setupPayload = $null
         $events.Clear()
         & ([scriptblock]::Create($commitStage))
         Assert (-not (Test-Path -LiteralPath $browser)) 'Final cleanup removes Edge restored by DISM'
@@ -314,6 +349,19 @@ try {
         Assert ($cleanupAt -lt $deleteAt -and $deleteAt -lt $commitAt) 'Restored files are removed after DISM cleanup and before commit'
         Remove-Item -LiteralPath $newRuntime -Force
         Assert-Throws { Assert-ImageFileState -Image $mountDir } 'Missing WebView2 still blocks commit'
+        # Regression from the KB5124008 build: the LCU replaces the in-box WebView2
+        # package, CBS unprojects the Program Files (x86) copy and the runtime
+        # stays only in System32\Microsoft-Edge-WebView. That is not a removal.
+        $stubDir = Join-Path $mountDir 'Windows\System32\Microsoft-Edge-WebView'
+        $null = New-Item -ItemType Directory -Path $stubDir -Force
+        $null = New-Item -ItemType File -Path (Join-Path $stubDir 'msedgewebview2.exe')
+        Set-Content -LiteralPath (Join-Path $stubDir '151.0.4129.59.manifest') -Value 'x'
+        $notesBefore = $notes.Count
+        Assert-ImageFileState -Image $mountDir
+        Assert ($notes.Count -eq $notesBefore + 1 -and $notes[-1] -match '151\.0\.4129\.59' -and $notes[-1] -match [regex]::Escape($webRoot)) 'Relocated in-box WebView2 after servicing is reported, not treated as a removal'
+        Assert ($script:ImageAudit['WebView'].Present.Count -eq 1 -and $script:ImageAudit['WebView'].Versions -contains '151.0.4129.59') 'Image audit records where WebView2 remains and its version'
+        Remove-Item -LiteralPath $stubDir -Recurse -Force
+        Assert-Throws { Assert-ImageFileState -Image $mountDir } 'WebView2 missing from every known root still blocks commit'
         $script:ImageAuditPath = $null
     }
 
@@ -330,13 +378,14 @@ try {
     }
     # Evaluate the actual answer-file expressions, then parse the resulting XML.
     $imgLang = 'ru-RU'; $setupLang = 'en-US'; $ProductKey = ''; $CompactOS = $false; $NoOobeNetworkBlock = $false
-    foreach ($name in @('compactBlock','oobeNetBlock','unattendXml')) {
+    foreach ($name in @('setupInputLocale','compactBlock','oobeNetBlock','unattendXml')) {
         $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq ('$' + $name) }, $true)
         . ([scriptblock]::Create($node.Extent.Text))
     }
     $xml = [xml]$unattendXml
     $ns = New-Object Xml.XmlNamespaceManager($xml.NameTable); $ns.AddNamespace('u','urn:schemas-microsoft-com:unattend')
     Assert ($xml.SelectSingleNode('//u:SetupUILanguage/u:UILanguage',$ns).InnerText -eq 'en-US') 'WinPE uses a language actually present in boot.wim'
+    Assert (@($xml.SelectNodes('//u:InputLocale',$ns) | Where-Object { $_.InnerText -ne '0419:00000419;0409:00000409' }).Count -eq 0) 'Windows Setup configures both Russian and English keyboards without a logon language script'
     Assert ($xml.SelectSingleNode('//u:settings[@pass="windowsPE"]/u:component[@name="Microsoft-Windows-International-Core-WinPE"]/u:UILanguage',$ns).InnerText -eq 'ru-RU') 'Windows default language is not overwritten by English Setup UI'
     $firstCommand = $xml.SelectSingleNode('//u:FirstLogonCommands/u:SynchronousCommand/u:CommandLine',$ns).InnerText
     Assert ($firstCommand -match 'Finalize.ps1.*-FirstLogon' -and $firstCommand -match '-WindowStyle Hidden') 'Answer file starts finalization directly and hidden'
@@ -363,15 +412,10 @@ try {
         Clear-Content -LiteralPath $path
         Assert-Throws { Assert-ImageLanguages -Image $image -Languages 'ru-RU' -SourceLanguage 'en-US' } 'Empty Settings PRI is rejected'
     }
-    $guardPolicies=@('HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection|AllowTelemetry|0')
-    $guardFolders=@('Windows\diagnostics'); $guardServices=@('DiagTrack'); $guardCaps=@(); $guardAppx=@()
-    foreach ($name in @('toPsList','guardScript')) {
-        $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq ('$' + $name) }, $true)
-        . ([scriptblock]::Create($node.Extent.Text))
-    }
+    $guardScript = Get-GuardScript
     $t=$null; $e=$null
     $null=[Management.Automation.Language.Parser]::ParseInput($guardScript,[ref]$t,[ref]$e)
-    Assert ($e.Count -eq 0) 'Generated guard parses with actual policy/folder lists'
+    Assert ($e.Count -eq 0) 'Generated guard parses'
 
     # Execute generated scripts with mocked privileged APIs and a fake file tree.
     & {

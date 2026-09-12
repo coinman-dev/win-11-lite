@@ -1,0 +1,36 @@
+{
+  "Date": "2026-09-12T17:59:30.0336305+03:00",
+  "ScriptSHA256": "615EBF0AEE8EBD34A3CF371276A6EA0C6EF3A46A8355B4D18DA51809C0DD7726",
+  "ChecksPerRuntime": 368,
+  "ChecksBySuite": {
+    "Main": 129,
+    "WindowsBatch": 72,
+    "Guard": 33,
+    "Downloads": 80,
+    "SetupLanguage": 54
+  },
+  "TestFiles": [
+    "tests/Test-Win11Lite.ps1",
+    "tests/Test-WindowsBatch.ps1",
+    "tests/Test-Guard.ps1",
+    "tests/Test-Downloads.ps1",
+    "tests/Test-SetupLanguage.ps1"
+  ],
+  "PowerShell7": "7.6.6 PASS",
+  "WindowsPowerShell": "5.1.19041.7725 PASS",
+  "DryRun": "Source LTSC ISO index 2, DownloadLanguage ru-RU: Setup language ru-RU; PowerShell 7 RU (LegacySetup/TrimSources) and PS 5.1 EN PASS. See .ai/setup-language-validation.",
+  "FullIsoBuild": "User build 20260912-132101 (PS 5.1, -WithUpdates KB5124008, ru-RU, winget, Guard, RemoveWinRE, LegacySetup, TrimSources) reached stage 17 and failed only on the WebView2 assert; stage 15 confirmed the PS 5.1 reg-query fix on a real image (15 of 18 services present). Assert relaxed; rebuild required.",
+  "LastUserBuild": "20260912-002657: completed 01:09:59, ISO 3121188864 bytes, no KB5124008 (language-repair LCU only); predates all 2026-09-12 revisions",
+  "VmInstall": "User confirmed correct D: ISO works; screenshots show Russian Settings. Revisions after that not installed in VM yet.",
+  "FirefoxLauncher": "out/Install-Firefox.cmd: UTF-8 without BOM, CRLF; native CMD branch tests PASS; Mozilla redirect HEAD ends in HTTP 200",
+  "Guard": "SYSTEM logon worker + interactive limited-user live log observer; GuardDebug default true; takeown/icacls now run with local Continue; tested with mocks; actual new VM logon not tested",
+  "Review20260912": "See 14-review-native-stderr-2026-09-12.md: PS 5.1 stderr+Stop fix, safe+RemoveWinRE fix, dead branches removed",
+  "EarlierBaselineIsoBytes": 3101646848,
+  "WebView2AfterLcu": "KB5124008 replaces in-box Microsoft-Edge-WebView 10.0.26100.1 (122.0.2365.106) with 10.0.26100.9444 (151.0.4129.59); CBS unprojects Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\122.*, runtime remains in Windows\\System32\\Microsoft-Edge-WebView. Builder now accepts any known root; first-boot WebView2 registration must be verified in a VM.",
+  "DownloadPreparation": "All payloads prepared before ISO copy, work cleanup and WIM servicing; component skip/cancel, verified cache, checkpoints, language repair dependencies, partial-file handling and offline integration tested with mocks. No new full ISO build or VM install.",
+  "LatestUserBuildFailure": "User reported api.github.com DNS failure while embedding winget at stage 16 with no internet. Downloads have now been moved to preparation; actual rebuild required.",
+  "ValidationLogs": ".ai/publish-validation; fresh sequential processes, all five suites passed on PowerShell 7.6.6 and Windows PowerShell 5.1.19041.7725 (368 checks per runtime) after normalizing line endings for Git. Earlier input-payload and DryRun evidence remains in .ai/setup-language-validation.",
+  "SetupLanguage": "Default auto follows first prepared Windows language; original preserves source Setup; explicit language and local WinPE source supported. Microsoft WinPE 26100 x64 download catalog, verified archives/CAB identities and offline cache. LP/installed OC/repair LCU, binary synchronization, lang.ini and TrimSources preservation implemented. Real RU payload verified; no new full ISO build or VM install.",
+  "WinPeCatalogSHA256": "78059F63D9DAF5E86F858C469B7B683AE0CA0E3A57FD7E4D3BC1F5BA9E0A5DA0",
+  "Publication": "coinman-dev/win-11-lite, main; README/CHANGELOG, current Windows source, data, tests and maintained project notes. No new full ISO build or VM installation."
+}
