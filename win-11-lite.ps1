@@ -746,6 +746,8 @@ function Get-ProgressLine {
           [int]$Width = 80, [switch]$Done, [switch]$Failed)
     $limit = [Math]::Max(1, $Width - 1) # Последний столбец вызывает перенос строки.
     $percent = [Math]::Max(0, [Math]::Min(100, $Percent))
+    $waiting = -not $Done -and $percent -eq 100
+    if ($Done -and -not $Failed) { $percent = 100 }
     $time = '{0:00}:{1:00}' -f [Math]::Floor($Elapsed.TotalMinutes), $Elapsed.Seconds
     $activityText = ($Activity -replace '[\r\n\t]', ' ')
     # Идентификатор KB полезнее длинного имени MSU с хэшем.
@@ -754,11 +756,20 @@ function Get-ProgressLine {
     # номер этапа показываем только со второго, чтобы не шуметь в обычном случае.
     if ($Done) { $activityText += if ($Failed) { T ' — ОШИБКА' ' - FAILED' } else { T ' — готово' ' - done' } }
     elseif ($Phase -gt 1) { $activityText += (T ' (этап ' ' (phase ') + "$Phase)" }
-    $tail = ' {0,3}%  {1}  {2}' -f $percent, $time, $activityText
+    if ($waiting) { $activityText = (T 'ожидание завершения — ' 'waiting for completion - ') + $activityText }
+    $percentText = if ($Done -and $Failed) { ' ERR' } elseif ($waiting) { ' ...' } else { '{0,3}%' -f $percent }
+    $tail = ' {0}  {1}  {2}' -f $percentText, $time, $activityText
     $barWidth = [Math]::Min(40, $limit - 2 - 2 - $tail.Length)
     $line = if ($barWidth -ge 8) {
-        $filled = [int][Math]::Round($barWidth * $percent / 100)
-        '  [' + ('█' * $filled) + ('·' * ($barWidth - $filled)) + ']' + $tail
+        if ($waiting) {
+            # 100% от утилиты не означает, что процесс уже завершён. Не рисуем
+            # выдуманные 99%: пока ждём выхода/нового этапа, показываем движение.
+            $position = [int]([Math]::Max(0, [Math]::Floor($Elapsed.TotalMilliseconds / 500)) % ($barWidth - 2))
+            '  [' + ('·' * $position) + '███' + ('·' * ($barWidth - $position - 3)) + ']' + $tail
+        } else {
+            $filled = [int][Math]::Round($barWidth * $percent / 100)
+            '  [' + ('█' * $filled) + ('·' * ($barWidth - $filled)) + ']' + $tail
+        }
     } else { ' ' + $tail }
     if ($line.Length -gt $limit) { $line = $line.Substring(0, [Math]::Max(0, $limit - 1)) + '…' }
     $line
@@ -893,10 +904,15 @@ function Invoke-ProgressProcess {
         $chars = New-Object char[] 2048
         $readTask = $reader.ReadAsync($chars, 0, $chars.Length)
         $lastDraw = [DateTime]::MinValue
-        while ($true) {
-            if ($readTask.IsCompleted) {
+        $reading = $true
+        while ($reading -or -not $proc.HasExited -or -not $restTask.IsCompleted) {
+            if ($reading -and $readTask.IsCompleted) {
                 $count = $readTask.GetAwaiter().GetResult()
-                if ($count -eq 0) { break }
+                if ($count -eq 0) {
+                    $reading = $false
+                    Update-ProgressState -State $state -Text $buffer.ToString()
+                    $null = $buffer.Clear()
+                }
                 for ($i = 0; $i -lt $count; $i++) {
                     $c = $chars[$i]
                     if ($c -eq "`r" -or $c -eq "`n" -or $c -eq [char]8) {
@@ -904,7 +920,7 @@ function Invoke-ProgressProcess {
                         $null = $buffer.Clear()
                     } else { $null = $buffer.Append($c) }
                 }
-                $readTask = $reader.ReadAsync($chars, 0, $chars.Length)
+                if ($reading) { $readTask = $reader.ReadAsync($chars, 0, $chars.Length) }
             }
             if (((Get-Date) - $lastDraw).TotalMilliseconds -ge 500) {
                 # Отказ внешнего счётчика гасим: индикация не должна ломать сборку.
@@ -912,7 +928,9 @@ function Invoke-ProgressProcess {
                 Write-ProgressBar -Activity $Activity -Percent ([Math]::Max(0, $state.Percent)) -Phase $state.Phase
                 $lastDraw = Get-Date
             }
-            if (-not $readTask.IsCompleted) { Start-Sleep -Milliseconds 100 }
+            # Даже после закрытия stdout/stderr процесс может ещё работать.
+            # До его выхода продолжаем обновлять время и индикатор ожидания.
+            if (-not $reading -or -not $readTask.IsCompleted) { Start-Sleep -Milliseconds 100 }
         }
         Update-ProgressState -State $state -Text $buffer.ToString()
         $restText = $restTask.GetAwaiter().GetResult()

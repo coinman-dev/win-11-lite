@@ -86,8 +86,28 @@ try {
             Assert ($line.Length -lt $width -and $line -notmatch '[\r\n]') "Progress never reaches the wrap column ($width)"
         }
         Assert ((Get-ProgressLine -Activity 'windows11.0-kb5124008-x64_longhash.msu' -Percent 1 -Phase 2 -Elapsed ([TimeSpan]::FromSeconds(1)) -Width 120) -match 'KB5124008') 'Progress retains KB while shortening update filenames'
+        foreach ($lang in @('ru','en')) {
+            $script:Lang=$lang
+            $pending=Get-ProgressLine -Activity 'WinPE' -Percent 100 -Phase 2 -Elapsed ([TimeSpan]::FromSeconds(315)) -Width 132
+            $next=Get-ProgressLine -Activity 'WinPE' -Percent 100 -Phase 2 -Elapsed ([TimeSpan]::FromSeconds(315.5)) -Width 132
+            Assert ($pending -notmatch '100%|99%' -and $pending -match $(if($lang -eq 'ru'){'ожидание завершения'}else{'waiting for completion'})) "A live process at 100 percent has an honest waiting state ($lang)"
+            Assert ($pending -ne $next) "Waiting indicator moves even before the elapsed second changes ($lang)"
+            $finished=Get-ProgressLine -Activity 'WinPE' -Percent 100 -Elapsed ([TimeSpan]::FromSeconds(400)) -Width 132 -Done
+            Assert ($finished -match '100%' -and $finished -match $(if($lang -eq 'ru'){'готово'}else{'done'})) "Only successful completion displays 100 percent ($lang)"
+            $failed=Get-ProgressLine -Activity 'WinPE' -Percent 100 -Elapsed ([TimeSpan]::FromSeconds(400)) -Width 132 -Done -Failed
+            Assert ($failed -notmatch '100%' -and $failed -match 'ERR') "Failure after reported 100 percent cannot look successful ($lang)"
+            foreach($width in @(20,80,120)) {
+                Assert ((Get-ProgressLine -Activity ('Long activity '+('x'*100)) -Percent 100 -Elapsed ([TimeSpan]::FromSeconds(315)) -Width $width).Length -lt $width) "Waiting line fits a narrow console ($lang/$width)"
+            }
+        }
+        $script:Lang='en'
         $frames = [Collections.Generic.List[object]]::new()
-        function Write-ProgressBar { param($Activity,$Percent,$Phase=1,[switch]$Done,[switch]$Failed) $frames.Add([pscustomobject]@{Percent=$Percent;Phase=$Phase;Done=[bool]$Done;Failed=[bool]$Failed}) }
+        function Write-ProgressBar {
+            param($Activity,$Percent,$Phase=1,[switch]$Done,[switch]$Failed)
+            $elapsed=(Get-Date)-$script:ProgressStarted
+            $rendered=Get-ProgressLine -Activity $Activity -Percent $Percent -Phase $Phase -Elapsed $elapsed -Width 132 -Done:$Done -Failed:$Failed
+            $frames.Add([pscustomobject]@{Percent=$Percent;Phase=$Phase;Done=[bool]$Done;Failed=[bool]$Failed;Elapsed=$elapsed;Line=$rendered})
+        }
         $payload = '[Console]::Write("36%`r"); [Console]::Out.Flush(); Start-Sleep -Milliseconds 650; [Console]::Write("100%`r1%`r100%`r"); [Console]::Error.WriteLine("Simulated failure after progress reached 100%."); exit 5'
         $progressFixture = Join-Path $testRoot 'progress-simulation.ps1'
         [IO.File]::WriteAllText($progressFixture, $payload, [Text.UTF8Encoding]::new($true))
@@ -111,6 +131,35 @@ try {
         $run = Invoke-ProgressProcess -Exe $psExe -Arguments @('-NoProfile','-NonInteractive','-Command','Start-Sleep -Milliseconds 650') `
                                       -Activity 'External percentage test' -GetPercent { 42 }
         Assert ($run.ExitCode -eq 0 -and @($frames | Where-Object { $_.Percent -eq 42 -and -not $_.Done }).Count -gt 0) 'Silent tools take their percentage from -GetPercent'
+        # A real child prints 100%, keeps running, then either succeeds or fails.
+        foreach($resultCode in @(0,5)) {
+            $frames.Clear()
+            $fixture=Join-Path $testRoot "reported-100-$resultCode.ps1"
+            $text='[Console]::Write("100%`r"); [Console]::Out.Flush(); Start-Sleep -Milliseconds 1400; exit '+$resultCode
+            [IO.File]::WriteAllText($fixture,$text,[Text.UTF8Encoding]::new($true))
+            $run=Invoke-ProgressProcess -Exe $psExe -Arguments @('-NoProfile','-NonInteractive','-File',$fixture) -Activity 'Reported 100 percent'
+            $waiting=@($frames | Where-Object {$_.Percent -eq 100 -and -not $_.Done})
+            Assert ($waiting.Count -ge 2 -and $waiting[-1].Elapsed -gt $waiting[0].Elapsed) "Timer updates while the child remains alive after 100 percent (exit $resultCode)"
+            Assert (@($waiting | Where-Object {$_.Line -match '100%' -or $_.Line -notmatch 'waiting for completion'}).Count -eq 0) "Live native frames do not claim completion (exit $resultCode)"
+            Assert ($run.ExitCode -eq $resultCode -and $frames[-1].Done -and $frames[-1].Failed -eq ($resultCode -ne 0)) "Exit status decides final state after the wait (exit $resultCode)"
+        }
+        & {
+            # Both pipes can close before the process exits. Simulate EOF with
+            # real TextReader tasks and a process whose lifetime is controlled.
+            $frames.Clear()
+            $fakeProcess=[pscustomobject]@{StartInfo=$null;StandardOutput=[IO.StringReader]::new("100%`r");StandardError=[IO.StringReader]::new('');ExitCode=0;Timer=[Diagnostics.Stopwatch]::new();EarlyWait=$false;Disposed=$false}
+            $fakeProcess | Add-Member -MemberType ScriptMethod -Name Start -Value {$this.Timer.Start();$true}
+            $fakeProcess | Add-Member -MemberType ScriptProperty -Name HasExited -Value {$this.Timer.ElapsedMilliseconds -ge 1400}
+            $fakeProcess | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value {$this.EarlyWait=-not $this.HasExited;while(-not $this.HasExited){[Threading.Thread]::Sleep(25)}}
+            $fakeProcess | Add-Member -MemberType ScriptMethod -Name Dispose -Value {$this.Disposed=$true;$this.StandardOutput.Dispose();$this.StandardError.Dispose()}
+            function New-Object {
+                [CmdletBinding()]param([string]$TypeName,[object[]]$ArgumentList)
+                if($TypeName -eq 'System.Diagnostics.Process'){$fakeProcess}else{Microsoft.PowerShell.Utility\New-Object @PSBoundParameters}
+            }
+            $run=Invoke-ProgressProcess -Exe 'never-executed.exe' -Activity 'Closed output streams'
+            Assert (-not $fakeProcess.EarlyWait -and $fakeProcess.Disposed -and $run.ExitCode -eq 0) 'EOF does not cause a blocking wait before the process exits'
+            Assert (@($frames | Where-Object {$_.Percent -eq 100 -and -not $_.Done}).Count -ge 2) 'Waiting indicator keeps refreshing after stdout/stderr close'
+        }
         $copyRoot = Join-Path $testRoot 'copy-progress'
         $null = New-Item -ItemType Directory -Path $copyRoot
         [IO.File]::WriteAllBytes((Join-Path $copyRoot 'part.bin'), (New-Object byte[] 500))

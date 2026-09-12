@@ -1,9 +1,9 @@
 {
-  "Date": "2026-09-12T20:45:48.4317650+03:00",
-  "ScriptSHA256": "798F1F18F1C4D581DAF739964A8E213D249A087A71275A45DC5990B4F3C75642",
-  "ChecksPerRuntime": 491,
+  "Date": "2026-09-12T21:22:27.9791190+03:00",
+  "ScriptSHA256": "F953C2772A14F99A1982FD12BE409269F80853BDFA8BBF41271DC85A6C944033",
+  "ChecksPerRuntime": 513,
   "ChecksBySuite": {
-    "Main": 142,
+    "Main": 164,
     "WindowsBatch": 142,
     "Guard": 33,
     "Downloads": 80,
@@ -31,11 +31,12 @@
   "WebView2AfterLcu": "KB5124008 replaces in-box Microsoft-Edge-WebView 10.0.26100.1 (122.0.2365.106) with 10.0.26100.9444 (151.0.4129.59); CBS unprojects Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\122.*, runtime remains in Windows\\System32\\Microsoft-Edge-WebView. Builder now accepts any known root; first-boot WebView2 registration must be verified in a VM.",
   "DownloadPreparation": "All payloads prepared before ISO copy, work cleanup and WIM servicing; component skip/cancel, verified cache, checkpoints, language repair dependencies, partial-file handling and offline integration tested with mocks. No new full ISO build or VM install.",
   "LatestUserBuildFailure": "User reported api.github.com DNS failure while embedding winget at stage 16 with no internet. Downloads have now been moved to preparation; actual rebuild required.",
-  "ValidationLogs": ".ai/logging-validation: updated main suite (142) passed on PowerShell 7.6.6 and Windows PowerShell 5.1.19041.7725; Debug+Verbose DryRun on both has zero console verbose/debug lines. Other unchanged suites retain .ai/oobe-validation results; 491 checks per runtime in total.",
+  "ValidationLogs": "Main suite rerun after progress completion changes: 164 PASS on PowerShell 7.6.6 and Windows PowerShell 5.1.19041.7725, including real child processes pausing at 100% and a controlled process outliving its output streams. Prior logging/DryRun evidence in .ai/logging-validation; other unchanged suites in .ai/oobe-validation. Total 513 checks per runtime.",
   "SetupLanguage": "User output ISO 20260912-180510 was built with RU Windows/Setup and KB5043080 for Setup, as verified from its embedded manifest. Official RU WinPE CABs and offline cache validated. New OOBE networking changes are not part of that ISO.",
   "WinPeCatalogSHA256": "78059F63D9DAF5E86F858C469B7B683AE0CA0E3A57FD7E4D3BC1F5BA9E0A5DA0",
   "Publication": "coinman-dev/win-11-lite, main; README/CHANGELOG, current Windows source, data, tests and maintained project notes. No new full ISO build or VM installation.",
   "OobeFix": "Retry adapter discovery, repeat blocking from SetupComplete, persistent temporary outbound rule for late interfaces, native OOBEComplete gating even at FirstLogon, hidden wait worker, independent network restoration, completion marker to prevent reblocking. Guest logs still required to identify the exact regression mechanism.",
   "QuietLogging": "Debug, LogFile and wizard logging keep console verbose/debug silent. Commands and technical messages are appended to UTF-8 .details.log; transcript and native .dism.log use separate writers. Native DISM logging also enabled by explicit LogFile; failures remain visible.",
-  "LastChangeValidation": "Presentation-only LCU warning split into two lines in RU/EN. Rendered preview and PowerShell 5.1/7 syntax checked; unchanged test suites not rerun."
+  "LastChangeValidation": "Progress rendering and process-wait loop verified on PowerShell 5.1/7. Pending native 100% renders an animated waiting state; only a successful exit renders 100% done; failed exit renders ERR. No Windows image servicing performed.",
+  "ProgressCompletion": "Internal tool percentages are not overall completion. Keep timer and animation alive until process exit and both output streams finish, then determine success from the exit code."
 }
