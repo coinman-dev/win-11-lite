@@ -63,18 +63,33 @@ function Write-GuardLog {
     $counts.LogFailed++
     try { [Console]::Error.WriteLine("[LOG ERROR] ${logFile}: $($problem.Message)`r`n$line") } catch { }
 }
-# takeown/icacls report problems on stderr. Under Windows PowerShell 5.1 with
-# ErrorActionPreference=Stop a redirected stderr line becomes an exception
-# before Remove-Item runs, so the preference is relaxed only inside this helper.
-function Grant-SystemAccess {
-    param([string]$Path, [switch]$Recurse)
+# Keep native diagnostics without turning redirected stderr into a terminating
+# exception on Windows PowerShell 5.1. Permission preparation is best effort:
+# an ownership error alone does not prove that deletion is impossible.
+function Invoke-GuardAccessCommand {
+    param([string]$FileName, [string[]]$Arguments, [hashtable]$Observation)
     $ErrorActionPreference = 'Continue'
+    $PSNativeCommandUseErrorActionPreference = $false
+    $Observation.Step=$FileName
+    $global:LASTEXITCODE=-1
+    $output=@(& $FileName @Arguments 2>&1 | Select-Object -Last 12)
+    $code=$LASTEXITCODE
+    $Observation.Detail+="; $FileName ExitCode=$code"
+    if($code -ne 0){
+        $tail=(@($output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine).Trim()
+        $message="$FileName ExitCode=$code; $($Arguments -join ' ')"
+        if($tail){$message+=[Environment]::NewLine+$tail;$Observation.Detail+=[Environment]::NewLine+$tail}
+        Write-GuardLog 'DETAIL' $message
+    }
+}
+function Grant-SystemAccess {
+    param([string]$Path, [switch]$Recurse, [hashtable]$Observation)
     if ($Recurse) {
-        & takeown.exe /F $Path /R /A /D Y *> $null
-        & icacls.exe $Path /grant '*S-1-5-18:(OI)(CI)F' /T /C /Q *> $null
+        Invoke-GuardAccessCommand 'takeown.exe' @('/F',$Path,'/R','/A','/D','Y') $Observation
+        Invoke-GuardAccessCommand 'icacls.exe' @($Path,'/grant','*S-1-5-18:(OI)(CI)F','/T','/C','/Q') $Observation
     } else {
-        & takeown.exe /F $Path /A *> $null
-        & icacls.exe $Path /grant '*S-1-5-18:F' /C /Q *> $null
+        Invoke-GuardAccessCommand 'takeown.exe' @('/F',$Path,'/A') $Observation
+        Invoke-GuardAccessCommand 'icacls.exe' @($Path,'/grant','*S-1-5-18:F','/C','/Q') $Observation
     }
 }
 function Test-GuardMatch {
@@ -103,7 +118,7 @@ function Invoke-GuardCheck {
     $counts.Checked++
     $guardVisited["$Category|$Identity"]=$true
     Write-GuardLog 'CHECK' $Label
-    $observation=@{Found=$null;Before='';After='';Detail=''}
+    $observation=@{Found=$null;Before='';After='';Detail='';Step=''}
     try {
         $result = & $Action $observation
         if ($result -eq 'changed') {
@@ -116,8 +131,19 @@ function Invoke-GuardCheck {
         Add-GuardDetail -Category $Category -Name $Name -Identity $Identity -Outcome $outcome -Found $observation.Found -Before $observation.Before -After $observation.After -Detail $observation.Detail -Desired $Desired
     } catch {
         $counts.Failed++
-        Write-GuardLog 'ERROR' "$Label : $($_.Exception.Message)"
-        Add-GuardDetail -Category $Category -Name $Name -Identity $Identity -Outcome 'failed' -Found $observation.Found -Before $observation.Before -After $observation.After -Detail $_.Exception.Message
+        $failure=$_
+        $problem=$failure.Exception.GetBaseException()
+        $detail=$failure.Exception.Message
+        if($observation.Step){$detail=(T "Этап: $($observation.Step). $detail" "Stage: $($observation.Step). $detail")}
+        Write-GuardLog 'ERROR' "$Label : $detail"
+        $diagnostic="$($problem.GetType().FullName); HRESULT=0x$($problem.HResult.ToString('X8')); $($failure.FullyQualifiedErrorId)"
+        if($null -ne $failure.TargetObject){$diagnostic+="; Target=$($failure.TargetObject)"}
+        $logDiagnostic=$diagnostic
+        if($failure.ScriptStackTrace){$logDiagnostic+=[Environment]::NewLine+$failure.ScriptStackTrace}
+        Write-GuardLog 'DETAIL' $logDiagnostic
+        if($observation.Detail){$detail+=[Environment]::NewLine+$observation.Detail}
+        $detail+=[Environment]::NewLine+$diagnostic
+        Add-GuardDetail -Category $Category -Name $Name -Identity $Identity -Outcome 'failed' -Found $observation.Found -Before $observation.Before -After $observation.After -Detail $detail
     }
 }
 function Read-GuardInventory {
@@ -409,20 +435,24 @@ try {
                 Invoke-GuardCheck -Label (T "Файл/каталог $($item.FullName)" "File/directory $($item.FullName)") -Category path -Name $relative -Identity $item.FullName -Desired absent -Action {
                     param($observation)
                     $observation.Found=$true;$observation.Before='Present';$observation.Detail=$item.FullName
+                    $observation.Step=(T 'проверка границ пути' 'path boundary validation')
                     $full = [IO.Path]::GetFullPath($item.FullName)
                     if (-not $full.StartsWith($driveRoot, [StringComparison]::OrdinalIgnoreCase) -or $full.TrimEnd('\') -eq $driveRoot.TrimEnd('\')) { throw (T 'Путь вне системного диска' 'Path is outside the system drive') }
                     $cursor = $full
                     while ($cursor) {
+                        $observation.Step=(T "проверка ссылки: $cursor" "link inspection: $cursor")
                         if ((Get-Item -LiteralPath $cursor -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) { $observation.Detail+=(T '; ссылка файловой системы не удаляется' '; filesystem link is not removed');return 'skipped' }
                         $cursor = Split-Path $cursor -Parent
                     }
-                    Grant-SystemAccess -Path $full -Recurse:$item.PSIsContainer
+                    Grant-SystemAccess -Path $full -Recurse:$item.PSIsContainer -Observation $observation
+                    $observation.Step=(T 'удаление (Remove-Item)' 'removal (Remove-Item)')
                     if ($item.PSIsContainer) {
                         Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
                     } else {
                         Remove-Item -LiteralPath $full -Force -ErrorAction Stop
                     }
-                    if (Test-Path -LiteralPath $full) { throw (T 'Объект остался после удаления' 'Object remains after removal') }
+                    $observation.Step=(T 'проверка после удаления' 'verification after removal')
+                    if (Test-Path -LiteralPath $full -ErrorAction Stop) { throw (T 'Объект остался после удаления' 'Object remains after removal') }
                     $observation.After='Absent'
                     'changed'
                 }

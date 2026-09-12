@@ -20,6 +20,22 @@ foreach($name in @('CapabilityRules','PackageRules','FolderRules','FileRules','A
 $root=Join-Path $repo ('tmp\guard-tests-'+[guid]::NewGuid().ToString('N'))
 $null=New-Item -ItemType Directory -Path $root
 try{
+    & {
+        # Only the native-output helper runs here, with a harmless child script.
+        # No takeown/icacls or guard system operations are invoked on the host.
+        $guardAst=[Management.Automation.Language.Parser]::ParseInput((Get-GuardScript),[ref]$t,[ref]$e)
+        if($e.Count){throw ($e|Out-String)}
+        $helper=$guardAst.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-GuardAccessCommand'},$false)
+        . ([scriptblock]::Create($helper.Extent.Text))
+        $diagnostics=[Collections.Generic.List[string]]::new()
+        function Write-GuardLog {param($Level,$Message)$diagnostics.Add($Message)}
+        $probe=Join-Path $root 'native-stderr.ps1'
+        Set-Content -LiteralPath $probe -Value '[Console]::Error.WriteLine("native stderr probe"); exit 7' -Encoding UTF8
+        $observation=@{Step='';Detail=''}
+        $unexpected=@(Invoke-GuardAccessCommand -FileName "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Arguments @('-NoProfile','-NonInteractive','-File',$probe) -Observation $observation)
+        Assert ($observation.Detail -match 'ExitCode=7' -and $observation.Detail -match 'native stderr probe') 'Real native stderr and exit status are captured on both PowerShell runtimes'
+        Assert (-not $unexpected.Count -and $diagnostics.Count -eq 1 -and $ErrorActionPreference -eq 'Stop') 'Native diagnostics do not leak to stdout or change the caller error preference'
+    }
     # Evaluate the actual embedding block: rules -> guard.json + guard.ps1.
     $mountDir=Join-Path $root 'image'; $guardDir=Join-Path $mountDir 'Windows\Setup\Scripts\Win11Lite'; $Guard=$true
     function Write-Ok {param($Message)}
@@ -92,9 +108,15 @@ try{
             function Test-Path {
                 [CmdletBinding()]param($LiteralPath,$Path)
                 $p=if($LiteralPath){$LiteralPath}else{$Path}
+                if($p -eq $remove -and $fixture.DenyVerify){Write-Error 'Mock verification denied' -Category PermissionDenied;return $false}
                 if($p -like '*\Services\MissingSvc'){return $false}
                 if($p -like 'HKLM:*'){return $true}
                 Microsoft.PowerShell.Management\Test-Path -LiteralPath $p
+            }
+            function Get-Item {
+                [CmdletBinding()]param($LiteralPath,$Path,[switch]$Force)
+                if($LiteralPath -eq $remove -and $fixture.DenyInspect){throw [UnauthorizedAccessException]::new('Mock inspection denied')}
+                Microsoft.PowerShell.Management\Get-Item @PSBoundParameters
             }
             function Get-Service {param($Name,$ErrorAction)$service}
             function Stop-Service {param($Name,[switch]$Force,$ErrorAction)$service.Status='Stopped';$calls.Add('stop-service')}
@@ -109,12 +131,13 @@ try{
             function Get-AppxProvisionedPackage {param([switch]$Online,$ErrorAction)if($fixture.Provisioned){[pscustomobject]@{DisplayName='Microsoft.BingWeather';PackageName='Microsoft.BingWeather_test'}}}
             function Remove-AppxProvisionedPackage {param([switch]$Online,$PackageName,$ErrorAction)$calls.Add('provisioned');$fixture.Provisioned=$false}
             function Get-ScheduledTask {param($TaskName,$ErrorAction)[pscustomobject]@{TaskName='win-11-lite finalize'}}
-            function takeown.exe {$global:LASTEXITCODE=0}
-            function icacls.exe {$global:LASTEXITCODE=0}
+            function takeown.exe {$calls.Add('takeown');if($fixture.DenyAccess){Write-Error 'Mock takeown denied';$global:LASTEXITCODE=1}else{$global:LASTEXITCODE=0}}
+            function icacls.exe {$calls.Add('icacls');if($fixture.DenyAccess){Write-Error 'Mock icacls denied';$global:LASTEXITCODE=5}else{$global:LASTEXITCODE=0}}
             function Remove-Item {
                 [CmdletBinding()]param($LiteralPath,[switch]$Recurse,[switch]$Force)
                 $full=[IO.Path]::GetFullPath($LiteralPath)
                 if(-not $full.StartsWith($root+'\',[StringComparison]::OrdinalIgnoreCase)){throw "Unsafe test deletion: $full"}
+                if($full -eq $remove -and $fixture.DenyRemove){Write-Error 'Mock removal denied' -TargetObject (Join-Path $full 'locked.dll') -Category PermissionDenied -ErrorAction Stop}
                 Microsoft.PowerShell.Management\Remove-Item -LiteralPath $full -Recurse:$Recurse -Force:$Force -ErrorAction Stop
             }
             function Invoke-FakeEdgeCleanup {if(Test-Path -LiteralPath $browser){Remove-Item -LiteralPath $browser -Recurse -Force;$calls.Add('edge')};$global:LASTEXITCODE=0}
@@ -172,6 +195,31 @@ try{
             $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
             Assert ($report.Deferred -and -not $report.Complete -and $report.Summary.setting.NotChecked -eq 1 -and $report.Summary.service.NotChecked -eq 1) 'Deferred reports list unexamined settings and services'
             $fixture.Oobe=0
+
+            $null=New-Item -ItemType Directory -Path $remove -Force
+            $fixture.DenyAccess=$true;$fixture.DenyRemove=$true;$calls.Clear()
+            & $guard
+            $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
+            $row=@($report.Items|Where-Object{$_.Category -eq 'path'})[0]
+            Assert ($LASTEXITCODE -eq 1 -and $row.Outcome -eq 'failed' -and $row.Found -and (Test-Path -LiteralPath $remove)) 'Denied removal is reported as found but not removed'
+            Assert ($row.Detail -match 'removal \(Remove-Item\)' -and $row.Detail -match 'HRESULT=0x' -and $row.Detail -match 'locked.dll') 'Failure identifies the stage, exception code and failing child path'
+            Assert ($row.Detail -match 'takeown.exe ExitCode=1' -and $row.Detail -match 'icacls.exe ExitCode=5' -and $row.Detail -match 'Mock takeown denied' -and $row.Detail -match 'Mock icacls denied') 'Native exit codes and stderr survive in the final failure report'
+            $fixture.DenyRemove=$false
+            & $guard
+            $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
+            Assert ($LASTEXITCODE -eq 0 -and -not(Test-Path -LiteralPath $remove) -and $report.Summary.path.removed -eq 1) 'Permission preparation errors do not prevent deletion when existing access suffices'
+            $fixture.DenyAccess=$false;$fixture.DenyInspect=$true;$calls.Clear()
+            $null=New-Item -ItemType Directory -Path $remove -Force
+            & $guard
+            $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
+            $row=@($report.Items|Where-Object{$_.Category -eq 'path'})[0]
+            Assert ($LASTEXITCODE -eq 1 -and $row.Detail -match 'link inspection:' -and $row.Detail -match 'HRESULT=0x80070005' -and $calls -notcontains 'takeown') 'An access failure before permission preparation is distinguished from failed removal'
+            $fixture.DenyInspect=$false;$fixture.DenyVerify=$true
+            & $guard
+            $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
+            $row=@($report.Items|Where-Object{$_.Category -eq 'path'})[0]
+            Assert ($LASTEXITCODE -eq 1 -and $row.Outcome -eq 'failed' -and $row.Detail -match 'verification after removal' -and -not $row.After) 'An unreadable post-removal path cannot be reported as successfully absent'
+            $fixture.DenyVerify=$false
 
             $outside=Join-Path $root 'outside-system'; $null=New-Item -ItemType Directory -Path $outside
             $marker=Join-Path $outside 'keep.txt'; Set-Content -LiteralPath $marker -Value 'must survive'
