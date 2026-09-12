@@ -54,7 +54,7 @@ try{
         Assert ($worker.Principal.UserId -eq 'S-1-5-18' -and $worker.Principal.LogonType -eq 'ServiceAccount') 'Worker retains SYSTEM privileges'
         Assert ($worker.Trigger.AtLogOn -and $worker.Settings.MultipleInstances -eq 'IgnoreNew') 'Worker triggers on logon and prevents overlap'
         Assert ($viewer.Principal.GroupId -eq 'S-1-5-32-545' -and $viewer.Principal.RunLevel -eq 'Limited') 'Observer uses the interactive user group without elevation'
-        Assert ($viewer.Action.Argument -match '-ShowDebugWindow' -and $viewer.Trigger.AtLogOn) 'Debug task opens observer through the OOBE check'
+        Assert ($viewer.Action.Argument -eq 'guard-debug' -and $viewer.Action.Execute -like '*\Win11Lite.Run.exe' -and $viewer.Trigger.AtLogOn) 'Debug task opens observer through the OOBE check without an extra console'
         $scripts=Get-SetupSupportScripts -BlockNetwork $false -RemoveEdge $true -EnableGuard $true -ShowGuardWindow $false
         [IO.File]::WriteAllText($prepare,$scripts.Prepare,[Text.UTF8Encoding]::new($true))
         & $prepare -RegisterOnly

@@ -1,5 +1,7 @@
 # WinPE language download catalog
 
+`SetupLauncher.cs` is also stored here. The builder compiles this small .NET Framework Windows GUI executable locally before image servicing. It starts only the fixed Prepare/Finalize/guard modes, using `UseShellExecute=false` and `CreateNoWindow=true`, and preserves child exit codes and diagnostic output. No prebuilt executable or additional SDK download is included. The optional visible guard viewer waits for native OOBE completion before opening.
+
 Keep this directory next to `win-11-lite.ps1`. `winpe-26100.json` maps the files in Microsoft's WinPE add-on to the x64 language CABs required by the builder. It contains filenames and integrity metadata, not redistributed Microsoft binaries.
 
 The catalog was extracted on 2026-09-12 from the Windows PE add-on for ADK **10.1.26100.2454**, linked by Microsoft's [ADK download page](https://learn.microsoft.com/en-us/windows-hardware/get-started/adk-install):

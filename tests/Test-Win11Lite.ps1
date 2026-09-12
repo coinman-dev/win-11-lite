@@ -480,13 +480,13 @@ try {
     Assert (@($xml.SelectNodes('//u:InputLocale',$ns) | Where-Object { $_.InnerText -ne '0419:00000419;0409:00000409' }).Count -eq 0) 'Windows Setup configures both Russian and English keyboards without a logon language script'
     Assert ($xml.SelectSingleNode('//u:settings[@pass="windowsPE"]/u:component[@name="Microsoft-Windows-International-Core-WinPE"]/u:UILanguage',$ns).InnerText -eq 'ru-RU') 'Windows default language is not overwritten by English Setup UI'
     $firstCommand = $xml.SelectSingleNode('//u:FirstLogonCommands/u:SynchronousCommand/u:CommandLine',$ns).InnerText
-    Assert ($firstCommand -match 'Finalize.ps1.*-FirstLogon' -and $firstCommand -match '-WindowStyle Hidden') 'Answer file starts finalization directly and hidden'
-    Assert ($xml.SelectSingleNode('//u:RunSynchronousCommand/u:Path',$ns).InnerText -match '-WindowStyle Hidden') 'Specialize PowerShell window is hidden'
+    Assert ($firstCommand -match 'Win11Lite\.Run\.exe" finalize$' -and $firstCommand -notmatch '(powershell|cmd)\.exe') 'Answer file starts finalization without a console-subsystem executable'
+    Assert ($xml.SelectSingleNode('//u:RunSynchronousCommand/u:Path',$ns).InnerText -match 'Win11Lite\.Run\.exe" prepare$') 'Specialize uses the windowless launcher'
     $node = $ast.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$setupComplete'}, $true)
     . ([scriptblock]::Create($node.Extent.Text))
-    Assert ($setupComplete -match '-WindowStyle Hidden' -and $setupComplete -match 'setupcomplete.log' -and $setupComplete -notmatch '>>[^\r\n]*prepare.log') 'SetupComplete is hidden and does not lock the preparation log'
+    Assert ($setupComplete -match 'start "" /wait .*Win11Lite\.Run\.exe" prepare-register' -and $setupComplete -match 'setupcomplete.log' -and $setupComplete -notmatch '>>[^\r\n]*prepare.log') 'SetupComplete waits for the windowless launcher without locking the preparation log'
     Assert ($xml.SelectSingleNode('//u:settings[@pass="specialize"]/u:component[@name="Microsoft-Windows-International-Core"]/u:UILanguage',$ns).InnerText -eq 'ru-RU') 'System language applied before OOBE'
-    Assert ($xml.SelectSingleNode('//u:RunSynchronousCommand/u:Path',$ns).InnerText -match 'Prepare.ps1') 'Specialize registers finalization'
+    Assert ($xml.SelectSingleNode('//u:RunSynchronousCommand/u:Path',$ns).InnerText -match 'Win11Lite\.Run\.exe" prepare$') 'Specialize registers finalization through the preparation mode'
     & {
         function Invoke-Dism { param($Arguments,[switch]$Quiet) [pscustomobject]@{ExitCode=0;Output=@('State : Installed')} }
         $image = Join-Path $testRoot 'language-image'

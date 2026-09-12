@@ -2027,6 +2027,29 @@ exit 0
 '@
 }
 
+function Build-SetupLauncher {
+    param([string]$Directory)
+    $source = Join-Path $script:ScriptRoot 'data\SetupLauncher.cs'
+    $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+    $dir = Join-Path $Directory 'setup-launcher'
+    $path = Join-Path $dir 'Win11Lite.Run.exe'
+    $cached = Read-PreparedCache -Directory $dir -Key 'launcher'
+    if ($cached -and $cached.Data.SourceSHA256 -eq $sourceHash -and 'Win11Lite.Run.exe' -in @($cached.Files.Name)) { return $path }
+    $compiler = @(
+        (Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'),
+        (Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe')
+    ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+    if (-not $compiler) { throw (T 'Не найден компилятор .NET Framework для скрытого запуска служебных скриптов' '.NET Framework compiler for windowless setup scripts was not found') }
+    $null = New-Item -ItemType Directory -Path $dir -Force
+    $run = Invoke-ProgressProcess -Exe $compiler -Arguments @('/nologo','/target:winexe','/platform:x64','/optimize+',"/out:$path",$source) `
+        -Activity (T 'Подготовка скрытого запуска установочных скриптов' 'Preparing windowless setup script launcher')
+    if ($run.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw (T "Не удалось собрать служебный запускатель: $($run.Output -join ' ')" "Could not build the setup launcher: $($run.Output -join ' ')")
+    }
+    Write-PreparedCache -Directory $dir -Key 'launcher' -Files @($path) -Data @{ SourceSHA256=$sourceHash }
+    $path
+}
+
 function Get-SetupSupportScripts {
     param([bool]$BlockNetwork, [bool]$RemoveEdge, [bool]$EnableGuard, [bool]$ManageOobe = $true, [string]$Language = 'en-US', [bool]$ShowGuardWindow = $true)
     $prepare = @'
@@ -2100,8 +2123,8 @@ if (__NETWORK__ -and -not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'oobe
 }
 try {
 $taskName = 'win-11-lite finalize'
-$exe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-$action = New-ScheduledTaskAction -Execute $exe -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}\Finalize.ps1" -WaitForOobe' -f $PSScriptRoot)
+$exe = Join-Path $PSScriptRoot 'Win11Lite.Run.exe'
+$action = New-ScheduledTaskAction -Execute $exe -Argument 'finalize-wait'
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $trigger.Delay = 'PT30S'
 $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
@@ -2109,10 +2132,10 @@ $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatt
 $finalizeSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 3)
 Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $finalizeSettings -Force | Out-Null
 if (__GUARD__) {
-    $guardAction = New-ScheduledTaskAction -Execute $exe -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}\guard.ps1"' -f $PSScriptRoot)
+    $guardAction = New-ScheduledTaskAction -Execute $exe -Argument 'guard'
     Register-ScheduledTask -TaskName 'win-11-lite guard' -Action $guardAction -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
     if (__GUARDDEBUG__) {
-        $viewerAction = New-ScheduledTaskAction -Execute $exe -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}\guard.ps1" -ShowDebugWindow' -f $PSScriptRoot)
+        $viewerAction = New-ScheduledTaskAction -Execute $exe -Argument 'guard-debug'
         $viewerPrincipal = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited
         $viewerTrigger = New-ScheduledTaskTrigger -AtLogOn
         $viewerTrigger.Delay = 'PT30S'
@@ -2182,8 +2205,8 @@ if (-not $EdgeOnly) {
         Write-FinalizeLog (T 'WAIT: первый вход ещё не подтверждает окончание OOBE' 'WAIT: first logon does not yet confirm OOBE completion')
         if ($FirstLogon) {
             # Не удерживаем FirstLogonCommands: это может задержать открытие рабочего стола.
-            $exe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-            Start-Process -FilePath $exe -WindowStyle Hidden -ArgumentList ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}\Finalize.ps1" -WaitForOobe' -f $PSScriptRoot) | Out-Null
+            $exe = Join-Path $PSScriptRoot 'Win11Lite.Run.exe'
+            Start-Process -FilePath $exe -WindowStyle Hidden -ArgumentList 'finalize-wait' | Out-Null
         }
         return
     }
@@ -3276,6 +3299,8 @@ if (-not $DryRun) {
             $setupLang = $sourceImageLanguage
         }
     }
+    # Обязательный локальный помощник готовится до любых изменений образа.
+    $setupLauncher = Build-SetupLauncher -Directory $UpdatesDir
     $script:DownloadsClosed = $true
     Write-Ok (T 'Все компоненты подготовлены. Дальнейшая сборка не требует интернета.' 'All components are prepared. The remaining build requires no internet connection.')
     if ($script:SkippedDownloads.Count) { Write-Note (T "Исключено по вашему выбору: $($script:SkippedDownloads -join '; ')" "Skipped by your choice: $($script:SkippedDownloads -join '; ')") }
@@ -4109,6 +4134,7 @@ if ($Guard) {
 $scriptsDir = Join-Path $mountDir 'Windows\Setup\Scripts'
 $supportDir = Join-Path $scriptsDir 'Win11Lite'
 $null = New-Item -ItemType Directory -Path $supportDir -Force
+Copy-Item -LiteralPath $setupLauncher -Destination (Join-Path $supportDir 'Win11Lite.Run.exe') -Force
 $support = Get-SetupSupportScripts -BlockNetwork ($script:ManageOobe -and -not $NoOobeNetworkBlock) `
     -RemoveEdge (Test-GroupActive -RulePreset 'safe' -Group 'Edge') -EnableGuard ([bool]$Guard) `
     -ManageOobe $script:ManageOobe -Language $imgLang -ShowGuardWindow ([bool]$GuardDebug)
@@ -4135,13 +4161,14 @@ $buildInfo = [ordered]@{
     GuardDebug = [bool]($Guard -and $GuardDebug)
     OobeNetworkBlock = [bool]($script:ManageOobe -and -not $NoOobeNetworkBlock)
     OobeCompletionCheck = 'OOBEComplete'
+    SetupScriptLauncher = 'Win11Lite.Run.exe'
 } | ConvertTo-Json -Depth 4
 [IO.File]::WriteAllText((Join-Path $supportDir 'build-info.json'), $buildInfo, [Text.UTF8Encoding]::new($false))
 [IO.File]::WriteAllText((Join-Path $isoDir 'win11-lite-build.json'), $buildInfo, [Text.UTF8Encoding]::new($false))
 Write-Ok (T "ID сборки: $($script:StartedAt.ToString('yyyyMMdd-HHmmss')) — записан в ISO и установленную Windows" "Build ID: $($script:StartedAt.ToString('yyyyMMdd-HHmmss')) - recorded in the ISO and installed Windows")
 $setupComplete = @"
 @echo off
-"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%SystemRoot%\Setup\Scripts\Win11Lite\Prepare.ps1" -RegisterOnly >> "%SystemRoot%\Setup\Scripts\Win11Lite\setupcomplete.log" 2>&1
+start "" /wait "%SystemRoot%\Setup\Scripts\Win11Lite\Win11Lite.Run.exe" prepare-register >> "%SystemRoot%\Setup\Scripts\Win11Lite\setupcomplete.log" 2>&1
 exit /b %errorlevel%
 "@
 Write-WindowsBatchFile -Path (Join-Path $scriptsDir 'SetupComplete.cmd') -Content $setupComplete
@@ -4351,7 +4378,7 @@ if ($Unattend -eq 'none') {
                 <RunSynchronousCommand wcm:action="add">
                     <Order>1</Order>
                     <Description>Prepare first logon and OOBE</Description>
-                    <Path>powershell.exe -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%WINDIR%\Setup\Scripts\Win11Lite\Prepare.ps1"</Path>
+                    <Path>"%WINDIR%\Setup\Scripts\Win11Lite\Win11Lite.Run.exe" prepare</Path>
                 </RunSynchronousCommand>
             </RunSynchronous>
         </component>
@@ -4400,7 +4427,7 @@ if ($Unattend -eq 'none') {
                 <SynchronousCommand wcm:action="add">
                     <Order>1</Order>
                     <Description>Finish installation</Description>
-                    <CommandLine>powershell.exe -WindowStyle Hidden -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%SystemRoot%\Setup\Scripts\Win11Lite\Finalize.ps1" -FirstLogon</CommandLine>
+                    <CommandLine>"%SystemRoot%\Setup\Scripts\Win11Lite\Win11Lite.Run.exe" finalize</CommandLine>
                 </SynchronousCommand>
             </FirstLogonCommands>
         </component>

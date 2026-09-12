@@ -72,7 +72,7 @@ try{
             function New-ScheduledTaskSettingsSet {param([switch]$StartWhenAvailable,[switch]$AllowStartIfOnBatteries,[switch]$DontStopIfGoingOnBatteries,$MultipleInstances,$ExecutionTimeLimit)[pscustomobject]@{Limit=$ExecutionTimeLimit}}
             function Register-ScheduledTask {param($TaskName,$Action,$Trigger,$Principal,$Settings,[switch]$Force)$state.Tasks[$TaskName]=[pscustomobject]@{Action=$Action;Settings=$Settings}}
             function Unregister-ScheduledTask {[CmdletBinding(SupportsShouldProcess)]param($TaskName)$state.Tasks.Remove($TaskName)}
-            function Start-Process {param($FilePath,$WindowStyle,$ArgumentList)Assert ($WindowStyle -eq 'Hidden' -and $ArgumentList -match '-WaitForOobe') 'FirstLogon starts a hidden waiter without holding up desktop startup';$state.Events.Add('background-wait')}
+            function Start-Process {param($FilePath,$WindowStyle,$ArgumentList)Assert ($WindowStyle -eq 'Hidden' -and $FilePath -like '*\Win11Lite.Run.exe' -and $ArgumentList -eq 'finalize-wait') 'FirstLogon starts a windowless waiter without holding up desktop startup';$state.Events.Add('background-wait')}
             function Get-ItemProperty {param($LiteralPath,$Name,$ErrorAction)if($LiteralPath -eq 'HKLM:\SYSTEM\Setup'){[pscustomobject]@{OOBEInProgress=1;SystemSetupInProgress=1}}}
             function Remove-ItemProperty {param($LiteralPath,$Name,$ErrorAction)throw 'Unexpected registry mutation in fixture'}
             function Get-Process {param($Name,$ErrorAction)@()}
@@ -85,7 +85,7 @@ try{
             if($case -eq 'late-adapter'){$state.EmptyCalls=20}
             if($case -eq 'enumeration-retry'){$state.QueryFailures=2}
             & (Join-Path $dir 'Prepare.ps1')
-            Assert ($state.Tasks['win-11-lite finalize'].Action.Argument -match '-WaitForOobe') 'SYSTEM logon task waits for actual OOBE completion'
+            Assert ($state.Tasks['win-11-lite finalize'].Action.Argument -eq 'finalize-wait' -and $state.Tasks['win-11-lite finalize'].Action.Execute -like '*\Win11Lite.Run.exe') 'SYSTEM logon task waits for actual OOBE completion through the windowless launcher'
             switch($case){
                 'late-adapter'{
                     Assert ($state.Firewall -and $nic.AdminStatus -eq 'Up' -and $state.SleepSeconds -eq 14) 'No initial adapters leaves the persistent firewall block in place'
