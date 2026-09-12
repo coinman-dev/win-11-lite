@@ -25,6 +25,10 @@ foreach ($name in @('T','Test-DismSuccess','ConvertFrom-DismList','Test-GroupAct
     . ([scriptblock]::Create($node.Extent.Text))
 }
 $script:Lang = 'en'
+foreach ($name in @('Get-ImageInstallXml','Get-ProductKeyUiMode','Get-LocalAccountXml','Assert-LocalUserName')) {
+    $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
+    . ([scriptblock]::Create($node.Extent.Text))
+}
 foreach ($name in @('CapabilityRules','PackageRules','FolderRules','AppxRules','NeverRemove','AppPlatformProtected','FileRules','DisableServices')) {
     $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq ('$script:' + $name) }, $false)
     . ([scriptblock]::Create($node.Extent.Text))
@@ -470,7 +474,8 @@ try {
     }
     # Evaluate the actual answer-file expressions, then parse the resulting XML.
     $imgLang = 'ru-RU'; $setupLang = 'en-US'; $ProductKey = ''; $CompactOS = $false; $NoOobeNetworkBlock = $false
-    foreach ($name in @('setupInputLocale','compactBlock','oobeNetBlock','unattendXml')) {
+    $selected=[pscustomobject]@{EditionId='IoTEnterpriseS'}; $LocalUserName=''; $LocalUserPassword=$null
+    foreach ($name in @('setupInputLocale','compactBlock','localAccountXml','productKeyUi','escapedProductKey','productKeyValue','oobeNetBlock','unattendXml')) {
         $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq ('$' + $name) }, $true)
         . ([scriptblock]::Create($node.Extent.Text))
     }

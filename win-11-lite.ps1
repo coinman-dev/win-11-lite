@@ -231,6 +231,12 @@ param(
     # вводится уже после установки.
     [string]$ProductKey,
 
+    # auto: для Home/Pro 26H1 задаём локальный аккаунт до сборки; setup — ввод в Windows.
+    [ValidateSet('auto','image','setup')]
+    [string]$AccountMode = 'auto',
+    [string]$LocalUserName,
+    [Security.SecureString]$LocalUserPassword,
+
     # Свой autounattend.xml, либо 'none' чтобы не класть его вовсе.
     [string]$Unattend,
 
@@ -252,6 +258,9 @@ param(
 
     # Установить Windows ADK (Deployment Tools), если он не найден.
     [switch]$InstallAdk,
+
+    # Явный путь к совместимому dism.exe; иначе выбирается подходящий комплект.
+    [string]$DismPath,
 
     # Файл лога. Если не задан, лог пишется только при -Debug — в подпапку log
     # рядом со скриптом, с именем <имя исходного ISO>_<дата-время>.log.
@@ -442,22 +451,48 @@ function Read-PathOrDefault {
     $answer
 }
 
-# Паспорт всех индексов WIM/ESD через модуль Dism (нужны права администратора).
-# Читаем модулем, а не dism.exe: тот печатает имена в OEM-кодировке (кириллица
-# превращается в мусор), а поле Languages выводит на отдельной строке.
+# XML-паспорт WIM/ESD читается без монтирования и без версии DISM на хосте.
+# XML resource в заголовке WIM не сжат, даже у install.esd с LZMS-сжатием данных.
 function Get-WimImageList {
     param([Parameter(Mandatory)][string]$Path)
-    Import-Module Dism -ErrorAction Stop -Verbose:$false
-    foreach ($b in (Get-WindowsImage -ImagePath $Path)) {
-        $d = Get-WindowsImage -ImagePath $Path -Index $b.ImageIndex
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    $reader = [IO.BinaryReader]::new($stream)
+    try {
+        $header = $reader.ReadBytes(208)
+        if ($header.Length -ne 208 -or [Text.Encoding]::ASCII.GetString($header,0,8) -ne "MSWIM`0`0`0") {
+            throw (T 'Некорректный заголовок WIM/ESD' 'Invalid WIM/ESD header')
+        }
+        $resource = [BitConverter]::ToUInt64($header,72)
+        $length = $resource -band [uint64]0x00FFFFFFFFFFFFFF
+        $offset = [BitConverter]::ToUInt64($header,80)
+        $original = [BitConverter]::ToUInt64($header,88)
+        if (($header[79] -band 4) -or $length -ne $original -or $length -lt 2 -or $length -gt 16MB -or
+            $offset -lt 208 -or $offset -gt [uint64]$stream.Length -or $length -gt ([uint64]$stream.Length - $offset)) {
+            throw (T 'Недоступный или повреждённый XML-паспорт WIM/ESD' 'Unsupported or damaged WIM/ESD XML metadata')
+        }
+        $null = $stream.Seek([int64]$offset,[IO.SeekOrigin]::Begin)
+        $bytes = $reader.ReadBytes([int]$length)
+        if ($bytes.Length -ne $length) { throw (T 'XML-паспорт WIM/ESD прочитан не полностью' 'Incomplete WIM/ESD XML metadata') }
+        $settings = [Xml.XmlReaderSettings]::new()
+        $settings.DtdProcessing = [Xml.DtdProcessing]::Prohibit
+        $settings.XmlResolver = $null
+        $text = [IO.StringReader]::new([Text.Encoding]::Unicode.GetString($bytes).TrimStart([char]0xFEFF))
+        $xmlReader = [Xml.XmlReader]::Create($text,$settings)
+        try { $xml = [xml]::new(); $xml.XmlResolver=$null; $xml.Load($xmlReader) } finally { $xmlReader.Dispose(); $text.Dispose() }
+    } finally { $reader.Dispose(); $stream.Dispose() }
+    $entries = @($xml.WIM.IMAGE)
+    if (-not $entries.Count -or $entries.Count -ne [BitConverter]::ToUInt32($header,44)) { throw (T 'Число индексов в WIM/ESD не совпадает с паспортом' 'WIM/ESD image count does not match its metadata') }
+    foreach ($entry in $entries) {
+        # Первым оставляем основной язык: именно его выбирает план сборки.
+        $languages = @([string]$entry.WINDOWS.LANGUAGES.DEFAULT) + @($entry.WINDOWS.LANGUAGES.LANGUAGE | ForEach-Object { [string]$_ })
         [PSCustomObject]@{
-            Index        = $d.ImageIndex
-            Name         = $d.ImageName
-            EditionId    = $d.EditionId
-            Architecture = $d.Architecture
-            Languages    = ($d.Languages -join ',')
-            Version      = $d.Version
-            Size         = $d.ImageSize
+            Index        = [int]$entry.INDEX
+            Name         = [string]$entry.NAME
+            EditionId    = [string]$entry.WINDOWS.EDITIONID
+            Architecture = [string]$entry.WINDOWS.ARCH
+            Languages    = (($languages | Where-Object { $_ } | Select-Object -Unique) -join ',')
+            Version      = '{0}.{1}.{2}.{3}' -f $entry.WINDOWS.VERSION.MAJOR,$entry.WINDOWS.VERSION.MINOR,$entry.WINDOWS.VERSION.BUILD,$entry.WINDOWS.VERSION.SPBUILD
+            Size         = [int64]$entry.TOTALBYTES
         }
     }
 }
@@ -467,8 +502,10 @@ function Get-IsoEditions {
     param([string]$Path)
     $result = @()
     $mounted = $null
+    $owned = $false
     try {
-        $mounted = Mount-DiskImage -ImagePath $Path -PassThru -Access ReadOnly -ErrorAction Stop
+        $mounted = Get-DiskImage -ImagePath $Path -ErrorAction Stop
+        if (-not $mounted.Attached) { $mounted = Mount-DiskImage -ImagePath $Path -PassThru -Access ReadOnly -ErrorAction Stop; $owned = $true }
         Start-Sleep -Seconds 2
         $drive = "$(($mounted | Get-Volume).DriveLetter):"
         $wim = Join-Path $drive 'sources\install.wim'
@@ -478,7 +515,7 @@ function Get-IsoEditions {
     } catch {
         Write-Host (T "  Не удалось прочитать образ: $($_.Exception.Message)" "  Could not read the image: $($_.Exception.Message)") -ForegroundColor Yellow
     } finally {
-        if ($mounted) { try { Dismount-DiskImage -ImagePath $Path | Out-Null } catch { } }
+        if ($owned) { try { Dismount-DiskImage -ImagePath $Path | Out-Null } catch { } }
     }
     $result
 }
@@ -1030,6 +1067,95 @@ function Get-EditionConfig {
     # Обычные Home/Pro не должны превращаться в корпоративный установочный носитель.
     $volume = if ($EditionId -match '^(Enterprise|Education|IoTEnterpriseS)') { 1 } else { 0 }
     "[EditionID]`r`n$EditionId`r`n`r`n[Channel]`r`nRetail`r`n`r`n[VL]`r`n$volume`r`n"
+}
+
+function Resolve-AccountMode {
+    param([int]$Build,[string]$EditionId,[string]$Mode,[string]$Name,[string]$AnswerFile)
+    if ($AnswerFile) {
+        if ($Name -or $Mode -eq 'image') { throw (T 'Локальный аккаунт задавайте в собственном answer-файле' 'Configure the local account in your custom answer file') }
+        return 'setup'
+    }
+    if ($Mode -eq 'setup') {
+        if ($Name) { throw (T '-LocalUserName несовместим с -AccountMode setup' '-LocalUserName cannot be combined with -AccountMode setup') }
+        return 'setup'
+    }
+    if ($Mode -eq 'image' -or $Name -or ($Build -eq 28000 -and $EditionId -match '^(Core|Professional)')) { return 'image' }
+    'setup'
+}
+
+function Assert-LocalUserName {
+    param([string]$Name)
+    if (-not $Name -or $Name.Length -gt 20 -or $Name -ne $Name.Trim() -or $Name.EndsWith('.') -or
+        $Name -match '["/\\\[\]:;|=,+*?<>\x00-\x1f]' -or $Name -match '^\.+$' -or
+        $Name -in @('Administrator','Администратор','Guest','Гость','DefaultAccount','WDAGUtilityAccount','defaultuser0')) {
+        throw (T 'Недопустимое имя локального пользователя: используйте до 20 символов без служебных знаков и имён встроенных учётных записей' 'Invalid local user name: use up to 20 characters without reserved punctuation or built-in account names')
+    }
+}
+
+function Read-LocalAccountOptions {
+    param([int]$Build,[string]$EditionId,[string]$Mode,[string]$Name,[Security.SecureString]$Password,[switch]$Preview)
+    $resolved = Resolve-AccountMode -Build $Build -EditionId $EditionId -Mode $Mode -Name $Name -AnswerFile $Unattend
+    if ($Password -and $resolved -ne 'image') { throw (T 'Пароль указан без создаваемого локального аккаунта' 'A password was supplied without a local account to create') }
+    if ($resolved -eq 'image' -and -not $Name -and -not $Preview) {
+        if (-not (Test-CanPrompt)) { throw (T 'Для Home/Pro 26H1 укажите -LocalUserName <имя> или -AccountMode setup для ввода при установке Windows' 'For Home/Pro 26H1, specify -LocalUserName <name> or -AccountMode setup to enter it during Windows Setup') }
+        $resolved = Read-Option -Question (T 'Где задать локального пользователя' 'Where to configure the local user') -Items @((T 'Сейчас, до сборки ISO' 'Now, before building the ISO'),(T 'При установке Windows' 'During Windows Setup')) -Values @('image','setup') -Default 1
+        if ($resolved -eq 'image') {
+            $Name = (Read-Host (T '  Имя локального пользователя' '  Local user name')).Trim()
+            Assert-LocalUserName $Name
+            Write-Note (T 'Пароль попадёт в установочный answer-файл ISO; кодирование Windows не является шифрованием.' 'The password is stored in the ISO answer file; Windows encoding is not encryption.')
+            $Password = Read-Host (T '  Пароль (пусто — без пароля)' '  Password (empty for no password)') -AsSecureString
+        }
+    }
+    if ($Name) { Assert-LocalUserName $Name }
+    [pscustomobject]@{Mode=$resolved;Name=$Name;Password=$Password}
+}
+
+function Get-LocalAccountXml {
+    param([string]$Name,[Security.SecureString]$Password)
+    if (-not $Name) { return '' }
+    Assert-LocalUserName $Name
+    $escaped = [Security.SecurityElement]::Escape($Name)
+    $plain = ''
+    if ($Password) {
+        $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
+        try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer) }
+    }
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($plain+'Password'))
+    $plain = $null
+    @"
+
+            <UserAccounts>
+                <LocalAccounts>
+                    <LocalAccount wcm:action="add">
+                        <Password><Value>$encoded</Value><PlainText>false</PlainText></Password>
+                        <DisplayName>$escaped</DisplayName>
+                        <Group>Administrators</Group>
+                        <Name>$escaped</Name>
+                    </LocalAccount>
+                </LocalAccounts>
+            </UserAccounts>
+"@
+}
+
+function Get-ImageInstallXml {
+    param([bool]$Compact)
+    $compactSetting = if ($Compact) { "`r`n                    <Compact>true</Compact>" } else { '' }
+    @"
+
+            <ImageInstall>
+                <OSImage>$compactSetting
+                    <InstallFrom>
+                        <MetaData wcm:action="add"><Key>/IMAGE/INDEX</Key><Value>1</Value></MetaData>
+                    </InstallFrom>
+                </OSImage>
+            </ImageInstall>
+"@
+}
+
+function Get-ProductKeyUiMode {
+    param([string]$EditionId)
+    if ($EditionId -match '^(Core|Professional)') { return 'OnError' }
+    'Never'
 }
 
 # Активна ли группа удаления при текущем пресете и -Keep.
@@ -2063,6 +2189,101 @@ exit 0
 '@
 }
 
+function Get-NativeToolVersion {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return [version]'0.0' }
+    $info = (Get-Item -LiteralPath $Path).VersionInfo
+    [version]('{0}.{1}.{2}.{3}' -f $info.FileMajorPart,$info.FileMinorPart,$info.FileBuildPart,$info.FilePrivatePart)
+}
+
+function Save-DeploymentTools {
+    param([string]$Directory, [int]$Build = 28000)
+    $catalogPath = Join-Path $script:ScriptRoot "data\deployment-tools-$Build.json"
+    $catalogHash = (Get-FileHash -LiteralPath $catalogPath -Algorithm SHA256).Hash
+    $catalog = Get-Content -LiteralPath $catalogPath -Raw | ConvertFrom-Json
+    if ($catalog.Schema -ne 1 -or $catalog.Build -ne $Build -or $catalog.Architecture -ne 'amd64') { throw (T 'Некорректный каталог инструментов DISM' 'Invalid DISM tool catalog') }
+    $dir = Join-Path $Directory "deployment-tools-$Build"
+    $cached = Read-PreparedCache -Directory $dir -Key 'tools'
+    if (-not $cached -or $cached.Data.CatalogSHA256 -ne $catalogHash) {
+        $downloadDir = Join-Path $dir 'downloads'
+        $null = New-Item -ItemType Directory -Path $downloadDir -Force
+        $files = @()
+        foreach ($archive in $catalog.Archives) {
+            $cab = Assert-ChildPath -Path (Join-Path $downloadDir $archive.Name) -Root $downloadDir
+            if (Test-Path -LiteralPath $cab) {
+                if ((Get-Item -LiteralPath $cab).Length -ne $archive.Size -or (Get-FileHash -LiteralPath $cab -Algorithm SHA256).Hash -ne $archive.SHA256) {
+                    Remove-Item -LiteralPath $cab,"$cab.size","$cab.sha256" -Force -ErrorAction SilentlyContinue
+                }
+            }
+            Save-Url -Url $archive.Url -Destination $cab
+            if ((Get-Item -LiteralPath $cab).Length -ne $archive.Size -or (Get-FileHash -LiteralPath $cab -Algorithm SHA256).Hash -ne $archive.SHA256) { throw (T "Повреждён архив инструментов: $($archive.Name)" "Tool archive integrity failure: $($archive.Name)") }
+            $expanded = Join-Path $downloadDir ($archive.Name + '.files')
+            $null = New-Item -ItemType Directory -Path $expanded -Force
+            if ((Invoke-NativeQuiet -FilePath "$env:SystemRoot\System32\expand.exe" -Arguments @('-R','-F:*',$cab,$expanded)) -ne 0) { throw (T 'Не удалось распаковать инструменты DISM' 'Could not extract DISM tools') }
+            foreach ($entry in $archive.Files) {
+                $source = Assert-ChildPath -Path (Join-Path $expanded $entry.Source) -Root $expanded
+                $target = Assert-ChildPath -Path (Join-Path $dir $entry.Path) -Root $dir
+                if ((Get-Item -LiteralPath $source).Length -ne $entry.Size -or (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ne $entry.SHA256) { throw (T "Повреждён файл инструмента: $($entry.Path)" "Tool file integrity failure: $($entry.Path)") }
+                $null = New-Item -ItemType Directory -Path (Split-Path $target -Parent) -Force
+                Copy-Item -LiteralPath $source -Destination $target -Force
+                $files += $target
+            }
+        }
+        Write-PreparedCache -Directory $dir -Key 'tools' -Files $files -Data @{ CatalogSHA256=$catalogHash }
+    }
+    $dism = Join-Path $dir 'amd64\DISM\dism.exe'
+    $oscdimg = Join-Path $dir 'amd64\Oscdimg\oscdimg.exe'
+    if ((Get-NativeToolVersion $dism).Build -lt $Build -or -not (Test-Path -LiteralPath $oscdimg)) { throw (T 'Неполный комплект инструментов обслуживания' 'Incomplete servicing tool set') }
+    [pscustomobject]@{ Dism=$dism; Oscdimg=$oscdimg }
+}
+
+function Initialize-DeploymentTools {
+    param([int]$Build, [string]$Directory, [string]$ExplicitDism, [switch]$Install, [switch]$Preview)
+    $minimum = if ($Build -eq 26200) { 26100 } else { $Build }
+    $roots = @("${env:ProgramFiles(x86)}\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools", "$env:ProgramFiles\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools")
+    $candidates = @($roots | ForEach-Object { Join-Path $_ 'amd64\DISM\dism.exe' }) + @("$env:SystemRoot\System32\dism.exe")
+    $script:Oscdimg = $roots | ForEach-Object { Join-Path $_ 'amd64\Oscdimg\oscdimg.exe' } | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if ($ExplicitDism) {
+        $script:Dism = (Resolve-Path -LiteralPath $ExplicitDism -ErrorAction Stop).Path
+        if ((Get-NativeToolVersion $script:Dism).Build -lt $minimum) { throw (T "Указанный DISM слишком старый: нужен build $minimum или новее" "The specified DISM is too old: build $minimum or newer is required") }
+    } else {
+        $script:Dism = $candidates | Where-Object { (Get-NativeToolVersion $_).Build -ge $minimum } | Sort-Object { Get-NativeToolVersion $_ } -Descending | Select-Object -First 1
+    }
+    if ($Build -eq 28000 -and (-not $script:Dism -or (-not $script:Oscdimg -and -not $SkipIso))) {
+        if ($Preview) {
+            Write-Note (T 'Для 26H1 будет подготовлен отдельный DISM 28000 из ADK (~6.3 МиБ); установленный ADK сохраняется.' '26H1 will use a separate DISM 28000 from the ADK (about 6.3 MiB); the installed ADK is retained.')
+            return
+        }
+        Write-Step (T 'Подготовка DISM 28000 и oscdimg для 26H1' 'Preparing DISM 28000 and oscdimg for 26H1')
+        $tools = Save-DeploymentTools -Directory $Directory -Build 28000
+        if (-not $script:Dism) { $script:Dism = $tools.Dism }
+        if (-not $script:Oscdimg) { $script:Oscdimg = $tools.Oscdimg }
+    }
+    if ((-not $script:Dism -or (-not $script:Oscdimg -and -not $SkipIso)) -and $Install -and -not $Preview) {
+        $setup = Join-Path $Directory 'adksetup-26100.exe'
+        Save-Url -Url 'https://go.microsoft.com/fwlink/?linkid=2289980' -Destination $setup
+        $code = Invoke-NativeQuiet -FilePath $setup -Arguments @('/quiet','/norestart','/features','OptionId.DeploymentTools')
+        if (-not (Test-DismSuccess $code)) { throw (T "Установка ADK завершилась с кодом $code" "ADK installation exited with code $code") }
+        Initialize-DeploymentTools -Build $Build -Directory $Directory -ExplicitDism $ExplicitDism
+        return
+    }
+    if (-not $script:Dism -or (-not $script:Oscdimg -and -not $SkipIso)) {
+        $message = T "Нужны DISM build $minimum или новее и oscdimg. Установите Deployment Tools из ADK или используйте -InstallAdk; путь к DISM можно задать через -DismPath." "DISM build $minimum or newer and oscdimg are required. Install ADK Deployment Tools or use -InstallAdk; specify a DISM path with -DismPath."
+        if ($Preview) { Write-Note $message; return }
+        throw $message
+    }
+    Write-Ok (T "DISM: $script:Dism ($(Get-NativeToolVersion $script:Dism))" "DISM: $script:Dism ($(Get-NativeToolVersion $script:Dism))")
+}
+
+function Ensure-WimMountDriver {
+    $key = 'HKLM:\SYSTEM\CurrentControlSet\Services\WIMMount'
+    if ((Test-Path $key) -and (Get-ItemProperty $key -Name ImagePath -ErrorAction SilentlyContinue).ImagePath) { return }
+    $setup = Join-Path (Split-Path $script:Dism -Parent) 'WimMountAdkSetupAmd64.exe'
+    if (-not (Test-Path -LiteralPath $setup)) { throw (T 'Не найден WIMMount. Установите Deployment Tools из Windows ADK.' 'WIMMount was not found. Install Windows ADK Deployment Tools.') }
+    $code = Invoke-NativeQuiet -FilePath $setup -Arguments @('/Install')
+    if (-not (Test-DismSuccess $code) -or -not (Test-Path $key)) { throw (T "Не удалось зарегистрировать WIMMount (код $code)" "Could not register WIMMount (exit code $code)") }
+}
+
 function Build-SetupLauncher {
     param([string]$Directory)
     $source = Join-Path $script:ScriptRoot 'data\SetupLauncher.cs'
@@ -2585,6 +2806,12 @@ if ($script:WizardMode) {
         Write-Host (T "  В образе одна редакция: $($editions[0].Name) ($($editions[0].EditionId))" "  The image has a single edition: $($editions[0].Name) ($($editions[0].EditionId))") -ForegroundColor Gray
     }
 
+    $wizardImage = $editions | Where-Object { [int]$_.Index -eq $Index } | Select-Object -First 1
+    if ($wizardImage) {
+        $account = Read-LocalAccountOptions -Build ([version]$wizardImage.Version).Build -EditionId $wizardImage.EditionId -Mode $AccountMode -Name $LocalUserName -Password $LocalUserPassword -Preview:$DryRun
+        $AccountMode=$account.Mode; $LocalUserName=$account.Name; $LocalUserPassword=$account.Password
+    }
+
     # 3. Рабочая папка
     Write-Host ''
     $defaultWork = $WorkDir
@@ -2683,6 +2910,10 @@ if ($script:WizardMode) {
 
     $cmd = ".\win-11-lite.ps1 -InputIso `"$InputIso`""
     if ($Index -gt 0)        { $cmd += " -Index $Index" }
+    if ($AccountMode -ne 'auto') { $cmd += " -AccountMode $AccountMode" }
+    if ($LocalUserName) { $cmd += " -LocalUserName '$($LocalUserName.Replace("'","''"))'" }
+    if ($LocalUserPassword -and $LocalUserPassword.Length) { $cmd += ' -LocalUserPassword (Read-Host -AsSecureString)' }
+    if ($DismPath) { $cmd += " -DismPath '$($DismPath.Replace("'","''"))'" }
     if ($Preset -ne 'balanced') { $cmd += " -Preset $Preset" }
     if ($WorkDir -ne $defaultWork) { $cmd += " -WorkDir `"$WorkDir`"" }
     if ($DownloadLanguage)   { $cmd += " -DownloadLanguage $($DownloadLanguage -join ',')" }
@@ -2809,7 +3040,7 @@ function Test-SafeToWipe {
     if ($full -eq [IO.Path]::GetFullPath($env:SystemRoot).TrimEnd('\')) { return $false }
 
     # каталог с исходным ISO и папка результатов тоже под запретом
-    foreach ($protectedPath in @($InputIso, $OutputIso, $UpdatesDir, $script:ScriptRoot, $Unattend, $LanguageSource, $DriversDir, $LanguageUpdatePath, $SetupLanguageSource, $SetupLanguageUpdatePath, $LogFile)) {
+    foreach ($protectedPath in @($InputIso, $OutputIso, $UpdatesDir, $script:ScriptRoot, $Unattend, $LanguageSource, $DriversDir, $LanguageUpdatePath, $SetupLanguageSource, $SetupLanguageUpdatePath, $LogFile, $DismPath)) {
         if (-not $protectedPath -or $protectedPath -eq 'none') { continue }
         $k = [IO.Path]::GetFullPath($protectedPath).TrimEnd('\')
         if ($full -eq $k -or $k.StartsWith("$full\", [StringComparison]::OrdinalIgnoreCase)) { return $false }
@@ -2880,93 +3111,9 @@ if ($isAdmin) {
     Write-Note (T 'Прав администратора нет — в режиме DryRun это допустимо' 'No administrator rights - acceptable in DryRun mode')
 }
 
-# --- Windows ADK ---
-$adkCandidates = @(
-    "${env:ProgramFiles(x86)}\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools",
-    "$env:ProgramFiles\Windows Kits\10\Assessment and Deployment Kit\Deployment Tools"
-)
+# Инструменты выбираются после чтения версии образа, до любых изменений WIM.
 $script:Dism = $null
 $script:Oscdimg = $null
-foreach ($root in $adkCandidates) {
-    $d = Join-Path $root 'amd64\DISM\dism.exe'
-    $o = Join-Path $root 'amd64\Oscdimg\oscdimg.exe'
-    if ((Test-Path $d) -and -not $script:Dism) { $script:Dism = $d }
-    if ((Test-Path $o) -and -not $script:Oscdimg) { $script:Oscdimg = $o }
-}
-
-if ((-not $script:Dism -or -not $script:Oscdimg) -and $InstallAdk -and -not $DryRun) {
-    Write-Step (T 'Windows ADK не найден — устанавливаю Deployment Tools ...' 'Windows ADK not found - installing Deployment Tools ...')
-    $adkSetup = Join-Path $env:TEMP 'adksetup.exe'
-    # ADK 10.1.26100.2454 (декабрь 2024) — поддерживает Windows 11 24H2 и 25H2
-    Save-Url -Url 'https://go.microsoft.com/fwlink/?linkid=2289980' -Destination $adkSetup
-    & $adkSetup /quiet /norestart /features OptionId.DeploymentTools | Out-Null
-    foreach ($root in $adkCandidates) {
-        $d = Join-Path $root 'amd64\DISM\dism.exe'
-        $o = Join-Path $root 'amd64\Oscdimg\oscdimg.exe'
-        if ((Test-Path $d) -and -not $script:Dism) { $script:Dism = $d }
-        if ((Test-Path $o) -and -not $script:Oscdimg) { $script:Oscdimg = $o }
-    }
-}
-
-if ($script:Dism) {
-    $v = (Get-Item $script:Dism).VersionInfo.ProductVersion
-    Write-Ok (T "DISM из ADK: $script:Dism  (версия $v)" "DISM from ADK: $script:Dism  (version $v)")
-} else {
-    $msg = T @'
-Не найден DISM из Windows ADK.
-
-Хостовый C:\Windows\System32\Dism.exe (версия 10.0.19041.x) не подходит для
-обслуживания образов Windows 11 24H2 — нужен DISM 10.1.26100.x из ADK.
-
-Установите Windows ADK 10.1.26100.2454 (декабрь 2024), только Deployment Tools:
-    https://go.microsoft.com/fwlink/?linkid=2289980
-    adksetup.exe /quiet /norestart /features OptionId.DeploymentTools
-
-Или запустите скрипт с ключом -InstallAdk, чтобы он поставил ADK сам.
-'@ @'
-DISM from the Windows ADK was not found.
-
-The host C:\Windows\System32\Dism.exe (version 10.0.19041.x) cannot service
-Windows 11 24H2 images - DISM 10.1.26100.x from the ADK is required.
-
-Install Windows ADK 10.1.26100.2454 (December 2024), Deployment Tools only:
-    https://go.microsoft.com/fwlink/?linkid=2289980
-    adksetup.exe /quiet /norestart /features OptionId.DeploymentTools
-
-Or run the script with -InstallAdk to let it install the ADK itself.
-'@
-    if ($DryRun) { Write-Note (T 'DISM из ADK не найден (для DryRun не критично)' 'DISM from ADK not found (not critical for DryRun)'); $script:Dism = "$env:SystemRoot\System32\Dism.exe" }
-    else { throw $msg }
-}
-
-# --- драйвер монтирования WIM ---
-# Тихая установка ADK не всегда регистрирует WIMMount. Без него /Mount-Image
-# падает с кодом 1243 «The specified service does not exist».
-if ($isAdmin -and -not $DryRun -and $script:Dism) {
-    $wimMountKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\WIMMount'
-    $wimMountOk = (Test-Path $wimMountKey) -and (Get-ItemProperty $wimMountKey -Name ImagePath -ErrorAction SilentlyContinue).ImagePath
-    if ($wimMountOk) {
-        Write-Ok (T 'Драйвер монтирования WIMMount зарегистрирован' 'WIMMount driver is registered')
-    } else {
-        $wimSetup = Join-Path (Split-Path $script:Dism -Parent) 'WimMountAdkSetupAmd64.exe'
-        if (Test-Path $wimSetup) {
-            Write-Step (T 'Регистрирую драйвер монтирования WIMMount из ADK ...' 'Registering WIMMount driver from ADK ...')
-            $null = Invoke-NativeQuiet $wimSetup @('/Install')
-            Start-Sleep -Seconds 2
-            if (Test-Path $wimMountKey) { Write-Ok (T 'Драйвер WIMMount зарегистрирован' 'WIMMount driver registered') }
-            else { Write-Note (T 'Не удалось зарегистрировать WIMMount — монтирование образа может не сработать' 'Failed to register WIMMount - mounting the image may fail') }
-        } else {
-            Write-Note (T 'WimMountAdkSetupAmd64.exe не найден — если монтирование упадёт с кодом 1243, зарегистрируйте драйвер вручную' 'WimMountAdkSetupAmd64.exe not found - if mounting fails with code 1243, register the driver manually')
-        }
-    }
-}
-
-if ($script:Oscdimg) {
-    Write-Ok (T "oscdimg: $script:Oscdimg" "oscdimg: $script:Oscdimg")
-} elseif (-not $SkipIso) {
-    if ($DryRun) { Write-Note (T 'oscdimg не найден (для DryRun не критично)' 'oscdimg not found (not critical for DryRun)') }
-    else { throw (T 'Не найден oscdimg.exe — он ставится вместе с Deployment Tools из Windows ADK (см. выше).' 'oscdimg.exe not found - it comes with Deployment Tools from the Windows ADK (see above).') }
-}
 
 # --- место на диске ---
 if ($script:WorkDirMoved) {
@@ -3060,40 +3207,7 @@ if (-not (Test-Path -LiteralPath $srcInstall)) {
 }
 Write-Ok (T "Образ: $(Split-Path $srcInstall -Leaf)  ($(Format-Size (Get-Item -LiteralPath $srcInstall).Length))" "Image: $(Split-Path $srcInstall -Leaf)  ($(Format-Size (Get-Item -LiteralPath $srcInstall).Length))")
 
-$images = @()
-if ($isAdmin) {
-    # Обслуживание образа идёт через dism.exe из ADK — здесь только чтение модулем.
-    $images = @(Get-WimImageList -Path $srcInstall)
-} else {
-    # DryRun без прав: читаем XML-заголовок образа через 7-Zip
-    $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
-    if (Test-Path $sevenZip) {
-        # Имя уникально для процесса: каталог от прошлого запуска мог остаться
-        # с правами администратора и оказаться недоступным
-        $tmpXml = Join-Path $env:TEMP "win11lite-meta-$PID"
-        $null = Invoke-NativeQuiet $sevenZip @('e', $srcInstall, '[1].xml', "-o$tmpXml", '-y')
-        $xmlFile = Join-Path $tmpXml '[1].xml'
-        if (Test-Path -LiteralPath $xmlFile) {
-            $xml = [xml](Get-Content -LiteralPath $xmlFile -Raw -Encoding Unicode)
-            $images = $xml.WIM.IMAGE | ForEach-Object {
-                [PSCustomObject]@{
-                    Index     = $_.INDEX
-                    Name      = $_.NAME
-                    EditionId = $_.WINDOWS.EDITIONID
-                    Architecture = $_.WINDOWS.ARCH
-                    Languages = $_.WINDOWS.LANGUAGES.DEFAULT
-                    Version   = "$($_.WINDOWS.VERSION.MAJOR).$($_.WINDOWS.VERSION.MINOR).$($_.WINDOWS.VERSION.BUILD).$($_.WINDOWS.VERSION.SPBUILD)"
-                    Size      = $_.TOTALBYTES
-                }
-            }
-            try {
-                $null = Assert-ChildPath -Path $tmpXml -Root $env:TEMP
-                Remove-Item -LiteralPath $tmpXml -Recurse -Force -ErrorAction Stop
-            } catch { }
-        }
-    }
-    if (-not $images) { throw (T 'Не удалось прочитать метаданные образа без прав администратора (нужен 7-Zip).' 'Could not read image metadata without administrator rights (7-Zip required).') }
-}
+$images = @(Get-WimImageList -Path $srcInstall)
 
 Write-Host ''
 Write-Host (T '  Индексы в образе:' '  Editions in the image:') -ForegroundColor White
@@ -3152,9 +3266,9 @@ $winVersion = Get-WindowsRelease -Build $buildNumber
 
 Write-Ok (T "Выбран индекс $srcIndex — $($selected.Name)" "Selected index $srcIndex - $($selected.Name)")
 Write-Ok (T "Редакция: $($selected.EditionId)   Язык: $imgLang   Билд: $imgVersion   ($winVersion)" "Edition: $($selected.EditionId)   Language: $imgLang   Build: $imgVersion   ($winVersion)")
-if ($buildNumber -eq 28000) {
-    Write-Note (T '26H1 x64: экспериментальная сборка. Обслуживание DISM и установка Home/Pro с локальной учётной записью ещё не проверены в VM; ADK 26100 официально рассчитан на 24H2/25H2.' '26H1 x64: experimental build. DISM servicing and Home/Pro setup with a local account have not been verified in a VM; ADK 26100 officially supports 24H2/25H2.')
-}
+if ($DryRun) { Initialize-DeploymentTools -Build $buildNumber -Directory $UpdatesDir -ExplicitDism $DismPath -Install:$InstallAdk -Preview }
+$account = Read-LocalAccountOptions -Build $buildNumber -EditionId $selected.EditionId -Mode $AccountMode -Name $LocalUserName -Password $LocalUserPassword -Preview:$DryRun
+$AccountMode=$account.Mode; $LocalUserName=$account.Name; $LocalUserPassword=$account.Password
 
 $mozLang = $script:MozillaLang[$imgLang]
 if (-not $mozLang) { $mozLang = ($imgLang -split '-')[0] }
@@ -3168,7 +3282,7 @@ if (-not $DryRun) {
     if ($ClearCache -and (Test-Path $UpdatesDir)) {
         if (-not (Test-Path -LiteralPath (Join-Path $UpdatesDir '.win-11-lite-cache'))) { throw (T 'Отказ от очистки кэша без метки принадлежности скрипту' 'Refusing to clear an unmarked cache directory') }
         $null = Assert-ChildPath -Path $UpdatesDir -Root (Split-Path $UpdatesDir -Parent)
-        foreach ($protectedPath in @($InputIso, $OutputIso, $WorkDir, $script:ScriptRoot, $LanguageSource, $Unattend, $DriversDir, $LanguageUpdatePath, $SetupLanguageSource, $SetupLanguageUpdatePath)) {
+        foreach ($protectedPath in @($InputIso, $OutputIso, $WorkDir, $script:ScriptRoot, $LanguageSource, $Unattend, $DriversDir, $LanguageUpdatePath, $SetupLanguageSource, $SetupLanguageUpdatePath, $DismPath)) {
             if (-not $protectedPath -or $protectedPath -eq 'none') { continue }
             $fullProtected = [IO.Path]::GetFullPath($protectedPath)
             if ($fullProtected -eq $UpdatesDir -or $fullProtected.StartsWith("$UpdatesDir\", [StringComparison]::OrdinalIgnoreCase)) {
@@ -3182,6 +3296,7 @@ if (-not $DryRun) {
     if (-not @(Get-ChildItem -LiteralPath $UpdatesDir -Force).Count) {
         Set-Content -LiteralPath (Join-Path $UpdatesDir '.win-11-lite-cache') -Value 'win-11-lite cache' -Encoding ascii
     }
+    Initialize-DeploymentTools -Build $buildNumber -Directory $UpdatesDir -ExplicitDism $DismPath -Install:$InstallAdk
     $lcuDir = Join-Path $UpdatesDir "lcu-$winVersion"
     $netDir = Join-Path $UpdatesDir "dotnet-$winVersion"
     $requestedUpdateMode = $UpdateMode
@@ -3391,6 +3506,10 @@ $plannedSetupLang = if ($DryRun -and $SetupLanguage -ne 'original') {
     if ($SetupLanguage -ne 'auto') { $SetupLanguage } elseif ($AddLanguage) { $AddLanguage[0] } else { $setupLang }
 } else { $setupLang }
 Write-Host (T "  Язык установки : $plannedSetupLang" "  Setup language : $plannedSetupLang")
+$accountPlan = if ($AccountMode -eq 'image') {
+    if ($LocalUserName) { $LocalUserName } else { T 'задать перед сборкой ISO' 'configure before building the ISO' }
+} else { T 'ввод при установке Windows' 'enter during Windows Setup' }
+Write-Host (T "  Пользователь   : $accountPlan" "  User account   : $accountPlan")
 Write-Host (T "  WinRE          : $vWinRE" "  WinRE          : $vWinRE")
 Write-Host (T "  sources        : $vSources" "  sources        : $vSources")
 Write-Host (T "  Очистка склада : $vCleanup" "  Store cleanup  : $vCleanup")
@@ -3414,6 +3533,7 @@ if ($DryRun) {
 }
 
 #region ── Распаковка ISO после подготовки загрузок ──────────────────────────
+Ensure-WimMountDriver
 Write-Stage (T 'Распаковка исходного ISO' 'Extracting the source ISO')
 # --- висящие точки монтирования ---
 if ($isAdmin -and -not $DryRun) {
@@ -4196,6 +4316,8 @@ $buildInfo = [ordered]@{
     OobeNetworkBlock = [bool]($script:ManageOobe -and -not $NoOobeNetworkBlock)
     OobeCompletionCheck = 'OOBEComplete'
     SetupScriptLauncher = 'Win11Lite.Run.exe'
+    ServicingDismVersion = [string](Get-NativeToolVersion $script:Dism)
+    AccountMode = $AccountMode
 } | ConvertTo-Json -Depth 4
 [IO.File]::WriteAllText((Join-Path $supportDir 'build-info.json'), $buildInfo, [Text.UTF8Encoding]::new($false))
 [IO.File]::WriteAllText((Join-Path $isoDir 'win11-lite-build.json'), $buildInfo, [Text.UTF8Encoding]::new($false))
@@ -4378,14 +4500,11 @@ if ($Unattend -eq 'none') {
     # Пустой Key вместе с WillShowUI=Never пропускает запрос ключа — для
     # корпоративных редакций это штатный сценарий.
     $setupInputLocale = if ($imgLang -eq 'ru-RU') { '0419:00000419;0409:00000409' } else { $imgLang }
-    $compactBlock = if ($CompactOS) { @"
-
-            <ImageInstall>
-                <OSImage>
-                    <Compact>true</Compact>
-                </OSImage>
-            </ImageInstall>
-"@ } else { '' }
+    $compactBlock = Get-ImageInstallXml -Compact ([bool]$CompactOS)
+    $localAccountXml = Get-LocalAccountXml -Name $LocalUserName -Password $LocalUserPassword
+    $productKeyUi = Get-ProductKeyUiMode -EditionId $selected.EditionId
+    $escapedProductKey = [Security.SecurityElement]::Escape($ProductKey)
+    $productKeyValue = if ($ProductKey -or $selected.EditionId -notmatch '^(Core|Professional)') { "<Key>$escapedProductKey</Key>" } else { '' }
 
     # В specialize сохраняются и отключаются активные адаптеры, затем
     # регистрируется дополнительная задача завершения установки.
@@ -4427,8 +4546,8 @@ if ($Unattend -eq 'none') {
             <UserData>
                 <AcceptEula>true</AcceptEula>
                 <ProductKey>
-                    <Key>$ProductKey</Key>
-                    <WillShowUI>Never</WillShowUI>
+                    $productKeyValue
+                    <WillShowUI>$productKeyUi</WillShowUI>
                 </ProductKey>
             </UserData>
         </component>
@@ -4454,7 +4573,7 @@ if ($Unattend -eq 'none') {
                     <Description>Finish installation</Description>
                     <CommandLine>"%SystemRoot%\Setup\Scripts\Win11Lite\Win11Lite.Run.exe" finalize</CommandLine>
                 </SynchronousCommand>
-            </FirstLogonCommands>
+            </FirstLogonCommands>$localAccountXml
         </component>
     </settings>
 </unattend>

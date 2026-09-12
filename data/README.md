@@ -1,5 +1,7 @@
 # WinPE language download catalog
 
+`deployment-tools-28000.json` maps 194 x64 DISM/oscdimg files to nine official ADK 10.1.28000.1 CABs (6,641,932 bytes in total). The builder downloads and extracts them before image servicing, keeping them separate from the installed ADK. CABs were checked against the manifest of the Microsoft-signed [ADK bootstrapper](https://go.microsoft.com/fwlink/?linkid=2337875); archive and extracted-file SHA256 values are pinned in the catalog. MSI tables were read without installation to restore the original paths. No Microsoft binaries are redistributed here. The resulting DISM executable was verified as Microsoft-signed version 10.0.28000.1; complete image servicing still requires an elevated Windows process.
+
 `SetupLauncher.cs` is also stored here. The builder compiles this small .NET Framework Windows GUI executable locally before image servicing. It starts only the fixed Prepare/Finalize/guard modes, using `UseShellExecute=false` and `CreateNoWindow=true`, and preserves child exit codes and diagnostic output. No prebuilt executable or additional SDK download is included. The optional visible guard viewer waits for native OOBE completion before opening.
 
 Keep this directory next to `win-11-lite.ps1`. `winpe-26100.json` maps the files in Microsoft's WinPE add-on to the x64 language CABs required by the builder. It contains filenames and integrity metadata, not redistributed Microsoft binaries.
