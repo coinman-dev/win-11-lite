@@ -3309,7 +3309,7 @@ $vUpd = "$UpdateMode" + $(if ($UpdateMode -eq 'none') { T '  (встроить �
 
 Write-Host (T "  Языки          : $vLang" "  Languages      : $vLang")
 if ($AddLanguage -and $UpdateMode -eq 'none') {
-    Write-Note (T 'Добавление языка в обновлённый ISO требует повторного LCU исходного билда. Для 26100.1742 с -DownloadLanguage автоматически скачивается KB5043080 (~509 МБ загрузки).' 'Adding a language to updated media requires reapplying the source LCU. For 26100.1742, -DownloadLanguage automatically downloads KB5043080 (about 509 MB download).')
+    Write-Note (T "Добавление языка в обновлённый ISO требует повторного LCU исходного билда.`r`n  Для 26100.1742 с -DownloadLanguage автоматически скачивается KB5043080 (~509 МБ загрузки)." "Adding a language to updated media requires reapplying the source LCU.`r`n  For 26100.1742, -DownloadLanguage automatically downloads KB5043080 (about 509 MB download).")
 }
 Write-Host (T "  Установщик     : $vSetup" "  Setup          : $vSetup")
 $plannedSetupLang = if ($DryRun -and $SetupLanguage -ne 'original') {

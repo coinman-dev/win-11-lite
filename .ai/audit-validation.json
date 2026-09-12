@@ -1,6 +1,6 @@
 {
-  "Date": "2026-09-12T20:29:16.6398273+03:00",
-  "ScriptSHA256": "6EE58811E0E1AA2276DFF9008A13D6E3DBE339531B03C6BBE2B8C52501C37814",
+  "Date": "2026-09-12T20:45:48.4317650+03:00",
+  "ScriptSHA256": "798F1F18F1C4D581DAF739964A8E213D249A087A71275A45DC5990B4F3C75642",
   "ChecksPerRuntime": 491,
   "ChecksBySuite": {
     "Main": 142,
@@ -36,5 +36,6 @@
   "WinPeCatalogSHA256": "78059F63D9DAF5E86F858C469B7B683AE0CA0E3A57FD7E4D3BC1F5BA9E0A5DA0",
   "Publication": "coinman-dev/win-11-lite, main; README/CHANGELOG, current Windows source, data, tests and maintained project notes. No new full ISO build or VM installation.",
   "OobeFix": "Retry adapter discovery, repeat blocking from SetupComplete, persistent temporary outbound rule for late interfaces, native OOBEComplete gating even at FirstLogon, hidden wait worker, independent network restoration, completion marker to prevent reblocking. Guest logs still required to identify the exact regression mechanism.",
-  "QuietLogging": "Debug, LogFile and wizard logging keep console verbose/debug silent. Commands and technical messages are appended to UTF-8 .details.log; transcript and native .dism.log use separate writers. Native DISM logging also enabled by explicit LogFile; failures remain visible."
+  "QuietLogging": "Debug, LogFile and wizard logging keep console verbose/debug silent. Commands and technical messages are appended to UTF-8 .details.log; transcript and native .dism.log use separate writers. Native DISM logging also enabled by explicit LogFile; failures remain visible.",
+  "LastChangeValidation": "Presentation-only LCU warning split into two lines in RU/EN. Rendered preview and PowerShell 5.1/7 syntax checked; unchanged test suites not rerun."
 }
