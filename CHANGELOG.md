@@ -2,6 +2,13 @@
 
 ## 2026-09-13
 
+### Локальные заметки больше не публикуются
+
+- Из репозитория удалены 20 файлов `.ai/`, попавших туда ещё в первом коммите: планы, отчёты, `PROJECT_CONTEXT.md`, `audit-validation.json` и `Collect-GuestDiagnostics.ps1`. Это локальная рабочая память, а не часть сборщика. Файлы остаются на диске у разработчика.
+- В `.gitignore` вместо частных правил для отдельных файлов `.ai` стоят целиком `/.ai/` и `/doc/`.
+- Из README убрана ссылка на `Collect-GuestDiagnostics.ps1`; вместо неё перечислены гостевые журналы, которые нужны при разборе проблемы: prepare.log, finalize.log, launcher.log и guard.log.
+- Код сборщика и тесты не менялись.
+
 ### Один гостевой сценарий вместо пяти; папок data и tools больше нет
 
 - Run-Setup.ps1, Prepare.ps1, Finalize.ps1, guard.ps1 и Guard.UI.ps1 объединены в один `Win11Lite.ps1`, который сборщик пишет в образ. Режимы: prepare, prepare-register, finalize, finalize-wait, guard и view. Все точки входа — SetupComplete, answer-файл и три задачи планировщика — запускают этот файл, отличая только режим.
