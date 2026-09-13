@@ -7,7 +7,7 @@ $repo=Split-Path $PSScriptRoot -Parent
 $t=$null;$e=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'win-11-lite.ps1'),[ref]$t,[ref]$e)
 if($e.Count){throw ($e|Out-String)}
-foreach($name in 'T','Get-SetupRunnerPath','Write-WindowsBatchFile'){
+foreach($name in 'T','Get-BundledResource','Get-SetupRunnerScript','Write-WindowsBatchFile'){
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     . ([scriptblock]::Create($node.Extent.Text))
 }
@@ -25,7 +25,8 @@ function New-RunnerProcess([string]$Runner,[string]$Mode,[string]$Directory){
     $psi
 }
 try{
-    $runnerSource=Get-SetupRunnerPath
+    $runnerSource=Join-Path $root 'Run-Setup.ps1'
+    [IO.File]::WriteAllText($runnerSource,(Get-SetupRunnerScript),[Text.UTF8Encoding]::new($true))
     Assert ((Split-Path $runnerSource -Leaf) -eq 'Run-Setup.ps1') 'Setup runner is a PowerShell source file'
     Assert (-not $ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Build-SetupLauncher'},$false)) 'Builder has no executable compilation stage'
     Assert (-not(Test-Path (Join-Path $repo 'data\SetupLauncher.cs'))) 'No custom EXE source remains in data'

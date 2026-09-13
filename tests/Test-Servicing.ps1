@@ -7,7 +7,7 @@ $repo=Split-Path $PSScriptRoot -Parent
 $t=$null;$e=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'win-11-lite.ps1'),[ref]$t,[ref]$e)
 if($e.Count){throw ($e|Out-String)}
-foreach($name in 'T','Get-WimImageList','Get-NativeToolVersion','Save-DeploymentTools','Initialize-DeploymentTools','Ensure-WimMountDriver','Read-PreparedCache','Write-PreparedCache','Assert-ChildPath','Invoke-NativeQuiet','Test-DismSuccess','Resolve-AccountMode','Assert-LocalUserName','Test-SecureStringEqual','Read-ConfirmedLocalAccountPassword','Read-LocalAccountOptions','Get-LocalAccountXml','Get-ImageInstallXml','Get-ProductKeyUiMode','Get-ElevationCommand'){
+foreach($name in 'T','Get-BundledResource','Get-BundledResourceHash','Get-WimImageList','Get-NativeToolVersion','Save-DeploymentTools','Initialize-DeploymentTools','Ensure-WimMountDriver','Read-PreparedCache','Write-PreparedCache','Assert-ChildPath','Invoke-NativeQuiet','Test-DismSuccess','Resolve-AccountMode','Assert-LocalUserName','Test-SecureStringEqual','Read-ConfirmedLocalAccountPassword','Read-LocalAccountOptions','Get-LocalAccountXml','Get-ImageInstallXml','Get-ProductKeyUiMode','Get-ElevationCommand'){
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     if(-not $node){throw "Missing function: $name"}
     . ([scriptblock]::Create($node.Extent.Text))
@@ -67,7 +67,6 @@ try{
         Assert-Throws {Initialize-DeploymentTools -Build 28000 -Directory $root -ExplicitDism $custom} 'An explicitly selected old DISM is rejected before servicing'
     }
     & {
-        $script:ScriptRoot=Join-Path $root 'tool-source';$dataDir=Join-Path $script:ScriptRoot 'data';$null=New-Item -ItemType Directory -Path $dataDir
         $payload=Join-Path $root 'payload.bin';[IO.File]::WriteAllText($payload,'inert tool fixture')
         $cab=Join-Path $root 'fixture.cab'
         & "$env:SystemRoot\System32\makecab.exe" $payload $cab | Out-Null
@@ -76,7 +75,7 @@ try{
         $second=[ordered]@{Source='payload.bin';Path='amd64\Oscdimg\oscdimg.exe';Size=$entry.Size;SHA256=$entry.SHA256}
         $archive=[ordered]@{Name='fixture.cab';Url='https://fixture/fixture.cab';Size=(Get-Item $cab).Length;SHA256=(Get-FileHash $cab -Algorithm SHA256).Hash;Files=@($entry,$second)}
         $catalog=[ordered]@{Schema=1;Build=28000;Architecture='amd64';Archives=@($archive)}
-        $catalog|ConvertTo-Json -Depth 8|Set-Content -LiteralPath (Join-Path $dataDir 'deployment-tools-28000.json') -Encoding utf8
+        function Get-BundledResource {param($Name)if($Name -ne 'deployment-tools-28000.json'){throw 'Unexpected fixture resource'};$catalog|ConvertTo-Json -Depth 8}
         $state=@{Copies=0;Corrupt=$false;SourceCab=$cab}
         function Get-NativeToolVersion {param($Path)[version]'10.0.28000.1'}
         function Save-Url {param($Url,$Destination)$state.Copies++;if($state.Corrupt){[IO.File]::WriteAllText($Destination,'broken')}else{Copy-Item -LiteralPath $state.SourceCab -Destination $Destination -Force}}
@@ -92,7 +91,6 @@ try{
         Assert-Throws {Save-DeploymentTools -Directory (Join-Path $root 'bad-cache')} 'Wrong archive hash fails before any tool becomes ready'
         Assert (-not(Test-Path (Join-Path $root 'bad-cache\deployment-tools-28000\tools.ready.json'))) 'A failed tool preparation leaves no ready manifest'
         $archive.Name='..\outside.cab'
-        $catalog|ConvertTo-Json -Depth 8|Set-Content -LiteralPath (Join-Path $dataDir 'deployment-tools-28000.json') -Encoding utf8
         Assert-Throws {Save-DeploymentTools -Directory (Join-Path $root 'path-cache')} 'Archive paths cannot escape the tool cache'
     }
     & {

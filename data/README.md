@@ -1,12 +1,23 @@
-# Build data and PowerShell runtime scripts
+# Sources of the single-file builder's bundled resources
+
+Users only need `win-11-lite.ps1` to run the builder. These five source files are embedded as readable PowerShell string literals in its generated resource block; the builder always reads that block, even if a neighboring `data/` folder exists. It writes the required runtime scripts into the Windows image itself. The separate installed-VM updater still uses the source files supplied in its update package.
+
+After editing a resource, regenerate the standalone file and verify it:
+
+```powershell
+powershell.exe -NoProfile -File .\tools\Update-BundledResources.ps1
+powershell.exe -NoProfile -File .\tools\Update-BundledResources.ps1 -Check
+```
+
+Run these commands from the repository root and commit both the edited sources and `win-11-lite.ps1`. `Test-Win11Lite` and `Test-SingleFile` reject stale resources. Resources use canonical Windows newlines when read from the bundle, keeping the existing DISM cache catalog hash unchanged after a Git LF checkout. No encoded archive, dynamic script download, or custom EXE is involved.
 
 `deployment-tools-28000.json` maps 194 x64 DISM/oscdimg files to nine official ADK 10.1.28000.1 CABs (6,641,932 bytes in total). The builder downloads and extracts them before image servicing, keeping them separate from the installed ADK. CABs were checked against the manifest of the Microsoft-signed [ADK bootstrapper](https://go.microsoft.com/fwlink/?linkid=2337875); archive and extracted-file SHA256 values are pinned in the catalog. MSI tables were read without installation to restore the original paths. No Microsoft binaries are redistributed here. The resulting DISM executable was verified as Microsoft-signed version 10.0.28000.1; complete image servicing still requires an elevated Windows process.
 
 `Run-Setup.ps1` replaces the former custom EXE launcher for Prepare/Finalize and the SYSTEM guard worker. Children use `CreateNoWindow`, with output and exit codes retained in `launcher.log`. Guard presentation now bypasses this runner: the worker requests one limited, demand-start task in each desktop session after native OOBE completion. Standard opens the summary after checking, Debug opens the live log, and Silent requests no user process. Early Windows Setup entry points can still flash a console; no custom launcher executable is built or distributed.
 
-`guard.ps1` contains the guard worker and read-only `-View` entry point; `Guard.UI.ps1` contains presentation helpers and demand-task registration. Both files are required. Each run saves `guard-summary.txt`, full `guard-report.txt`, structured `guard-report.json`, and successful observations in `guard-state.json`. `guard-run.json` records the run ID and log offset. Program totals deduplicate installed/provisioned copies, and recurrence requires previous successful observations; failed re-removals are counted as reappearances without claiming success. Live log reading permits shared UTF-8 writes. The viewer uses [Task Scheduler RunEx](https://learn.microsoft.com/en-us/windows/win32/taskschd/registeredtask-runex) with a session ID so it runs as that session's user, not SYSTEM.
+`guard.ps1` contains the guard worker and read-only `-View` entry point; `Guard.UI.ps1` contains presentation helpers and demand-task registration. The builder writes both into the guest support directory automatically. Each run saves `guard-summary.txt`, full `guard-report.txt`, structured `guard-report.json`, and successful observations in `guard-state.json`. `guard-run.json` records the run ID and log offset. Program totals deduplicate installed/provisioned copies, and recurrence requires previous successful observations; failed re-removals are counted as reappearances without claiming success. Live log reading permits shared UTF-8 writes. The viewer uses [Task Scheduler RunEx](https://learn.microsoft.com/en-us/windows/win32/taskschd/registeredtask-runex) with a session ID so it runs as that session's user, not SYSTEM.
 
-Keep this directory next to `win-11-lite.ps1`. `winpe-26100.json` maps the files in Microsoft's WinPE add-on to the x64 language CABs required by the builder. It contains filenames and integrity metadata, not redistributed Microsoft binaries.
+`winpe-26100.json` maps the files in Microsoft's WinPE add-on to the x64 language CABs required by the builder. Its content is embedded in `win-11-lite.ps1`; it contains filenames and integrity metadata, not redistributed Microsoft binaries.
 
 The catalog was extracted on 2026-09-12 from the Windows PE add-on for ADK **10.1.26100.2454**, linked by Microsoft's [ADK download page](https://learn.microsoft.com/en-us/windows-hardware/get-started/adk-install):
 

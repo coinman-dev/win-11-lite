@@ -10,7 +10,7 @@ if($e.Count){throw ($e|Out-String)}
 $script:checks=0
 function Assert([bool]$Value,[string]$Message){if(-not $Value){throw "FAIL: $Message"};$script:checks++}
 function Assert-Throws([scriptblock]$Action,[string]$Message){$failed=$false;try{& $Action|Out-Null}catch{$failed=$true};Assert $failed $Message}
-foreach($name in @('T','Assert-ChildPath','Read-PreparedCache','Write-PreparedCache','Get-SetupFontPackage','Get-CabIdentity',
+foreach($name in @('T','Get-BundledResource','Assert-ChildPath','Read-PreparedCache','Write-PreparedCache','Get-SetupFontPackage','Get-CabIdentity',
     'Save-SetupLanguagePayload','Add-SetupLanguage','ConvertFrom-DismList','Confirm-SkipDownload')){
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     if(-not $node){throw "Missing function $name"}
@@ -26,12 +26,12 @@ function Invoke-RestMethod {throw 'NETWORK DISABLED BY TEST'}
 function Invoke-WebRequest {throw 'NETWORK DISABLED BY TEST'}
 function Invoke-NativeQuiet {throw 'NATIVE PROCESS DISABLED BY TEST'}
 function Invoke-Dism {throw 'DISM DISABLED BY TEST'}
-function Get-SetupRunnerPath {'fixture-runner.ps1'}
+function Get-SetupRunnerScript {'# fixture runner'}
 function Initialize-DeploymentTools {param($Build,$Directory,$ExplicitDism,[switch]$Install)}
 $root=Join-Path $repo ('tmp\setup-tests-'+[guid]::NewGuid().ToString('N'))
 $null=New-Item -ItemType Directory -Path $root
 try{
-    $catalog=Get-Content -LiteralPath (Join-Path $repo 'data/winpe-26100.json') -Raw|ConvertFrom-Json
+    $catalog=Get-BundledResource 'winpe-26100.json'|ConvertFrom-Json
     Assert ($catalog.Build -eq 26100 -and $catalog.Architecture -eq 'amd64') 'Catalog matches target WinPE build and architecture'
     Assert ($catalog.BaseUrl -match '^https://download\.microsoft\.com/') 'Packages come directly from Microsoft'
     Assert ($catalog.Files.Count -eq 894) 'Authenticated ADK catalog includes 37 languages and 6 font packages'

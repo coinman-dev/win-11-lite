@@ -8,7 +8,7 @@ $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'win-11
 if($e.Count){throw ($e|Out-String)}
 $script:checks=0
 function Assert([bool]$Value,[string]$Message){if(-not $Value){throw "FAIL: $Message"};$script:checks++}
-foreach($name in @('T','Test-GroupActive','Get-ProtectedPatterns','Get-GuardScript','Get-SetupSupportScripts')){
+foreach($name in @('T','Get-BundledResource','Test-GroupActive','Get-ProtectedPatterns','Get-GuardScript','Get-SetupSupportScripts')){
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     . ([scriptblock]::Create($node.Extent.Text))
 }
@@ -19,7 +19,7 @@ foreach($name in @('CapabilityRules','PackageRules','FolderRules','FileRules','A
 }
 $root=Join-Path $repo ('tmp\guard-tests-'+[guid]::NewGuid().ToString('N'))
 $null=New-Item -ItemType Directory -Path $root
-Copy-Item -LiteralPath (Join-Path $repo 'data\Guard.UI.ps1') -Destination (Join-Path $root 'Guard.UI.ps1')
+[IO.File]::WriteAllText((Join-Path $root 'Guard.UI.ps1'),(Get-BundledResource 'Guard.UI.ps1'),[Text.UTF8Encoding]::new($true))
 try{
     & {
         # Only the native-output helper runs here, with a harmless child script.

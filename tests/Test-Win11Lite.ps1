@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 $script:ScriptRoot=$repo
 $sourcePath = Join-Path $repo 'win-11-lite.ps1'
+& (Join-Path $repo 'tools\Update-BundledResources.ps1') -Check | Out-Null
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($sourcePath, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors | Out-String) }
@@ -20,7 +21,7 @@ function Assert-Throws([scriptblock]$Action, [string]$Message) {
     Assert $thrown $Message
 }
 # Load declarations and pure configuration only, never execute the build pipeline.
-foreach ($name in @('T','Test-DismSuccess','ConvertFrom-DismList','Test-GroupActive','Test-Protected','Get-ProtectedPatterns','Get-WindowsRelease','Get-EditionConfig','Assert-ChildPath','Test-SafeToWipe','Get-FodSourceName','Get-UpdateTarget','Get-SetupSupportScripts','Get-GuardScript','Get-ElevationCommand','Invoke-RegCommand','Invoke-NativeQuiet','Set-Reg','Mount-Hive','Dismount-Hives','Remove-Reg','Save-ImageAudit','Write-ComponentStoreReport','Write-ServicingRemovalFailure','Get-PackageRemovalSkipReason','Get-RequestedRemovalItems','Remove-OfflineRecall','Write-RemainingRemovalReport','Get-WebViewRuntimeRoots','Assert-ImageFileState','Get-ProgressLine','Update-ProgressState','Invoke-ProgressProcess','Get-CopyPercent','Assert-ImageLanguages','Write-WindowsBatchFile','Write-DiagnosticLog','Invoke-Dism')) {
+foreach ($name in @('T','Get-BundledResource','Test-DismSuccess','ConvertFrom-DismList','Test-GroupActive','Test-Protected','Get-ProtectedPatterns','Get-WindowsRelease','Get-EditionConfig','Assert-ChildPath','Test-SafeToWipe','Get-FodSourceName','Get-UpdateTarget','Get-SetupSupportScripts','Get-GuardScript','Get-ElevationCommand','Invoke-RegCommand','Invoke-NativeQuiet','Set-Reg','Mount-Hive','Dismount-Hives','Remove-Reg','Save-ImageAudit','Write-ComponentStoreReport','Write-ServicingRemovalFailure','Get-PackageRemovalSkipReason','Get-RequestedRemovalItems','Remove-OfflineRecall','Write-RemainingRemovalReport','Get-WebViewRuntimeRoots','Assert-ImageFileState','Get-ProgressLine','Update-ProgressState','Invoke-ProgressProcess','Get-CopyPercent','Assert-ImageLanguages','Write-WindowsBatchFile','Write-DiagnosticLog','Invoke-Dism')) {
     $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
     if (-not $node) { throw "Missing function: $name" }
     . ([scriptblock]::Create($node.Extent.Text))
