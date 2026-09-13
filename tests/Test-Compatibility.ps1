@@ -62,6 +62,8 @@ function Write-Step {param($Message)}
 function Write-Ok {param($Message)}
 function Write-ServicingRemovalFailure {throw 'Unexpected DISM failure in fixture'}
 $inventory=@($platform)+@('Microsoft.BingWeather','Microsoft.Paint','Microsoft.WindowsCalculator')
+$entertainment=@('Microsoft.ZuneMusic','Microsoft.ZuneVideo','Microsoft.GamingApp','Microsoft.XboxApp','Microsoft.XboxGamingOverlay','Microsoft.XboxGameOverlay','Microsoft.XboxSpeechToTextOverlay')
+$consumerApps=@('Microsoft.Todos','MicrosoftCorporationII.MicrosoftFamily')
 $state=@{Removed=[Collections.Generic.List[string]]::new()}
 function Invoke-Dism {
     param($Arguments,[switch]$Quiet,[switch]$AllowFail)
@@ -77,6 +79,22 @@ function Invoke-Dism {
 $mountDir='C:\inert-image';$Preset='balanced'
 & ([scriptblock]::Create($stage))
 Assert ($state.Removed.Count -eq 1 -and $state.Removed[0] -eq 'Microsoft.BingWeather_fixture') 'Balanced preserves Store/MSIX and ordinary apps while removing selected consumer apps'
+
+$inventory += $entertainment + $consumerApps + @('Microsoft.XboxIdentityProvider','Microsoft.Xbox.TCUI','Microsoft.HEVCVideoExtension')
+foreach($Preset in 'safe','balanced','max'){
+    $state.Removed.Clear()
+    & ([scriptblock]::Create($stage))
+    foreach($name in ($entertainment+$consumerApps)){
+        Assert (($state.Removed -contains ($name+'_fixture')) -eq ($Preset -ne 'safe')) "$Preset handles the selected consumer app $name"
+    }
+    foreach($name in 'Microsoft.DesktopAppInstaller','Microsoft.WindowsStore','Microsoft.Paint','Microsoft.WindowsCalculator','Microsoft.XboxIdentityProvider','Microsoft.Xbox.TCUI','Microsoft.HEVCVideoExtension'){
+        Assert (-not ($state.Removed -contains ($name+'_fixture'))) "$Preset keeps $name with the selected app rules"
+    }
+}
+$Preset='balanced';$Keep=@('WMP','Apps');$state.Removed.Clear()
+& ([scriptblock]::Create($stage))
+Assert ($state.Removed.Count -eq 0) 'Keep WMP and Apps preserve modern media players, Xbox, Family and To Do'
+$Keep=@();$inventory=@($platform)+@('Microsoft.BingWeather','Microsoft.Paint','Microsoft.WindowsCalculator')
 
 # Regression: an accidentally broadened rule must not remove the platform.
 $script:AppxRules=@(@{Preset='balanced';Group='Apps';Pattern='^Microsoft\.'})

@@ -134,8 +134,8 @@ param(
     # Интегрировать накопительное обновление для .NET Framework.
     [bool]$IncludeDotNetUpdate = $true,
 
-    # Встроить winget (App Installer) в образ. По умолчанию не ставится —
-    # это ~300 МБ загрузки с GitHub и лишний компонент в образе.
+    # Дополнительно встроить winget (App Installer), ~300 МБ загрузки.
+    # Без ключа имеющийся в исходном образе App Installer/winget сохраняется.
     [Alias('Winget')]
     [switch]$WithWinget,
 
@@ -235,7 +235,7 @@ param(
     # вводится уже после установки.
     [string]$ProductKey,
 
-    # auto: для Home/Pro 26H1 задаём локальный аккаунт до сборки; setup — ввод в Windows.
+    # auto: общий диалог для всех версий; по умолчанию ввод пользователя в Windows.
     [ValidateSet('auto','image','setup')]
     [string]$AccountMode = 'auto',
     [string]$LocalUserName,
@@ -529,6 +529,68 @@ function Get-IsoEditions {
     $result
 }
 
+function Get-WimWingetState {
+    param([string]$Path, [ValidateRange(1,65535)][int]$Index,
+          [string]$Dism = (Join-Path $env:SystemRoot 'System32\dism.exe'))
+    # List-Image читает только каталог выбранного индекса: WIM не монтируется
+    # для обслуживания, файлы не распаковываются, winget хоста не используется.
+    try {
+        $nativePreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $PSNativeCommandUseErrorActionPreference = $false
+            $lines = @(& $Dism /English /List-Image "/ImageFile:$Path" "/Index:$Index" 2>&1)
+            $code = $LASTEXITCODE
+        } finally { $ErrorActionPreference = $nativePreference }
+        if ($null -eq $code -or $code -ne 0) {
+            throw "DISM ($code): $(($lines | Select-Object -Last 6) -join ' ')"
+        }
+        $paths = @($lines | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^\\' })
+        if (-not $paths.Count) { throw (T 'DISM не вернул каталог файлов' 'DISM did not return a file listing') }
+        $found = @($paths | Where-Object { $_ -match '^\\Program Files\\WindowsApps\\Microsoft\.DesktopAppInstaller_[^\\]+\\winget\.exe$' }).Count -gt 0
+        [pscustomobject]@{ State = $(if ($found) { 'Present' } else { 'Absent' }); Reason = '' }
+    } catch {
+        # Неудачная проверка не означает, что winget отсутствует.
+        [pscustomobject]@{ State = 'Unknown'; Reason = $_.Exception.Message }
+    }
+}
+
+function Get-IsoWingetState {
+    param([string]$Path, [ValidateRange(1,65535)][int]$Index, [string]$Dism)
+    $owned = $false
+    try {
+        $disk = Get-DiskImage -ImagePath $Path -ErrorAction Stop
+        if (-not $disk.Attached) {
+            $disk = Mount-DiskImage -ImagePath $Path -PassThru -Access ReadOnly -ErrorAction Stop
+            $owned = $true
+            Start-Sleep -Seconds 2
+        }
+        $drive = "$(($disk | Get-Volume -ErrorAction Stop).DriveLetter):"
+        $wim = Join-Path $drive 'sources\install.wim'
+        if (-not (Test-Path -LiteralPath $wim)) { $wim = Join-Path $drive 'sources\install.esd' }
+        if (-not (Test-Path -LiteralPath $wim)) { throw (T 'В ISO нет install.wim/install.esd' 'The ISO has no install.wim/install.esd') }
+        $queryParams = @{ Path = $wim; Index = $Index }
+        if ($Dism) { $queryParams.Dism = $Dism }
+        Get-WimWingetState @queryParams
+    } catch {
+        [pscustomobject]@{ State = 'Unknown'; Reason = $_.Exception.Message }
+    } finally {
+        if ($owned) { Dismount-DiskImage -ImagePath $Path -ErrorAction Stop | Out-Null }
+    }
+}
+
+function Read-WingetOption {
+    param([Parameter(Mandatory)]$SourceState)
+    if ($SourceState.State -eq 'Present') {
+        Write-Host (T '  winget уже встроен в выбранную редакцию; App Installer и winget сохраняются.' '  winget is already included in the selected edition; keeping App Installer and winget.') -ForegroundColor Gray
+        return $false
+    }
+    if ($SourceState.State -eq 'Unknown') {
+        Write-Note (T "Наличие winget проверить не удалось: $($SourceState.Reason)" "Could not check for winget: $($SourceState.Reason)")
+    }
+    Read-YesNo -Question (T 'Встроить winget (менеджер пакетов, ~300 МБ загрузки)?' 'Embed winget (package manager, about 300 MB download)?') -Default $false
+}
+
 # Выбор исходного ISO, когда параметр не задан: показываем всё, что лежит
 # рядом со скриптом, вместо безликого запроса PowerShell «InputIso:»
 function Select-InputIso {
@@ -676,6 +738,9 @@ $script:AppPlatformProtected = @(
 
 # Provisioned Appx на удаление.
 $script:AppxRules = @(
+    @{ Preset = 'balanced'; Group = 'Apps'; Pattern = '^(Microsoft\.Todos|MicrosoftCorporationII\.MicrosoftFamily)$'; Desc = (T 'Family и Microsoft To Do' 'Family and Microsoft To Do') }
+    @{ Preset = 'balanced'; Group = 'WMP'; Pattern = '^Microsoft\.(ZuneMusic|ZuneVideo)$'; Desc = (T 'Медиаплеер, Музыка Groove и Кино и ТВ' 'Media Player, Groove Music and Movies & TV') }
+    @{ Preset = 'balanced'; Group = 'Apps'; Pattern = '^Microsoft\.(GamingApp|XboxApp|XboxGamingOverlay|XboxGameOverlay|XboxSpeechToTextOverlay)$'; Desc = (T 'Xbox и Game Bar' 'Xbox and Game Bar') }
     @{ Preset = 'balanced'; Group = 'Defender'; Pattern = '^Microsoft\.SecHealthUI'; Desc = (T 'Интерфейс «Безопасность Windows»' 'Windows Security app') }
     @{ Preset = 'balanced'; Group = 'AI'; Pattern = '^Microsoft\.(Copilot|Windows\.Ai\.Copilot\.Provider)$'; Desc = 'Copilot' }
     @{ Preset = 'balanced'; Group = 'Apps'; Pattern = '^(Clipchamp\.Clipchamp|Microsoft\.(BingNews|BingWeather|GetHelp|Getstarted|MicrosoftOfficeHub|MicrosoftSolitaireCollection|WindowsFeedbackHub|YourPhone|OutlookForWindows)|MicrosoftTeams|MSTeams)$'; Desc = (T 'Необязательные потребительские приложения' 'Optional consumer apps') }
@@ -1088,7 +1153,7 @@ function Resolve-AccountMode {
         if ($Name) { throw (T '-LocalUserName несовместим с -AccountMode setup' '-LocalUserName cannot be combined with -AccountMode setup') }
         return 'setup'
     }
-    if ($Mode -eq 'image' -or $Name -or ($Build -eq 28000 -and $EditionId -match '^(Core|Professional)')) { return 'image' }
+    if ($Mode -eq 'image' -or $Name) { return 'image' }
     'setup'
 }
 
@@ -1141,15 +1206,15 @@ function Read-LocalAccountOptions {
     param([int]$Build,[string]$EditionId,[string]$Mode,[string]$Name,[Security.SecureString]$Password,[switch]$Preview)
     $resolved = Resolve-AccountMode -Build $Build -EditionId $EditionId -Mode $Mode -Name $Name -AnswerFile $Unattend
     if ($Password -and $resolved -ne 'image') { throw (T 'Пароль указан без создаваемого локального аккаунта' 'A password was supplied without a local account to create') }
+    if ($Mode -eq 'auto' -and -not $Name -and -not $Unattend -and -not $Preview -and (Test-CanPrompt)) {
+        $resolved = Read-Option -Question (T 'Где задать локального пользователя' 'Where to configure the local user') -Items @((T 'При установке Windows' 'During Windows Setup'),(T 'Сейчас, до сборки ISO' 'Now, before building the ISO')) -Values @('setup','image') -Default 1
+    }
     if ($resolved -eq 'image' -and -not $Name -and -not $Preview) {
-        if (-not (Test-CanPrompt)) { throw (T 'Для Home/Pro 26H1 укажите -LocalUserName <имя> или -AccountMode setup для ввода при установке Windows' 'For Home/Pro 26H1, specify -LocalUserName <name> or -AccountMode setup to enter it during Windows Setup') }
-        $resolved = Read-Option -Question (T 'Где задать локального пользователя' 'Where to configure the local user') -Items @((T 'Сейчас, до сборки ISO' 'Now, before building the ISO'),(T 'При установке Windows' 'During Windows Setup')) -Values @('image','setup') -Default 1
-        if ($resolved -eq 'image') {
-            $Name = (Read-Host (T '  Имя локального пользователя' '  Local user name')).Trim()
-            Assert-LocalUserName $Name
-            Write-Note (T 'Пароль попадёт в установочный answer-файл ISO; кодирование Windows не является шифрованием.' 'The password is stored in the ISO answer file; Windows encoding is not encryption.')
-            $Password = Read-ConfirmedLocalAccountPassword
-        }
+        if (-not (Test-CanPrompt)) { throw (T 'Для создания аккаунта до сборки укажите -LocalUserName <имя> или выберите -AccountMode setup для ввода при установке Windows' 'To create an account before building, specify -LocalUserName <name>, or choose -AccountMode setup to enter it during Windows Setup') }
+        $Name = (Read-Host (T '  Имя локального пользователя' '  Local user name')).Trim()
+        Assert-LocalUserName $Name
+        Write-Note (T 'Пароль попадёт в установочный answer-файл ISO; кодирование Windows не является шифрованием.' 'The password is stored in the ISO answer file; Windows encoding is not encryption.')
+        if ($null -eq $Password) { $Password = Read-ConfirmedLocalAccountPassword }
     }
     if ($Name) { Assert-LocalUserName $Name }
     [pscustomobject]@{Mode=$resolved;Name=$Name;Password=$Password}
@@ -2002,7 +2067,7 @@ echo.
 where winget >nul 2>&1
 if not errorlevel 1 (
     echo  $tryWinget
-    winget install --id Mozilla.Firefox -e --accept-package-agreements --accept-source-agreements
+    winget install --id Mozilla.Firefox -e --source winget --accept-package-agreements --accept-source-agreements
     if errorlevel 0 if not errorlevel 1 goto :done
     echo.
     echo  $fallback
@@ -2379,6 +2444,7 @@ function Get-GuardMode {
 function Get-GuardExpectedApps {
     param($Config)
     $known=@('Microsoft.SecHealthUI','Microsoft.Copilot','Microsoft.Windows.Ai.Copilot.Provider','Clipchamp.Clipchamp','Microsoft.BingNews','Microsoft.BingWeather','Microsoft.GetHelp','Microsoft.Getstarted','Microsoft.MicrosoftOfficeHub','Microsoft.MicrosoftSolitaireCollection','Microsoft.WindowsFeedbackHub','Microsoft.YourPhone','Microsoft.OutlookForWindows','MicrosoftTeams','MSTeams')
+    $known+=@('Microsoft.Todos','MicrosoftCorporationII.MicrosoftFamily','Microsoft.ZuneMusic','Microsoft.ZuneVideo','Microsoft.GamingApp','Microsoft.XboxApp','Microsoft.XboxGamingOverlay','Microsoft.XboxGameOverlay','Microsoft.XboxSpeechToTextOverlay')
     if($Config.ExpectedApps){$known=@($Config.ExpectedApps)}
     foreach($name in $known){
         if(@($Config.Protected|Where-Object{$_ -and $name -match $_}).Count){continue}
@@ -2430,6 +2496,18 @@ function Start-GuardViewer {
     }
 }
 
+function Get-GuardControlText {
+    @(
+        (T 'Управление Guard (Терминал от имени администратора):' 'Guard control (run Terminal as administrator):')
+        (T 'Отключить:' 'Disable:')
+        '  schtasks.exe /Change /TN "\win-11-lite guard" /Disable'
+        (T 'Включить обратно:' 'Enable again:')
+        '  schtasks.exe /Change /TN "\win-11-lite guard" /Enable'
+        (T 'Отключение запрещает следующие запуски; текущая проверка завершится.' 'Disabling prevents future runs; the current check will finish.')
+        (T 'После включения проверка выполнится при следующем входе в Windows.' 'After enabling, the check runs at the next Windows sign-in.')
+    ) -join "`r`n"
+}
+
 function Get-GuardBriefReport {
     param($Report,[bool]$HasHistory)
     $lines=[Collections.Generic.List[string]]::new()
@@ -2457,11 +2535,45 @@ function Get-GuardBriefReport {
     if($present -or $fixed){$lines.Add((T "Найдено сейчас программ: $present; удалено: $removed; исправлено настроек/служб: $fixed" "Programs found now: $present; removed: $removed; settings/services corrected: $fixed"))}
     foreach($category in 'capability','path'){
         $rows=@($Report.Items|Where-Object{$_.Category -eq $category -and -not $_.Inventory})
-        $found=@($rows|Where-Object{$_.Found -eq $true}).Count
+        $foundRows=@($rows|Where-Object{$_.Found -eq $true})
+        $found=$foundRows.Count
         $cleared=@($rows|Where-Object{$_.Outcome -eq 'removed'}).Count
         if($found){
             $label=if($category -eq 'path'){T 'Файлы и каталоги' 'Files and directories'}else{T 'Компоненты Windows' 'Windows capabilities'}
             $lines.Add((T "${label}: найдено $found; удалено $cleared" "${label}: found $found; removed $cleared"))
+            foreach($row in $foundRows){
+                if($category -eq 'path'){
+                    # Identity содержит конкретное совпадение, Name может быть маской.
+                    $path=if($row.Identity){[string]$row.Identity}else{[string]$row.Name}
+                    $parts=@($path -split '[\\/]+'|Where-Object{$_})
+                    $name=$parts[-1]
+                    $sameName=@($foundRows|Where-Object{
+                        $other=if($_.Identity){[string]$_.Identity}else{[string]$_.Name}
+                        ($other.TrimEnd('\','/') -split '[\\/]')[-1] -eq $name
+                    })
+                    if($sameName.Count -gt 1 -and $parts.Count -gt 1){$name+=" ($($parts[-2]))"}
+                }else{
+                    $baseName=([string]$row.Name -split '~')[0]
+                    $name=switch($baseName){
+                        'Media.WindowsMediaPlayer'{'Windows Media Player'}
+                        'Language.Handwriting'{T 'Рукописный ввод' 'Handwriting'}
+                        'Language.OCR'{T 'Распознавание текста (OCR)' 'Text recognition (OCR)'}
+                        'Language.Speech'{T 'Распознавание речи' 'Speech recognition'}
+                        'Language.TextToSpeech'{T 'Синтез речи' 'Text to speech'}
+                        default{$baseName}
+                    }
+                    if($row.Name -match '~([a-z]{2,3}(?:-[a-z0-9]+)+)~'){$name+=" ($($matches[1]))"}
+                }
+                $outcome=switch($row.Outcome){
+                    'removed'{T 'удалено' 'removed'}
+                    'pending'{T 'ожидает завершения удаления' 'removal pending'}
+                    'failed'{T 'ошибка' 'error'}
+                    'skipped'{T 'пропущено' 'skipped'}
+                    'protected'{T 'сохранено по правилам защиты' 'retained by protection rules'}
+                    default{T 'результат не подтверждён' 'result unconfirmed'}
+                }
+                $lines.Add("  - $name — $outcome")
+            }
         }
     }
     $pending=@($Report.Items|Where-Object{$_.Outcome -eq 'pending'}).Count
@@ -2482,6 +2594,8 @@ function Get-GuardBriefReport {
         $lines.Add("  $name — $reason$(if($code){' ('+$code+')'})")
     }
     foreach($warning in $Report.Warnings){$lines.Add("! $warning")}
+    $lines.Add('')
+    $lines.Add((Get-GuardControlText))
     [pscustomobject]@{
         Text=($lines -join "`r`n")
         Counts=[ordered]@{Programs=$programs.Count;ProgramsReappeared=$programReturned;ProgramsRemovedAgain=$programRemoved;Settings=$settings.Count;SettingsReappeared=$settingsReturned;SettingsRestoredAgain=$settingsFixed;HasHistory=$HasHistory}
@@ -2528,6 +2642,9 @@ function Show-GuardView {
             Start-Sleep -Milliseconds 200
         }
     }
+    Write-Host ''
+    $detailsPath=Join-Path $SupportDirectory 'guard-report.txt'
+    Write-Host (T "Подробный отчёт: $detailsPath" "Detailed report: $detailsPath") -ForegroundColor Gray
     $null=Read-Host (T 'Нажмите Enter, чтобы закрыть окно' 'Press Enter to close')
 }
 
@@ -2821,6 +2938,8 @@ function Save-GuardReport {
     $lines.Add((T "Всего ошибок проверок: $($counts.Failed); ошибок записи журнала: $($counts.LogFailed)." "Total check errors: $($counts.Failed); log write errors: $($counts.LogFailed)."))
     if(-not $guardHistory.Count){$lines.Add((T 'Предыдущей истории ещё нет: повторные изменения пока не определяются.' 'No previous history yet: repeated changes cannot be determined.'))}
     foreach($warning in $guardWarnings){$lines.Add("! $warning")}
+    $lines.Add('')
+    $lines.Add((Get-GuardControlText))
     $text=$lines -join "`r`n"
     Write-GuardLog 'REPORT' ("`r`n"+$text)
     $report=[ordered]@{Schema=2;BuildId=$config.BuildId;RunId=$guardRunId;Mode=$guardMode;Started=$guardStartedAt.ToString('o');Finished=(Get-Date).ToString('o');Complete=$guardComplete;Deferred=$guardSkippedOobe;Errors=$counts.Failed;LogErrors=$counts.LogFailed;ViewErrors=$counts.ViewFailed;Summary=$totals;Items=@($guardRows.ToArray());Warnings=@($guardWarnings.ToArray())}
@@ -3632,7 +3751,7 @@ if ($script:WizardMode) {
     $Preset = Read-Option -Question (T 'Насколько глубоко чистить' 'How aggressively should I clean') -Default 2 `
         -Items @(
             (T 'safe      — только Edge, телеметрия и реклама' 'safe      - Edge, telemetry and ads only'),
-            (T 'balanced  — плюс Defender, речь, Media Player, AI-компоненты' 'balanced  - plus Defender, speech, Media Player, AI components'),
+            (T 'balanced  — плюс Defender, речь, Media Player, Xbox/Game Bar, AI-компоненты' 'balanced  - plus Defender, speech, Media Player, Xbox/Game Bar, AI components'),
             (T 'max       — плюс WebView2, резервы компонентов и дополнительные FoD; возможна потеря совместимости' 'max       - plus WebView2, component backups and extra FoDs; compatibility may be lost')
         ) -Values @('safe', 'balanced', 'max')
 
@@ -3681,7 +3800,9 @@ if ($script:WizardMode) {
 
     # 8. winget
     Write-Host ''
-    if (Read-YesNo -Question (T 'Встроить winget (менеджер пакетов, ~300 МБ загрузки)?' 'Embed winget (package manager, about 300 MB download)?') -Default $false) { $WithWinget = $true }
+    Write-Host (T '  Проверяю наличие winget в выбранной редакции...' '  Checking for winget in the selected edition...') -ForegroundColor DarkGray
+    $sourceWinget = if ($Index -gt 0) { Get-IsoWingetState -Path $InputIso -Index $Index -Dism $DismPath } else { [pscustomobject]@{State='Unknown';Reason=(T 'Не выбран индекс образа' 'No image index selected')} }
+    $WithWinget = Read-WingetOption -SourceState $sourceWinget
 
     # 9. Уменьшение размера
     Write-Host ''

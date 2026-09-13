@@ -11,7 +11,7 @@ if(-not $accessor){throw 'Missing Get-GuestScript'}
 . ([scriptblock]::Create($accessor.Extent.Text))
 $guestAst=[Management.Automation.Language.Parser]::ParseInput((Get-GuestScript),[ref]$t,[ref]$e)
 if($e.Count){throw ($e|Out-String)}
-foreach($name in 'Get-GuardMode','Get-GuardExpectedApps','Get-GuardBriefReport','Start-GuardViewer','Show-GuardView','New-GuardViewerAction','Register-GuardViewerTask','Remove-GuardSelectedPath'){
+foreach($name in 'Get-GuardMode','Get-GuardExpectedApps','Get-GuardControlText','Get-GuardBriefReport','Start-GuardViewer','Show-GuardView','New-GuardViewerAction','Register-GuardViewerTask','Remove-GuardSelectedPath'){
     $node=$guestAst.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     if(-not $node){throw "Missing guest function: $name"}
     . ([scriptblock]::Create($node.Extent.Text))
@@ -39,6 +39,12 @@ try{
         [pscustomobject]@{Category='path';Name='Windows\diagnostics';Outcome='failed';Found=$true;Detail='C:\Windows\diagnostics; HRESULT=0x80070057; raw stack'}
     )}
     $brief=Get-GuardBriefReport $report $true
+    $disableCommand='schtasks.exe /Change /TN "\win-11-lite guard" /Disable'
+    $enableCommand='schtasks.exe /Change /TN "\win-11-lite guard" /Enable'
+    Assert ($brief.Text.Contains($disableCommand) -and $brief.Text.Contains($enableCommand) -and $brief.Text -match 'от имени администратора') 'The saved summary includes both commands and their elevation requirement'
+    Assert ($brief.Text -match 'текущая проверка завершится' -and $brief.Text -match 'при следующем входе') 'The summary explains when disabling and enabling take effect'
+    $expected=@(Get-GuardExpectedApps @{Apps=@('^(Microsoft\.Todos|MicrosoftCorporationII\.MicrosoftFamily|Microsoft\.ZuneMusic|Microsoft\.XboxGamingOverlay)$');Protected=@()})
+    Assert ($expected.Count -eq 4) 'New app targets are also known when absent or when inventory fails'
     Assert ($brief.Counts.Programs -eq 3) 'Programs are deduplicated across installed and provisioned packages; inventory errors are excluded'
     Assert ($brief.Counts.ProgramsReappeared -eq 1 -and $brief.Counts.ProgramsRemovedAgain -eq 0) 'An unfinished provisioned removal prevents claiming the whole app was removed'
     Assert ($brief.Counts.Settings -eq 3 -and $brief.Counts.SettingsReappeared -eq 1 -and $brief.Counts.SettingsRestoredAgain -eq 0) 'A re-enabled service is counted even if disabling it failed'
@@ -51,6 +57,33 @@ try{
     $report.Complete=$false
     Assert ((Get-GuardBriefReport $report $true).Text -match 'Проверка не завершена') 'An interrupted check is never presented as complete'
     $report.Complete=$true
+
+    $namedReport=@{Started=$report.Started;Complete=$true;Deferred=$false;Errors=1;LogErrors=0;ViewErrors=0;Warnings=@();Items=@(
+        [pscustomobject]@{Category='capability';Name='Media.WindowsMediaPlayer~~~~0.0.12.0';Outcome='removed';Found=$true},
+        [pscustomobject]@{Category='capability';Name='Language.Speech~~~ru-RU~0.0.1.0';Outcome='pending';Found=$true},
+        [pscustomobject]@{Category='capability';Name='Language.OCR~~~en-US~0.0.1.0';Outcome='absent';Found=$false},
+        [pscustomobject]@{Category='path';Name='Windows\System32\Speech_*';Identity='C:\Windows\System32\Speech_fixture.dll';Outcome='removed';Found=$true},
+        [pscustomobject]@{Category='path';Name='Program Files\Windows Defender';Identity='C:\Program Files\Windows Defender';Outcome='removed';Found=$true},
+        [pscustomobject]@{Category='path';Name='Program Files (x86)\Windows Defender';Identity='C:\Program Files (x86)\Windows Defender';Outcome='skipped';Found=$true},
+        [pscustomobject]@{Category='path';Name='Windows\System32\CodeIntegrity.cat';Outcome='failed';Found=$true},
+        [pscustomobject]@{Category='path';Name='Missing.dll';Outcome='absent';Found=$false},
+        [pscustomobject]@{Category='path';Name='Unknown.dll';Outcome='failed';Found=$null},
+        [pscustomobject]@{Category='path';Name='Inventory fixture';Outcome='failed';Found=$true;Inventory=$true}
+    )}
+    $named=Get-GuardBriefReport $namedReport $true
+    Assert ($named.Text -match 'Компоненты Windows: найдено 2; удалено 1' -and $named.Text -match 'Файлы и каталоги: найдено 4; удалено 2') 'The named list preserves existing counters and excludes inventory rows'
+    Assert ($named.Text -match '(?m)^  - Windows Media Player — удалено\r?$' -and $named.Text -match '(?m)^  - Распознавание речи \(ru-RU\) — ожидает завершения удаления\r?$') 'Component labels retain the language and distinguish completed from pending removal'
+    Assert ($named.Text -notmatch '~|0\.0\.12\.0|C:\\|Windows\\System32') 'Found-item labels omit capability versions and full object paths'
+    Assert ($named.Text -match '(?m)^  - Speech_fixture\.dll — удалено\r?$' -and $named.Text -notmatch 'Speech_\*') 'A wildcard match displays its concrete filename'
+    Assert ($named.Text -match '  - Windows Defender \(Program Files\) — удалено' -and $named.Text -match '  - Windows Defender \(Program Files \(x86\)\) — пропущено') 'Identical leaf names retain enough parent context to tell objects apart'
+    Assert ($named.Text -match '(?m)^  - CodeIntegrity.cat — ошибка\r?$' -and $named.Text -notmatch '(?m)^  - (Missing.dll|Unknown.dll|Inventory fixture)') 'Found failures are named without claiming absence or inventory errors are found objects'
+    $config.Language='en-US'
+    $named=Get-GuardBriefReport $namedReport $true
+    Assert ($named.Text.Contains($disableCommand) -and $named.Text.Contains($enableCommand) -and $named.Text -match 'run Terminal as administrator' -and $named.Text -match 'current check will finish') 'English reports carry the same actionable commands and timing'
+    Assert ($named.Text -match 'Windows capabilities: found 2; removed 1' -and $named.Text -match 'Speech recognition \(ru-RU\) — removal pending' -and $named.Text -match 'CodeIntegrity.cat — error') 'The new summary lines also use the English UI'
+    $namedReport.Items=@([pscustomobject]@{Category='path';Name='Nothing.dll';Outcome='absent';Found=$false})
+    Assert ((Get-GuardBriefReport $namedReport $true).Text -notmatch 'Files and directories|Windows capabilities|  - ') 'No extra found-item section is shown when nothing is found'
+    $config.Language='ru-RU'
 
     & {
         $state=@{Oobe=$true;Connect=0;Launches=[Collections.Generic.List[object]]::new()}
@@ -86,17 +119,22 @@ try{
         $reportPath=Join-Path $testRoot 'guard-report.json'
         @{RunId=$current;BriefText='only this summary'}|ConvertTo-Json|Set-Content -LiteralPath $reportPath -Encoding UTF8
         Show-GuardView $testRoot Standard $current 1
-        Assert ($shown.Count -eq 1 -and $shown[0] -eq 'only this summary') 'Standard displays one completed summary without the live log'
+        Assert ($shown.Count -eq 3 -and $shown[0] -eq 'only this summary' -and $shown[1] -eq '') 'Standard displays the completed summary and a separated report location'
+        Assert ($shown[2] -eq ('Подробный отчёт: '+(Join-Path $testRoot 'guard-report.txt'))) 'The report location uses the actual support directory'
         $shown.Clear()
         Assert-Throws {Show-GuardView $testRoot Standard $old 0} 'A mismatched prior report cannot be shown as the result of this run'
         Assert (-not $shown.Count) 'A stale report produces no successful summary'
         Show-GuardView $testRoot Silent $current 0
         Assert (-not $shown.Count) 'A manual Silent viewer call also produces no output'
+        $config.Language='en-US'
+        @{RunId=$current;LogOffset=0}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $testRoot 'guard-run.json') -Encoding UTF8
+        '[END] fixture guard completed'|Set-Content -LiteralPath (Join-Path $testRoot 'guard.log') -Encoding UTF8
+        Show-GuardView $testRoot Debug $current 0
+        Assert ($shown.Count -eq 3 -and $shown[0] -match '\[END\]' -and $shown[2] -eq ('Detailed report: '+(Join-Path $testRoot 'guard-report.txt'))) 'Debug also shows the report location after its live log, in English'
+        $config.Language='ru-RU'
     }
     # The deletion fallback runs only on our own test files.
-    $t=$null;$e=$null;$ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'data\guard.ps1'),[ref]$t,[ref]$e)
-    $function=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Remove-GuardSelectedPath'},$false)
-    . ([scriptblock]::Create($function.Extent.Text))
+    # Remove-GuardSelectedPath was loaded from the embedded guest above.
     & {
         $selected=Join-Path $testRoot 'selected';$null=New-Item -ItemType Directory -Path $selected
         $victim=Join-Path $selected 'payload.dll';Set-Content -LiteralPath $victim -Value 'test payload'

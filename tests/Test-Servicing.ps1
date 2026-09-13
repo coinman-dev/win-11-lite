@@ -249,8 +249,9 @@ try{
         function Test-CanPrompt {$false}
         foreach($edition in 'Core','Professional'){
             $choice=Read-LocalAccountOptions -Build 28000 -EditionId $edition -Mode auto -Preview
-            Assert ($choice.Mode -eq 'image' -and -not $choice.Name) "26H1 $edition preview plans an account without inventing a user"
-            Assert-Throws {Read-LocalAccountOptions -Build 28000 -EditionId $edition -Mode auto} "26H1 $edition requires account input before downloads when noninteractive"
+            Assert ($choice.Mode -eq 'setup' -and -not $choice.Name) "26H1 $edition preview defaults to account entry during Windows Setup"
+            Assert ((Read-LocalAccountOptions -Build 28000 -EditionId $edition -Mode auto).Mode -eq 'setup') "26H1 $edition uses the same default without interactive input"
+            Assert-Throws {Read-LocalAccountOptions -Build 28000 -EditionId $edition -Mode image} "Explicit account creation still requires a user name when noninteractive"
         }
         Assert ((Read-LocalAccountOptions -Build 26100 -EditionId IoTEnterpriseS -Mode auto).Mode -eq 'setup') 'Existing LTSC account setup stays unchanged'
         Assert ((Read-LocalAccountOptions -Build 28000 -EditionId Core -Mode setup).Mode -eq 'setup') 'Explicit Windows account-entry mode stays available'
@@ -258,6 +259,35 @@ try{
         foreach($name in 'Administrator','defaultuser0','bad/name','..','trailing.','a,b',('a'*21)) {Assert-Throws {Assert-LocalUserName $name} 'Invalid and built-in account names are rejected'}
         $Unattend='custom.xml'
         Assert-Throws {Read-LocalAccountOptions -Build 28000 -EditionId Core -Mode image -Name TestUser} 'Local account generation does not overwrite custom answer files'
+    }
+    & {
+        # Exercise the real menu with Enter and option 2 across Windows branches.
+        $menu=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Read-Option'},$false)
+        . ([scriptblock]::Create($menu.Extent.Text))
+        function Test-CanPrompt {$true}
+        $shown=[Collections.Generic.List[string]]::new();$prompts=[Collections.Generic.List[string]]::new()
+        $answers=[Collections.Queue]::new()
+        function Write-Host {param($Object,$ForegroundColor)$shown.Add([string]$Object)}
+        function Read-Host {param($Prompt,[switch]$AsSecureString)$prompts.Add($Prompt);$answers.Dequeue()}
+        $Unattend='';$script:Lang='ru'
+        foreach($source in @(@(22000,'Core'),@(22621,'Professional'),@(22631,'Enterprise'),@(26100,'IoTEnterpriseS'),@(26200,'Professional'),@(28000,'Core'),@(28000,'Professional'))){
+            $shown.Clear();$prompts.Clear();$answers.Enqueue('')
+            $choice=Read-LocalAccountOptions -Build $source[0] -EditionId $source[1] -Mode auto
+            Assert ($choice.Mode -eq 'setup' -and -not $choice.Name -and $prompts.Count -eq 1) "Enter chooses Windows Setup for $($source -join '/') without asking for credentials"
+            Assert ($shown[1] -match '\*\s*1\. При установке Windows' -and $shown[2] -match '2\. Сейчас, до сборки ISO' -and $prompts[0] -match 'Enter — 1') 'The displayed order and default match the requested menu'
+        }
+        $shown.Clear();$prompts.Clear();$answers.Enqueue('2');$answers.Enqueue('ImageUser');$answers.Enqueue([Security.SecureString]::new())
+        $choice=Read-LocalAccountOptions -Build 26100 -EditionId IoTEnterpriseS -Mode auto
+        Assert ($choice.Mode -eq 'image' -and $choice.Name -eq 'ImageUser' -and $prompts.Count -eq 3) 'Option 2 collects the account before the build on LTSC as well'
+        $prompts.Clear()
+        $null=Read-LocalAccountOptions -Build 26100 -EditionId IoTEnterpriseS -Mode $choice.Mode -Name $choice.Name -Password $choice.Password
+        $null=Read-LocalAccountOptions -Build 28000 -EditionId Core -Mode setup
+        $null=Read-LocalAccountOptions -Build 28000 -EditionId Core -Mode auto -Preview
+        $Unattend='custom.xml';$null=Read-LocalAccountOptions -Build 28000 -EditionId Core -Mode auto
+        Assert ($prompts.Count -eq 0) 'The resolved choice, explicit setup, preview and custom answer file do not trigger a second menu'
+        $Unattend='';$script:Lang='en';$shown.Clear();$answers.Enqueue('')
+        $choice=Read-LocalAccountOptions -Build 28000 -EditionId Core -Mode auto
+        Assert ($choice.Mode -eq 'setup' -and $shown[1] -match '\*\s*1\. During Windows Setup' -and $shown[2] -match '2\. Now, before building the ISO') 'English has the same order and default'
     }
     & {
         function Test-CanPrompt {$true}

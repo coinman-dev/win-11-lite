@@ -20,7 +20,7 @@ try {
     $stubs = Join-Path $root 'stubs'
     $null = New-Item -ItemType Directory -Path $stubs
     Write-WindowsBatchFile -Path (Join-Path $stubs 'where.cmd') -Content "@echo off`nexit /b %TEST_WHERE_EXIT%"
-    Write-WindowsBatchFile -Path (Join-Path $stubs 'winget.cmd') -Content "@echo off`n>>`"%TEST_TRACE%`" echo WINGET`nexit /b %TEST_WINGET_EXIT%"
+    Write-WindowsBatchFile -Path (Join-Path $stubs 'winget.cmd') -Content "@echo off`n>>`"%TEST_TRACE%`" echo WINGET %*`nexit /b %TEST_WINGET_EXIT%"
     Write-WindowsBatchFile -Path (Join-Path $stubs 'curl.cmd') -Content "@echo off`n>>`"%TEST_TRACE%`" echo DOWNLOAD %*`n>`"%FFSETUP%`" echo dummy installer - never executed`nexit /b %TEST_CURL_EXIT%"
     Write-WindowsBatchFile -Path (Join-Path $stubs 'installer.cmd') -Content "@echo off`n>>`"%TEST_TRACE%`" echo INSTALL`nexit /b %TEST_INSTALLER_EXIT%"
     Write-WindowsBatchFile -Path (Join-Path $stubs 'timeout.cmd') -Content "@echo off`nexit /b 1"
@@ -84,10 +84,13 @@ try {
                 $errorText = $stderr.GetAwaiter().GetResult()
                 $events = [IO.File]::ReadAllText($trace, [Text.Encoding]::UTF8)
                 $label = "$tag/$($case.Name)"
+                if ($case.Where -eq 0) {
+                    Assert ($events -match 'WINGET install --id Mozilla\.Firefox -e --source winget --accept-package-agreements --accept-source-agreements') "Firefox selects the winget source without querying msstore ($label)"
+                }
                 Assert ($process.ExitCode -eq $case.Exit) "Exit code ($label): $($process.ExitCode); stdout=$output; stderr=$errorText"
                 Assert ($errorText.Trim().Length -eq 0) "CMD parsing ($label): $errorText"
                 Assert (($events -match 'DOWNLOAD') -eq $case.Download) "Download branch ($label)"
-                Assert (($events -match 'INSTALL') -eq $case.Install) "Installer branch ($label)"
+                Assert (($events -match '(?m)^INSTALL\r?$') -eq $case.Install) "Installer branch ($label)"
                 Assert (@(Get-ChildItem -LiteralPath $caseDir -Filter 'Win11Lite-Firefox-*.exe').Count -eq 0) "Temporary installer cleanup ($label)"
                 if ($case.Download) {
                     Assert ($events.Contains("https://download.mozilla.org/?product=firefox-latest&os=win64&lang=$tag")) "Mozilla URL remains a single argument ($label)"

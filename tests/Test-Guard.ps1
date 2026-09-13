@@ -50,6 +50,12 @@ try{
     $cfg=Get-Content -LiteralPath (Join-Path $guardDir 'guard.json') -Raw | ConvertFrom-Json
     Assert ($cfg.Mode -eq 'Standard' -and $cfg.ViewerTask -and -not (Get-Member -InputObject $cfg -Name Language)) 'Guard targets are embedded with the chosen mode and no duplicate language setting'
     Assert (@($cfg.Apps | Where-Object {'Microsoft.BingWeather' -match $_}).Count -gt 0) 'Consumer app rules reach guard'
+    foreach($name in 'Microsoft.ZuneMusic','Microsoft.ZuneVideo','Microsoft.GamingApp','Microsoft.XboxGamingOverlay','Microsoft.XboxSpeechToTextOverlay','Microsoft.Todos','MicrosoftCorporationII.MicrosoftFamily'){
+        Assert (@($cfg.Apps | Where-Object {$name -match $_}).Count -gt 0) "Selected app removal reaches guard: $name"
+    }
+    foreach($name in 'Microsoft.DesktopAppInstaller','Microsoft.XboxIdentityProvider','Microsoft.Xbox.TCUI','Microsoft.HEVCVideoExtension'){
+        Assert (@($cfg.Apps | Where-Object {$name -match $_}).Count -eq 0) "Entertainment rules do not select $name in guard"
+    }
     Assert (@($cfg.Capabilities | Where-Object {'App.StepsRecorder~~~~0.0.1.0' -match $_}).Count -gt 0) 'Build capability rules reach guard'
     Assert (-not @($cfg.Paths | Where-Object {$_ -match 'EdgeWebView|NativeImages|WinSxS\\Backup'}).Count) 'Balanced guard preserves WebView2, NGEN and component backups'
     Assert (@($cfg.Protected | Where-Object {'Microsoft.Windows.Sense.Client~~~~' -match $_}).Count -gt 0) 'Guard does not repeatedly uninstall permanent Sense capability'
@@ -57,10 +63,13 @@ try{
         Assert (@($cfg.Protected | Where-Object {$name -match $_}).Count -gt 0) "Balanced app platform protection reaches guard: $name"
     }
     Assert (-not @($cfg.Services | Where-Object {$_ -in @('AppXSvc','ClipSVC','InstallService','LicenseManager','StateRepository','AppReadiness','TokenBroker','BITS','wuauserv','DoSvc','mpssvc')}).Count) 'Guard does not disable application deployment, licensing or Store download services'
-    $Keep=@('Apps','Speech'); $RemoveExtra=@('^Language')
+    $Keep=@('Apps','Speech','WMP'); $RemoveExtra=@('^Language')
     & ([scriptblock]::Create($node.Extent.Text))
     $kept=Get-Content -LiteralPath (Join-Path $guardDir 'guard.json') -Raw | ConvertFrom-Json
     Assert (-not @($kept.Apps | Where-Object {'Microsoft.BingWeather' -match $_}).Count) 'Keep Apps also applies to guard'
+    foreach($name in 'Microsoft.ZuneMusic','Microsoft.ZuneVideo','Microsoft.GamingApp','Microsoft.XboxGamingOverlay','Microsoft.Todos','MicrosoftCorporationII.MicrosoftFamily'){
+        Assert (-not @($kept.Apps | Where-Object {$name -match $_}).Count) "Keep WMP/Apps also protects $name from guard"
+    }
     Assert (@($kept.Protected | Where-Object {'Language.Speech~~~en-US~0.0.1.0' -match $_}).Count -gt 0) 'Keep Speech is protected even from RemoveExtra'
     $Keep=@(); $RemoveExtra=@()
 
@@ -174,6 +183,10 @@ try{
             Assert (@($report.Items|Where-Object{$_.Category -eq 'app' -and $_.Name -eq 'Microsoft.BingWeather' -and $_.Found -and $_.Outcome -eq 'removed'}).Count -eq 1) 'Report names apps that were found and successfully removed'
             Assert (@($report.Items|Where-Object{$_.Repeated}).Count -eq 0) 'First report does not invent repeated changes'
             $human=Get-Content -LiteralPath (Join-Path $root 'guard-report.txt') -Raw
+            $short=Get-Content -LiteralPath (Join-Path $root 'guard-summary.txt') -Raw
+            foreach($document in @($human,$short,$report.BriefText)){
+                Assert ($document.Contains('schtasks.exe /Change /TN "\win-11-lite guard" /Disable') -and $document.Contains('schtasks.exe /Change /TN "\win-11-lite guard" /Enable')) 'Both guard control commands survive report publication'
+            }
             Assert ($human -match 'SERVICES AND DRIVERS' -and $human -match 'Before: startup: disabled; state: running' -and $human -match 'successfully removed') 'Human report contains categories, names, previous state and actual outcomes'
             $fixture.Policy=1;$fixture.ServiceStart=2;$service.Status='Running';$calls.Clear()
             & $guest -Mode guard -Direct
