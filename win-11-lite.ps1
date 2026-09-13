@@ -1092,6 +1092,42 @@ function Assert-LocalUserName {
     }
 }
 
+function Test-SecureStringEqual {
+    param([Security.SecureString]$Left,[Security.SecureString]$Right)
+    if ($null -eq $Left -or $null -eq $Right) { return $null -eq $Left -and $null -eq $Right }
+    if ($Left.Length -ne $Right.Length) { return $false }
+    $leftPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Left)
+    $rightPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Right)
+    try {
+        $difference = 0
+        for ($index = 0; $index -lt $Left.Length; $index++) {
+            $difference = $difference -bor (
+                [Runtime.InteropServices.Marshal]::ReadInt16($leftPointer, $index * 2) -bxor
+                [Runtime.InteropServices.Marshal]::ReadInt16($rightPointer, $index * 2)
+            )
+        }
+        return $difference -eq 0
+    } finally {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($leftPointer)
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($rightPointer)
+    }
+}
+
+function Read-ConfirmedLocalAccountPassword {
+    while ($true) {
+        $password = Read-Host (T '  Пароль (пусто — без пароля)' '  Password (empty for no password)') -AsSecureString
+        if ($password.Length -eq 0) { return $password }
+        $confirmation = Read-Host (T '  Подтвердите пароль' '  Confirm password') -AsSecureString
+        if (Test-SecureStringEqual -Left $password -Right $confirmation) {
+            $confirmation.Dispose()
+            return $password
+        }
+        $password.Dispose()
+        $confirmation.Dispose()
+        Write-Host (T '  Пароли не совпадают. Введите пароль ещё раз.' '  Passwords do not match. Enter the password again.') -ForegroundColor Yellow
+    }
+}
+
 function Read-LocalAccountOptions {
     param([int]$Build,[string]$EditionId,[string]$Mode,[string]$Name,[Security.SecureString]$Password,[switch]$Preview)
     $resolved = Resolve-AccountMode -Build $Build -EditionId $EditionId -Mode $Mode -Name $Name -AnswerFile $Unattend
@@ -1103,7 +1139,7 @@ function Read-LocalAccountOptions {
             $Name = (Read-Host (T '  Имя локального пользователя' '  Local user name')).Trim()
             Assert-LocalUserName $Name
             Write-Note (T 'Пароль попадёт в установочный answer-файл ISO; кодирование Windows не является шифрованием.' 'The password is stored in the ISO answer file; Windows encoding is not encryption.')
-            $Password = Read-Host (T '  Пароль (пусто — без пароля)' '  Password (empty for no password)') -AsSecureString
+            $Password = Read-ConfirmedLocalAccountPassword
         }
     }
     if ($Name) { Assert-LocalUserName $Name }

@@ -7,7 +7,7 @@ $repo=Split-Path $PSScriptRoot -Parent
 $t=$null;$e=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'win-11-lite.ps1'),[ref]$t,[ref]$e)
 if($e.Count){throw ($e|Out-String)}
-foreach($name in 'T','Get-WimImageList','Get-NativeToolVersion','Save-DeploymentTools','Initialize-DeploymentTools','Ensure-WimMountDriver','Read-PreparedCache','Write-PreparedCache','Assert-ChildPath','Invoke-NativeQuiet','Test-DismSuccess','Resolve-AccountMode','Assert-LocalUserName','Read-LocalAccountOptions','Get-LocalAccountXml','Get-ImageInstallXml','Get-ProductKeyUiMode','Get-ElevationCommand'){
+foreach($name in 'T','Get-WimImageList','Get-NativeToolVersion','Save-DeploymentTools','Initialize-DeploymentTools','Ensure-WimMountDriver','Read-PreparedCache','Write-PreparedCache','Assert-ChildPath','Invoke-NativeQuiet','Test-DismSuccess','Resolve-AccountMode','Assert-LocalUserName','Test-SecureStringEqual','Read-ConfirmedLocalAccountPassword','Read-LocalAccountOptions','Get-LocalAccountXml','Get-ImageInstallXml','Get-ProductKeyUiMode','Get-ElevationCommand'){
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     if(-not $node){throw "Missing function: $name"}
     . ([scriptblock]::Create($node.Extent.Text))
@@ -108,6 +108,32 @@ try{
         foreach($name in 'Administrator','defaultuser0','bad/name','..','trailing.','a,b',('a'*21)) {Assert-Throws {Assert-LocalUserName $name} 'Invalid and built-in account names are rejected'}
         $Unattend='custom.xml'
         Assert-Throws {Read-LocalAccountOptions -Build 28000 -EditionId Core -Mode image -Name TestUser} 'Local account generation does not overwrite custom answer files'
+    }
+    & {
+        function Test-CanPrompt {$true}
+        function Read-Option {param($Question,$Items,$Values,$Default) 'image'}
+        $responses=[Collections.Queue]::new()
+        $responses.Enqueue('TestUser')
+        $responses.Enqueue((ConvertTo-SecureString 'first attempt' -AsPlainText -Force))
+        $responses.Enqueue((ConvertTo-SecureString 'different attempt' -AsPlainText -Force))
+        $responses.Enqueue((ConvertTo-SecureString 'final password' -AsPlainText -Force))
+        $responses.Enqueue((ConvertTo-SecureString 'final password' -AsPlainText -Force))
+        $prompts=[Collections.Generic.List[string]]::new();$warnings=[Collections.Generic.List[string]]::new()
+        function Read-Host {param($Prompt,[switch]$AsSecureString)$prompts.Add($Prompt);$responses.Dequeue()}
+        function Write-Host {param($Object,$ForegroundColor)if($Object -match 'Passwords do not match'){$warnings.Add($Object)}}
+        $Unattend=''
+        $choice=Read-LocalAccountOptions -Build 28000 -EditionId Core -Mode auto
+        $expected=ConvertTo-SecureString 'final password' -AsPlainText -Force
+        Assert ($choice.Mode -eq 'image' -and $choice.Name -eq 'TestUser' -and (Test-SecureStringEqual $choice.Password $expected)) 'Interactive account creation keeps only the confirmed password'
+        Assert ($prompts.Count -eq 5 -and $prompts[2] -match 'Confirm password' -and $prompts[4] -match 'Confirm password' -and $warnings.Count -eq 1) 'Mismatched passwords require entering and confirming the password again'
+        $emptySecure=[Security.SecureString]::new()
+        $blank=[Collections.Queue]::new();$blank.Enqueue('NoPassword');$blank.Enqueue($emptySecure)
+        $prompts.Clear();$responses=$blank
+        $empty=Read-LocalAccountOptions -Build 28000 -EditionId Core -Mode auto
+        Assert ($empty.Password.Length -eq 0 -and $prompts.Count -eq 2) 'An empty password remains allowed and does not require confirmation'
+        $provided=ConvertTo-SecureString 'command line password' -AsPlainText -Force
+        $direct=Read-LocalAccountOptions -Build 28000 -EditionId Core -Mode image -Name ExplicitUser -Password $provided
+        Assert ((Test-SecureStringEqual $direct.Password $provided) -and $prompts.Count -eq 2) 'Explicit SecureString parameters are retained without an interactive second prompt'
     }
     $password=ConvertTo-SecureString 'Fixture password & 7' -AsPlainText -Force
     $receiver=Join-Path $root 'account-parameters.ps1'
