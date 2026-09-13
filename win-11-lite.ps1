@@ -2031,36 +2031,511 @@ timeout /t 3 >nul 2>&1
 "@
 }
 
-#region Bundled resources
-# Generated from data/ by tools/Update-BundledResources.ps1. No external files are read at runtime.
-function Get-BundledResource {
+#region Guest script
+# The single guest runtime, written into the image as
+# %SystemRoot%\Setup\Scripts\Win11Lite\Win11Lite.ps1. This literal is the only
+# copy: edit it here. No separate file, archive or download is involved.
+function Get-GuestScript {
+    $text = @'
+#Requires -Version 5.1
+# win-11-lite guest runtime. One file covers the Windows Setup hooks, the first
+# logon finalizer, the guard worker and the guard report window. The builder
+# writes it into %SystemRoot%\Setup\Scripts\Win11Lite together with
+# build-info.json, which carries every choice made at build time.
+param(
+    # Only the mode is positional, so a mangled task action cannot slip an
+    # unexpected value into another parameter.
+    [Parameter(Position=0)][ValidateSet('prepare','prepare-register','finalize','finalize-wait','guard','view')][string]$Mode,
+    # Without -Direct the mode runs in a child process without a window, so its
+    # output and exit code are kept in launcher.log.
+    [switch]$Direct,
+    [string]$RunId,
+    [ValidateRange(0,86400)][int]$WaitSeconds = 0,
+    [Parameter(ValueFromRemainingArguments=$true)][string[]]$ExtraArguments
+)
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$script:Support = $PSScriptRoot
+$script:BuildInfo = $null
+try { $script:BuildInfo = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'build-info.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
+$logFile = Join-Path $PSScriptRoot 'guard.log'
+function T { param([string]$Ru, [string]$En) if ([string]$script:BuildInfo.Language -like 'ru*') { $Ru } else { $En } }
+# Build choices are required, never guessed: a missing value is a broken image.
+function Get-BuildSetting {
     param([Parameter(Mandatory)][string]$Name)
-    $text = switch ($Name) {
-        'guard.ps1' {
-'#Requires -Version 5.1
-param([switch]$View, [switch]$Watch, [switch]$ShowDebugWindow, [string]$RunId, [int]$WaitSeconds = 120)
-$ErrorActionPreference = ''Stop''
-$ProgressPreference = ''SilentlyContinue''
-$config = Get-Content -LiteralPath (Join-Path $PSScriptRoot ''guard.json'') -Raw | ConvertFrom-Json
-function T { param([string]$Ru, [string]$En) if ($config.Language -like ''ru*'') { $Ru } else { $En } }
-$logFile = Join-Path $PSScriptRoot ''guard.log''
-$reportFile = Join-Path $PSScriptRoot ''guard-report.txt''
-. (Join-Path $PSScriptRoot ''Guard.UI.ps1'')
-$guardMode=Get-GuardMode $config
-if($View -or $Watch -or $ShowDebugWindow){
-    $mode=if($Watch -or $ShowDebugWindow){''Debug''}else{$guardMode}
-    try{Show-GuardView -SupportDirectory $PSScriptRoot -Mode $mode -RunId $RunId -WaitSeconds $WaitSeconds}
-    catch{
-        Write-Host (T ''Не удалось показать отчёт guard. Подробности доступны в папке guard.'' ''Could not display the guard report. Details are available in the guard folder.'') -ForegroundColor Red
-        if($mode -eq ''Debug''){Write-Host $_.Exception.Message -ForegroundColor Red}
-        $null=Read-Host (T ''Нажмите Enter, чтобы закрыть окно'' ''Press Enter to close'')
-        exit 1
+    if ($null -eq $script:BuildInfo -or $null -eq $script:BuildInfo.$Name) {
+        throw (T "В build-info.json нет значения $Name" "build-info.json has no $Name value")
     }
-    return
+    $script:BuildInfo.$Name
 }
+function Get-GuestFlag { param([Parameter(Mandatory)][string]$Name) [bool](Get-BuildSetting -Name $Name) }
+function Write-GuestLog {
+    param([string]$File, [string]$Message)
+    $path = Join-Path $script:Support $File
+    for ($attempt = 0; $attempt -lt 5; $attempt++) {
+        try { [IO.File]::AppendAllText($path, "$(Get-Date -Format s) [$Mode] $Message`r`n", [Text.UTF8Encoding]::new($true)); return }
+        catch [IO.IOException] { Start-Sleep -Milliseconds 50 }
+        catch [UnauthorizedAccessException] { return } # A limited report process can read this folder.
+    }
+}
+function Write-RunnerLog   { param([string]$Message) Write-GuestLog 'launcher.log' $Message }
+function Write-PrepareLog  { param([string]$Message) Write-GuestLog 'prepare.log' $Message }
+function Write-FinalizeLog { param([string]$Message) Write-GuestLog 'finalize.log' $Message }
+function Test-NativeOobeComplete {
+    if (-not ('Win11Lite.Oobe' -as [type])) {
+        Add-Type -TypeDefinition @"
+using System.Runtime.InteropServices;
+namespace Win11Lite {
+    public static class Oobe {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool OOBEComplete([MarshalAs(UnmanagedType.Bool)] out bool complete);
+    }
+}
+"@
+    }
+    $complete = $false
+    if (-not [Win11Lite.Oobe]::OOBEComplete([ref]$complete)) {
+        throw (T "Не удалось проверить окончание OOBE: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" "Could not query OOBE completion: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())")
+    }
+    $complete
+}
+# Finalize keeps waiting rather than failing when the probe is unavailable.
+function Test-OobeComplete {
+    try { Test-NativeOobeComplete }
+    catch {
+        if ($script:OobeProbeError -ne $_.Exception.Message) {
+            Write-FinalizeLog (T "WAIT: состояние OOBE недоступно: $($_.Exception.Message)" "WAIT: OOBE state unavailable: $($_.Exception.Message)")
+        }
+        $script:OobeProbeError = $_.Exception.Message
+        $false
+    }
+}
+# Runs the requested mode as a hidden child of this same file, keeping its
+# output and exit code in launcher.log. Windows Setup entry points may still
+# flash the first console; no launcher executable is involved.
+function Start-GuestChild {
+    param([Parameter(Mandatory)][string]$ChildMode)
+    $psi = [Diagnostics.ProcessStartInfo]::new()
+    $psi.FileName = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $psi.Arguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $PSCommandPath + '" -Mode ' + $ChildMode + ' -Direct'
+    $psi.WorkingDirectory = $script:Support
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden
+    $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+    # Windows PowerShell uses the system OEM code page when its output is redirected.
+    $codePage = [int](Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage' -Name OEMCP).OEMCP
+    $psi.StandardOutputEncoding = [Text.Encoding]::GetEncoding($codePage)
+    $psi.StandardErrorEncoding = $psi.StandardOutputEncoding
+    $process = [Diagnostics.Process]::new(); $process.StartInfo = $psi
+    try {
+        if (-not $process.Start()) { throw 'PowerShell did not start' }
+        Write-RunnerLog "START PID=$($process.Id)"
+        $process.StandardInput.Close()
+        $stdout = $process.StandardOutput.ReadToEndAsync(); $stderr = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $output = $stdout.GetAwaiter().GetResult(); $errorText = $stderr.GetAwaiter().GetResult()
+        if ($output.Trim()) { Write-RunnerLog $output.Trim() }
+        if ($errorText.Trim()) { Write-RunnerLog ('STDERR ' + $errorText.Trim()) }
+        $code = $process.ExitCode; Write-RunnerLog "END ExitCode=$code"
+        $code
+    } finally { $process.Dispose() }
+}
+
+# ── Windows Setup: specialize and SetupComplete ────────────────────────────────
+
+function Invoke-Prepare {
+    param([switch]$RegisterOnly)
+    Write-PrepareLog (T "START: RegisterOnly=$RegisterOnly; пользователь=$env:USERNAME" "START: RegisterOnly=$RegisterOnly; user=$env:USERNAME")
+    # The answer file runs finalize directly at the first real user logon.
+    # Scheduler availability during specialize must not prevent network blocking.
+    if ((Get-GuestFlag 'OobeNetworkBlock') -and -not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'oobe-complete'))) {
+        # Блок действует и для интерфейсов, которые PnP добавит после specialize.
+        # SetupComplete повторяет проверку: RegisterOnly больше не пропускает сеть.
+        $firewallName = 'Win11Lite-OOBE-Temporary-Outbound-Block'
+        $firewallReady = $false
+        try {
+            $rule = Get-NetFirewallRule -Name $firewallName -PolicyStore PersistentStore -ErrorAction SilentlyContinue
+            if ($rule) {
+                Set-NetFirewallRule -Name $firewallName -PolicyStore PersistentStore -Enabled True -Direction Outbound -Action Block -Profile Any | Out-Null
+            } else {
+                New-NetFirewallRule -Name $firewallName -DisplayName $firewallName -PolicyStore PersistentStore -Enabled True -Direction Outbound -Action Block -Profile Any | Out-Null
+            }
+            $firewallReady = $true
+            Write-PrepareLog (T 'OOBE: временная блокировка исходящей сети включена' 'OOBE: temporary outbound network block enabled')
+        } catch {
+            Write-PrepareLog (T "OOBE: блокировка брандмауэра недоступна: $($_.Exception.Message); проверяю адаптеры" "OOBE: firewall block unavailable: $($_.Exception.Message); checking adapters")
+        }
+        $statePath = Join-Path $PSScriptRoot 'network-state.clixml'
+        $saved = @()
+        if (Test-Path -LiteralPath $statePath) { $saved = @(Import-Clixml -LiteralPath $statePath) }
+        $allAdapters = @()
+        for ($attempt = 0; $attempt -lt 15; $attempt++) {
+            try { $allAdapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop) }
+            catch {
+                if ($attempt -eq 14) {
+                    Write-PrepareLog (T "OOBE: ошибка получения адаптеров: $($_.Exception.Message)" "OOBE: adapter enumeration failed: $($_.Exception.Message)")
+                    if ($firewallReady) { break }
+                    throw
+                }
+            }
+            if ($allAdapters.Count) { break }
+            if ($attempt -lt 14) { Start-Sleep -Seconds 1 }
+        }
+        $adapters = @($allAdapters | Where-Object { [string]$_.AdminStatus -in @('Up', '1') })
+        $saved = @(@($saved) + @($adapters | Select-Object InterfaceGuid) | Sort-Object InterfaceGuid -Unique)
+        Export-Clixml -LiteralPath $statePath -InputObject $saved
+        foreach ($adapter in $adapters) { $adapter | Disable-NetAdapter -Confirm:$false }
+        foreach ($adapter in $adapters) { Write-PrepareLog (T "OOBE: отключён $($adapter.Name), GUID=$($adapter.InterfaceGuid)" "OOBE: disabled $($adapter.Name), GUID=$($adapter.InterfaceGuid)") }
+        $changedIds = @($adapters | ForEach-Object { [string]$_.InterfaceGuid })
+        for ($attempt = 0; $attempt -lt 5; $attempt++) {
+            $remaining = @(Get-NetAdapter -IncludeHidden | Where-Object { [string]$_.InterfaceGuid -in $changedIds -and [string]$_.AdminStatus -in @('Up','1') })
+            if (-not $remaining.Count) { break }
+            Start-Sleep -Milliseconds 500
+        }
+        if ($remaining.Count) {
+            $message = T 'Не все адаптеры отключены для OOBE' 'Some adapters remain enabled for OOBE'
+            Write-PrepareLog $message
+            throw $message
+        }
+        Write-PrepareLog (T "OOBE: отключено адаптеров $($adapters.Count); сохранено для восстановления $($saved.Count)" "OOBE: $($adapters.Count) adapters disabled; $($saved.Count) saved for restoration")
+        if (-not $allAdapters.Count) {
+            if (-not $firewallReady) { throw (T 'OOBE: нет доступных адаптеров и не удалось установить сетевой блок; отключение сети не подтверждено' 'OOBE: no adapters are available and firewall blocking failed; network isolation is unconfirmed') }
+            Write-PrepareLog (T 'OOBE: адаптеры пока не появились; остаётся временный сетевой блок, SetupComplete повторит проверку' 'OOBE: no adapters have appeared yet; temporary network block remains and SetupComplete will retry')
+        }
+    }
+    try {
+    $taskName = 'win-11-lite finalize'
+    $exe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    $runnerArguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}\Win11Lite.ps1" -Mode ' -f $PSScriptRoot
+    $action = New-ScheduledTaskAction -Execute $exe -Argument ($runnerArguments + 'finalize-wait')
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    $trigger.Delay = 'PT30S'
+    $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 20)
+    $finalizeSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 3)
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $finalizeSettings -Force | Out-Null
+    if ((Get-GuestFlag 'Guard')) {
+        $guardAction = New-ScheduledTaskAction -Execute $exe -Argument ($runnerArguments + 'guard')
+        Register-ScheduledTask -TaskName 'win-11-lite guard' -Action $guardAction -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+        $viewerMode=(Get-BuildSetting 'GuardMode')
+        $guardConfigPath=Join-Path $PSScriptRoot 'guard.json'
+        if(Test-Path -LiteralPath $guardConfigPath){$viewerMode=Get-GuardMode (Get-Content -LiteralPath $guardConfigPath -Raw|ConvertFrom-Json)}
+        Register-GuardViewerTask -SupportDirectory $PSScriptRoot -Mode $viewerMode
+    }
+    Write-PrepareLog (T 'Задачи первого входа зарегистрированы' 'First-logon tasks registered')
+    } catch {
+        Write-PrepareLog (T "Планировщик недоступен: $($_.Exception.Message)" "Task Scheduler unavailable: $($_.Exception.Message)")
+        if (-not (Get-GuestFlag 'ManageOobe')) { throw }
+        Write-PrepareLog (T 'Завершение установки выполнит FirstLogonCommands' 'FirstLogonCommands will finalize setup')
+    }
+}
+
+# ── First logon: network, updates and Edge ─────────────────────────────────────
+
+# Reports through $script:FinalizeFailed so the guard worker can call it in
+# process without an exit code ending the whole run.
+function Invoke-Finalize {
+    param([switch]$EdgeOnly, [switch]$FirstLogon, [switch]$WaitForOobe, [ValidateRange(1,86400)][int]$WaitSeconds = 7200)
+    Write-FinalizeLog (T "START: FirstLogon=$FirstLogon; WaitForOobe=$WaitForOobe; EdgeOnly=$EdgeOnly; пользователь=$env:USERNAME" "START: FirstLogon=$FirstLogon; WaitForOobe=$WaitForOobe; EdgeOnly=$EdgeOnly; user=$env:USERNAME")
+    if (-not $EdgeOnly) {
+        if ($env:USERNAME -match '^defaultuser\d+$') { Write-FinalizeLog (T 'SKIP: временный пользователь OOBE' 'SKIP: temporary OOBE user'); return }
+        $complete = Test-OobeComplete
+        if (-not $complete -and $WaitForOobe) {
+            Write-FinalizeLog (T 'WAIT: OOBE ещё выполняется, сеть остаётся заблокирована' 'WAIT: OOBE is still running; network remains blocked')
+            $deadline = (Get-Date).AddSeconds($WaitSeconds)
+            while (-not (Test-OobeComplete)) {
+                if ((Get-Date) -ge $deadline) { throw (T 'Истекло ожидание OOBE; задача сохранена для следующего входа' 'OOBE wait timed out; task retained for next logon') }
+                Start-Sleep -Seconds 2
+            }
+        } elseif (-not $complete) {
+            Write-FinalizeLog (T 'WAIT: первый вход ещё не подтверждает окончание OOBE' 'WAIT: first logon does not yet confirm OOBE completion')
+            if ($FirstLogon) {
+                # Не удерживаем FirstLogonCommands: это может задержать открытие рабочего стола.
+                $exe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+                Start-Process -FilePath $exe -WindowStyle Hidden -ArgumentList ('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}\Win11Lite.ps1" -Mode finalize-wait' -f $PSScriptRoot) | Out-Null
+            }
+            return
+        }
+        Write-FinalizeLog 'OOBEComplete=True'
+    }
+    # The logon task and FirstLogonCommands may start together; allow one finalizer.
+    try { $finalizeLock = [IO.File]::Open((Join-Path $PSScriptRoot 'finalize.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    catch [IO.IOException] { return }
+    try {
+    $script:FinalizeFailed = $false
+    if (-not $EdgeOnly -and (Get-GuestFlag 'ManageOobe')) {
+        # Поздний SetupComplete не должен снова отключать сеть после завершения OOBE.
+        try { Set-Content -LiteralPath (Join-Path $PSScriptRoot 'oobe-complete') -Value (Get-Date -Format o) -Encoding ascii }
+        catch { $script:FinalizeFailed = $true; Write-FinalizeLog (T "Не удалось записать окончание OOBE: $($_.Exception.Message)" "Could not record OOBE completion: $($_.Exception.Message)") }
+    }
+    try {
+        if ((Get-GuestFlag 'RemoveEdge')) {
+            # EdgeUpdate/WebView2 and their shared EdgeCore files are preserved.
+            foreach ($programRoot in @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Select-Object -Unique) {
+                if (-not $programRoot) { continue }
+                $browser = [IO.Path]::GetFullPath((Join-Path $programRoot 'Microsoft\Edge'))
+                if (-not $browser.StartsWith(([IO.Path]::GetFullPath($programRoot).TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase)) { throw (T 'Неверный путь Edge' 'Invalid Edge path') }
+                if (Test-Path -LiteralPath $browser) {
+                    $cursor = $browser
+                    while ($cursor) {
+                        if ((Get-Item -LiteralPath $cursor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw (T "Обнаружена ссылка файловой системы: $cursor" "Reparse point: $cursor") }
+                        $cursor = Split-Path $cursor -Parent
+                    }
+                    Get-Process -Name msedge -ErrorAction SilentlyContinue | Where-Object {
+                        $_.Path -and $_.Path.StartsWith("$browser\", [StringComparison]::OrdinalIgnoreCase)
+                    } | Stop-Process -Force
+                    & {
+                        # takeown/icacls write to stderr; under PowerShell 5.1 with Stop that would throw before Remove-Item.
+                        $ErrorActionPreference = 'Continue'
+                        & takeown.exe /F $browser /A /R /D Y *> $null
+                        & icacls.exe $browser /grant '*S-1-5-18:(OI)(CI)F' /T /C /Q *> $null
+                    }
+                    Remove-Item -LiteralPath $browser -Recurse -Force
+                    if (Test-Path -LiteralPath $browser) { throw (T "Не удалось удалить Edge: $browser" "Edge removal failed: $browser") }
+                }
+            }
+            $stable = '{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}'
+            foreach ($view in @('SOFTWARE', 'SOFTWARE\WOW6432Node')) {
+                foreach ($suffix in @("Microsoft\EdgeUpdate\Clients\$stable", "Microsoft\EdgeUpdate\ClientState\$stable", "Microsoft\EdgeUpdate\ClientStateMedium\$stable", 'Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge', 'Microsoft\Windows\CurrentVersion\App Paths\msedge.exe', 'Clients\StartMenuInternet\Microsoft Edge')) {
+                    $key = "HKLM:\$view\$suffix"
+                    if (Test-Path -LiteralPath $key) { Remove-Item -LiteralPath $key -Recurse -Force }
+                }
+            }
+            $shortcuts = @((Join-Path $env:PUBLIC 'Desktop\Microsoft Edge.lnk'), (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk'))
+            foreach ($profile in Get-CimInstance Win32_UserProfile | Where-Object { -not $_.Special -and $_.LocalPath }) {
+                $shortcuts += Join-Path $profile.LocalPath 'Desktop\Microsoft Edge.lnk'
+            }
+            foreach ($shortcut in $shortcuts) { if (Test-Path -LiteralPath $shortcut) { Remove-Item -LiteralPath $shortcut -Force } }
+        }
+    } catch {
+        $script:FinalizeFailed = $true
+        Write-FinalizeLog $_.Exception.Message
+    } finally {
+        # Always restore connectivity, even if optional cleanup failed.
+        if (-not $EdgeOnly -and (Get-GuestFlag 'ManageOobe')) {
+        try {
+            $statePath = Join-Path $PSScriptRoot 'network-state.clixml'
+            if (Test-Path -LiteralPath $statePath) {
+                $saved = @(Import-Clixml -LiteralPath $statePath)
+                foreach ($adapter in Get-NetAdapter -IncludeHidden) {
+                    if ([string]$adapter.InterfaceGuid -in @($saved | ForEach-Object { [string]$_.InterfaceGuid })) {
+                        $adapter | Enable-NetAdapter -Confirm:$false
+                        Write-FinalizeLog (T "Сеть: включён GUID=$($adapter.InterfaceGuid)" "Network: enabled GUID=$($adapter.InterfaceGuid)")
+                    }
+                }
+                Remove-Item -LiteralPath $statePath -Force
+            }
+        } catch {
+            $script:FinalizeFailed = $true
+            Write-FinalizeLog (T "Ошибка возврата адаптеров: $($_.Exception.Message)" "Adapter restoration failed: $($_.Exception.Message)")
+        }
+        # Независимо от отказа отдельного адаптера снимаем только собственный сетевой блок.
+        if ((Get-GuestFlag 'OobeNetworkBlock')) {
+        try {
+            $firewallName = 'Win11Lite-OOBE-Temporary-Outbound-Block'
+            # Не путать недоступность провайдера с отсутствием правила.
+            $rules = @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop | Where-Object { $_.Name -eq $firewallName })
+            if ($rules.Count) {
+                Remove-NetFirewallRule -Name $firewallName -PolicyStore PersistentStore -ErrorAction Stop
+                Write-FinalizeLog (T 'Сеть: временная блокировка брандмауэра снята' 'Network: temporary firewall block removed')
+            }
+        } catch {
+            $script:FinalizeFailed = $true
+            Write-FinalizeLog (T "Ошибка снятия сетевого блока: $($_.Exception.Message)" "Network block removal failed: $($_.Exception.Message)")
+        }
+        }
+        try {
+            foreach ($entry in @(
+                @('HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU', 'NoAutoUpdate'),
+                @('HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate', 'DoNotConnectToWindowsUpdateInternetLocations'),
+                @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE', 'DisableOOBEUpdate')
+            )) {
+                if (Get-ItemProperty -LiteralPath $entry[0] -Name $entry[1] -ErrorAction SilentlyContinue) {
+                    Remove-ItemProperty -LiteralPath $entry[0] -Name $entry[1]
+                }
+            }
+        } catch {
+            $script:FinalizeFailed = $true
+            Write-FinalizeLog ((T 'Ошибка восстановления' 'Restore failed') + ": $($_.Exception.Message)")
+        }
+        }
+    }
+    if (-not $script:FinalizeFailed -and -not $EdgeOnly) {
+        Write-FinalizeLog (T 'Завершение установки выполнено' 'Finalization completed')
+        Unregister-ScheduledTask -TaskName 'win-11-lite finalize' -Confirm:$false -ErrorAction SilentlyContinue
+    }
+    } finally { $finalizeLock.Dispose() }
+}
+
+# ── Guard report window and its on-demand task ────────────────────────────────
+
+# Guard presentation and report-task helpers.
+function Get-GuardMode {
+    param($Config)
+    if($Config.Mode -in @('Debug','Standard','Silent')){return [string]$Config.Mode}
+    'Standard'
+}
+
+function Get-GuardExpectedApps {
+    param($Config)
+    $known=@('Microsoft.SecHealthUI','Microsoft.Copilot','Microsoft.Windows.Ai.Copilot.Provider','Clipchamp.Clipchamp','Microsoft.BingNews','Microsoft.BingWeather','Microsoft.GetHelp','Microsoft.Getstarted','Microsoft.MicrosoftOfficeHub','Microsoft.MicrosoftSolitaireCollection','Microsoft.WindowsFeedbackHub','Microsoft.YourPhone','Microsoft.OutlookForWindows','MicrosoftTeams','MSTeams')
+    if($Config.ExpectedApps){$known=@($Config.ExpectedApps)}
+    foreach($name in $known){
+        if(@($Config.Protected|Where-Object{$_ -and $name -match $_}).Count){continue}
+        if(@($Config.Apps|Where-Object{$_ -and $name -match $_}).Count){$name}
+    }
+}
+
+function New-GuardViewerAction {
+    param([string]$SupportDirectory)
+    $powershell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    # Task Scheduler substitutes the worker's GUID; no intermediate console.
+    $arguments='-NoLogo -NoProfile -ExecutionPolicy Bypass -File "'+(Join-Path $SupportDirectory 'Win11Lite.ps1')+'" -Mode view -RunId "$(Arg0)"'
+    New-ScheduledTaskAction -Execute $powershell -Argument $arguments
+}
+
+function Register-GuardViewerTask {
+    param([string]$SupportDirectory,[ValidateSet('Debug','Standard','Silent')][string]$Mode='Standard')
+    if($Mode -eq 'Silent'){
+        Unregister-ScheduledTask -TaskName 'win-11-lite guard report' -Confirm:$false -ErrorAction SilentlyContinue
+    }else{
+        $action=New-GuardViewerAction $SupportDirectory
+        $principal=New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited
+        $settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances Parallel -ExecutionTimeLimit ([TimeSpan]::Zero)
+        # Demand start only. The SYSTEM worker opens this task after the OOBE gate.
+        Register-ScheduledTask -TaskName 'win-11-lite guard report' -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+    }
+}
+
+function Test-GuardOobeComplete {
+    $setup=Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\Setup' -ErrorAction Stop
+    if($env:USERNAME -eq 'defaultuser0' -or $setup.OOBEInProgress -eq 1 -or $setup.SystemSetupInProgress -eq 1){return $false}
+    # An unavailable probe must not open a window, and must not fail the run.
+    try{Test-NativeOobeComplete}catch{$false}
+}
+function Start-GuardViewer {
+    param([string]$SupportDirectory,[guid]$RunId,[ValidateSet('Debug','Standard','Silent')][string]$Mode)
+    if($Mode -eq 'Silent' -or -not (Test-GuardOobeComplete)){return}
+    $sessions=@(Get-Process -Name explorer -IncludeUserName -ErrorAction SilentlyContinue |
+        Where-Object{$_.SessionId -gt 0 -and $_.UserName -and $_.UserName -notmatch '\\defaultuser0$'} |
+        Select-Object -ExpandProperty SessionId -Unique)
+    if(-not $sessions.Count){return}
+    $scheduler=New-Object -ComObject 'Schedule.Service'
+    $scheduler.Connect()
+    $task=$scheduler.GetFolder('\').GetTask('win-11-lite guard report')
+    if(-not $task.Enabled){return}
+    foreach($session in $sessions){
+        # TASK_RUN_USE_SESSION_ID: run as the logged-on user, never as SYSTEM.
+        $null=$task.RunEx($RunId.ToString(),4,[int]$session,$null)
+    }
+}
+
+function Get-GuardBriefReport {
+    param($Report,[bool]$HasHistory)
+    $lines=[Collections.Generic.List[string]]::new()
+    $lines.Add((T 'ИТОГ ПРОВЕРКИ GUARD' 'GUARD SUMMARY'))
+    $lines.Add((T "Проверка: $(([datetime]$Report.Started).ToString('yyyy-MM-dd HH:mm:ss'))" "Check: $(([datetime]$Report.Started).ToString('yyyy-MM-dd HH:mm:ss'))"))
+    $programs=@($Report.Items|Where-Object{$_.Category -in @('app','provisioned','component') -and -not $_.Inventory -and $_.Outcome -ne 'protected'}|Group-Object Name)
+    $programReturned=@($programs|Where-Object{@($_.Group|Where-Object{$_.Reappeared}).Count}).Count
+    $programRemoved=@($programs|Where-Object{
+        @($_.Group|Where-Object{$_.Reappeared}).Count -and -not @($_.Group|Where-Object{$_.Outcome -notin @('removed','absent')}).Count
+    }).Count
+    $settings=@($Report.Items|Where-Object{$_.Category -in @('setting','service')})
+    $settingsReturned=@($settings|Where-Object{$_.Reappeared}).Count
+    $settingsFixed=@($settings|Where-Object{$_.Repeated -and $_.Outcome -in @('disabled','stopped','set','created')}).Count
+    $lines.Add('')
+    $lines.Add((T "Программ под контролем удаления: $($programs.Count)" "Programs monitored for removal: $($programs.Count)"))
+    $lines.Add((T "Программы, появившиеся снова: $programReturned" "Programs that reappeared: $programReturned"))
+    $lines.Add((T "Программы, успешно удалённые повторно: $programRemoved" "Programs successfully removed again: $programRemoved"))
+    $lines.Add('')
+    $lines.Add((T "Настроек и служб под контролем отключения: $($settings.Count)" "Settings and services monitored for disabling: $($settings.Count)"))
+    $lines.Add((T "Настройки и службы, сбившиеся или включившиеся снова: $settingsReturned" "Settings and services changed or enabled again: $settingsReturned"))
+    $lines.Add((T "Настройки и службы, успешно восстановленные повторно: $settingsFixed" "Settings and services successfully restored again: $settingsFixed"))
+    $present=@($programs|Where-Object{@($_.Group|Where-Object{$_.Found -eq $true}).Count}).Count
+    $removed=@($programs|Where-Object{@($_.Group|Where-Object{$_.Outcome -eq 'removed'}).Count -and -not @($_.Group|Where-Object{$_.Outcome -notin @('removed','absent')}).Count}).Count
+    $fixed=@($settings|Where-Object{$_.Outcome -in @('disabled','stopped','set','created')}).Count
+    if($present -or $fixed){$lines.Add((T "Найдено сейчас программ: $present; удалено: $removed; исправлено настроек/служб: $fixed" "Programs found now: $present; removed: $removed; settings/services corrected: $fixed"))}
+    foreach($category in 'capability','path'){
+        $rows=@($Report.Items|Where-Object{$_.Category -eq $category -and -not $_.Inventory})
+        $found=@($rows|Where-Object{$_.Found -eq $true}).Count
+        $cleared=@($rows|Where-Object{$_.Outcome -eq 'removed'}).Count
+        if($found){
+            $label=if($category -eq 'path'){T 'Файлы и каталоги' 'Files and directories'}else{T 'Компоненты Windows' 'Windows capabilities'}
+            $lines.Add((T "${label}: найдено $found; удалено $cleared" "${label}: found $found; removed $cleared"))
+        }
+    }
+    $pending=@($Report.Items|Where-Object{$_.Outcome -eq 'pending'}).Count
+    $unchecked=@($Report.Items|Where-Object{$_.Outcome -eq 'not_checked'}).Count
+    if($pending){$lines.Add((T "Ожидают завершения удаления: $pending" "Removals still pending: $pending"))}
+    if(-not $Report.Complete -or $Report.Deferred -or $unchecked){$lines.Add((T "Проверка не завершена; непроверенных пунктов: $unchecked" "Check is incomplete; unchecked items: $unchecked"))}
+    if(-not $HasHistory){$lines.Add((T 'Первый запуск: повторность пока неизвестна; история начинается с этой проверки.' 'First run: recurrence is not yet known; history starts with this check.'))}
+    $lines.Add('')
+    $lines.Add((T "Ошибок проверки: $($Report.Errors); записи: $($Report.LogErrors); показа: $($Report.ViewErrors)." "Check errors: $($Report.Errors); writing errors: $($Report.LogErrors); display errors: $($Report.ViewErrors)."))
+    foreach($row in $Report.Items|Where-Object{$_.Outcome -eq 'failed'}){
+        $name=if($row.Category -eq 'path'){($row.Name -split '[\\/]')[-1]}else{$row.Name}
+        if($row.Category -eq 'path' -and $row.Detail -match '(?:^|;)\s*Target=([^\r\n;]+)'){
+            $leaf=($matches[1] -split '[\\/]')[-1]
+            if($leaf -and $leaf -ne $name){$name+=" ($leaf)"}
+        }
+        $reason=switch($row.Category){'path'{T 'ошибка удаления/проверки' 'removal/check error'} 'service'{T 'ошибка проверки службы' 'service check error'} 'setting'{T 'ошибка проверки настройки' 'setting check error'} default{T 'ошибка проверки' 'check error'}}
+        $code=if($row.ErrorCode){$row.ErrorCode}elseif($row.Detail -match 'HRESULT=(0x[0-9A-Fa-f]+)'){$matches[1]}else{''}
+        $lines.Add("  $name — $reason$(if($code){' ('+$code+')'})")
+    }
+    foreach($warning in $Report.Warnings){$lines.Add("! $warning")}
+    [pscustomobject]@{
+        Text=($lines -join "`r`n")
+        Counts=[ordered]@{Programs=$programs.Count;ProgramsReappeared=$programReturned;ProgramsRemovedAgain=$programRemoved;Settings=$settings.Count;SettingsReappeared=$settingsReturned;SettingsRestoredAgain=$settingsFixed;HasHistory=$HasHistory}
+    }
+}
+
+function Show-GuardView {
+    param([string]$SupportDirectory,[ValidateSet('Debug','Standard','Silent')][string]$Mode,[string]$RunId,[int]$WaitSeconds=120)
+    if($Mode -eq 'Silent' -or -not (Test-GuardOobeComplete)){return}
+    if($RunId -and $RunId -ne '$(Arg0)'){$null=[guid]::Parse($RunId)}else{$RunId=''}
+    $Host.UI.RawUI.WindowTitle='win-11-lite guard - '+$Mode
+    $deadline=(Get-Date).AddSeconds($WaitSeconds)
+    $reportPath=Join-Path $SupportDirectory 'guard-report.json'
+    if($Mode -eq 'Debug'){
+        $marker=Get-Content -LiteralPath (Join-Path $SupportDirectory 'guard-run.json') -Raw -Encoding UTF8|ConvertFrom-Json
+        if($RunId -and $marker.RunId -ne $RunId){throw (T 'Этот запуск уже завершён; откройте последний отчёт из папки guard.' 'This run has been superseded; open the latest report from the guard folder.')}
+        $log=Join-Path $SupportDirectory 'guard.log'
+        $stream=[IO.File]::Open($log,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+        try{
+            $null=$stream.Seek([long]$marker.LogOffset,[IO.SeekOrigin]::Begin)
+            $reader=[IO.StreamReader]::new($stream,[Text.Encoding]::UTF8,$true)
+            try{
+                $done=$false;$deadline=(Get-Date).AddMinutes(25)
+                while(-not $done){
+                    while($null -ne ($line=$reader.ReadLine())){
+                        $color=if($line -match '\[ERROR\]'){'Red'}elseif($line -match '\[CHANGED\]|\[END\]'){'Green'}else{'Gray'}
+                        Write-Host $line -ForegroundColor $color
+                        if($line -match '\[END\]'){$done=$true;break}
+                    }
+                    if(-not $done){if((Get-Date) -ge $deadline){throw (T 'Истекло время ожидания guard.' 'Timed out waiting for guard.')} ;Start-Sleep -Milliseconds 200}
+                }
+            }finally{$reader.Dispose()}
+        }finally{$stream.Dispose()}
+    }else{
+        while($true){
+            $report=$null
+            try{if(Test-Path -LiteralPath $reportPath){$report=Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8|ConvertFrom-Json}}catch{}
+            if($report -and (-not $RunId -or $report.RunId -eq $RunId)){
+                if(-not $report.BriefText){throw (T 'Краткий отчёт ещё не создан. Дождитесь новой проверки guard.' 'No summary is available yet. Wait for a new guard check.')}
+                Write-Host $report.BriefText
+                break
+            }
+            if((Get-Date) -ge $deadline){throw (T 'Отчёт этого запуска не создан. Проверьте guard.log в папке guard.' 'No report was created for this run. Check guard.log in the guard folder.')}
+            Start-Sleep -Milliseconds 200
+        }
+    }
+    $null=Read-Host (T 'Нажмите Enter, чтобы закрыть окно' 'Press Enter to close')
+}
+
+# ── Guard worker helpers ──────────────────────────────────────────────────────
+
 function Write-GuardLog {
     param([string]$Level, [string]$Message)
-    $line = "$(Get-Date -Format ''yyyy-MM-dd HH:mm:ss'') [$Level] $Message"
+    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Message"
     $encoding = [Text.UTF8Encoding]::new($true)
     [byte[]]$data = $encoding.GetBytes($line + [Environment]::NewLine)
     # Windows PowerShell 5.1 Add-Content denies concurrent readers, including
@@ -2082,7 +2557,7 @@ function Write-GuardLog {
         }
     }
     # A logging failure must never become a policy/service failure or abort the
-    # remaining checks. Run-Setup.ps1 captures stderr in launcher.log.
+    # remaining checks. The runner captures stderr in launcher.log.
     $counts.LogFailed++
     try { [Console]::Error.WriteLine("[LOG ERROR] ${logFile}: $($problem.Message)`r`n$line") } catch { }
 }
@@ -2091,7 +2566,7 @@ function Write-GuardLog {
 # an ownership error alone does not prove that deletion is impossible.
 function Invoke-GuardAccessCommand {
     param([string]$FileName, [string[]]$Arguments, [hashtable]$Observation)
-    $ErrorActionPreference = ''Continue''
+    $ErrorActionPreference = 'Continue'
     $PSNativeCommandUseErrorActionPreference = $false
     $Observation.Step=$FileName
     $global:LASTEXITCODE=-1
@@ -2100,19 +2575,19 @@ function Invoke-GuardAccessCommand {
     $Observation.Detail+="; $FileName ExitCode=$code"
     if($code -ne 0){
         $tail=(@($output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine).Trim()
-        $message="$FileName ExitCode=$code; $($Arguments -join '' '')"
+        $message="$FileName ExitCode=$code; $($Arguments -join ' ')"
         if($tail){$message+=[Environment]::NewLine+$tail;$Observation.Detail+=[Environment]::NewLine+$tail}
-        Write-GuardLog ''DETAIL'' $message
+        Write-GuardLog 'DETAIL' $message
     }
 }
 function Grant-SystemAccess {
     param([string]$Path, [switch]$Recurse, [hashtable]$Observation)
     if ($Recurse) {
-        Invoke-GuardAccessCommand ''takeown.exe'' @(''/F'',$Path,''/R'',''/A'',''/D'',''Y'') $Observation
-        Invoke-GuardAccessCommand ''icacls.exe'' @($Path,''/grant'',''*S-1-5-18:(OI)(CI)F'',''/T'',''/C'',''/Q'') $Observation
+        Invoke-GuardAccessCommand 'takeown.exe' @('/F',$Path,'/R','/A','/D','Y') $Observation
+        Invoke-GuardAccessCommand 'icacls.exe' @($Path,'/grant','*S-1-5-18:(OI)(CI)F','/T','/C','/Q') $Observation
     } else {
-        Invoke-GuardAccessCommand ''takeown.exe'' @(''/F'',$Path,''/A'') $Observation
-        Invoke-GuardAccessCommand ''icacls.exe'' @($Path,''/grant'',''*S-1-5-18:F'',''/C'',''/Q'') $Observation
+        Invoke-GuardAccessCommand 'takeown.exe' @('/F',$Path,'/A') $Observation
+        Invoke-GuardAccessCommand 'icacls.exe' @($Path,'/grant','*S-1-5-18:F','/C','/Q') $Observation
     }
 }
 function Test-GuardMatch {
@@ -2121,24 +2596,19 @@ function Test-GuardMatch {
     foreach ($pattern in $Patterns) { if ($pattern -and $Name -match $pattern) { return $true } }
     return $false
 }
-$counts = @{Checked=0;Changed=0;Pending=0;Failed=0;Skipped=0;LogFailed=0;ViewFailed=0}
-$guardRows=[Collections.Generic.List[object]]::new()
-$guardWarnings=[Collections.Generic.List[string]]::new()
-$guardHistory=@{}; $guardNextHistory=@{}; $guardInventoryStatus=@{}; $guardVisited=@{}
-$guardStartedAt=Get-Date; $guardComplete=$false; $guardSkippedOobe=$false
-$guardRunId=[guid]::NewGuid().ToString()
+
 function Invoke-GuardPresentation {
-    if(-not $config.ViewerTask -or $guardMode -eq ''Silent''){return}
+    if(-not $config.ViewerTask -or $guardMode -eq 'Silent'){return}
     try{Start-GuardViewer -SupportDirectory $PSScriptRoot -RunId $guardRunId -Mode $guardMode}
     catch{
         $counts.ViewFailed++
-        $guardWarnings.Add((T ''Не удалось открыть окно guard; проверьте файлы отчёта в папке guard.'' ''Could not open the guard window; check the report files in the guard folder.''))
-        Write-GuardLog ''ERROR'' ("Viewer: "+$_.Exception.Message)
+        $guardWarnings.Add((T 'Не удалось открыть окно guard; проверьте файлы отчёта в папке guard.' 'Could not open the guard window; check the report files in the guard folder.'))
+        Write-GuardLog 'ERROR' ("Viewer: "+$_.Exception.Message)
     }
 }
 function Remove-GuardSelectedPath {
     param([string]$Path,[bool]$Directory,[hashtable]$Observation)
-    $selectedRoot=[IO.Path]::GetFullPath($Path).TrimEnd(''\'')
+    $selectedRoot=[IO.Path]::GetFullPath($Path).TrimEnd('\')
     $retried=@{}
     while($true){
         try{Remove-Item -LiteralPath $Path -Recurse:$Directory -Force -ErrorAction Stop;return}
@@ -2147,54 +2617,54 @@ function Remove-GuardSelectedPath {
             # change is unnecessary. Some serviced files reject that operation.
             # Only this provider error permits a direct, single-file retry.
             $failure=$_
-            if($failure.FullyQualifiedErrorId -notlike ''RemoveFileSystemItemArgumentError*'' -or $failure.TargetObject -isnot [IO.FileInfo]){throw}
+            if($failure.FullyQualifiedErrorId -notlike 'RemoveFileSystemItemArgumentError*' -or $failure.TargetObject -isnot [IO.FileInfo]){throw}
             $target=[IO.Path]::GetFullPath($failure.TargetObject.FullName)
-            if(($target -ne $selectedRoot -and -not $target.StartsWith($selectedRoot+''\'',[StringComparison]::OrdinalIgnoreCase)) -or $retried.ContainsKey($target)){throw}
+            if(($target -ne $selectedRoot -and -not $target.StartsWith($selectedRoot+'\',[StringComparison]::OrdinalIgnoreCase)) -or $retried.ContainsKey($target)){throw}
             $cursor=Split-Path $target -Parent
             while($cursor){
-                if((Get-Item -LiteralPath $cursor -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint){throw (T ''Повторное удаление через ссылку каталога запрещено'' ''Retry through a directory link is not allowed'')}
+                if((Get-Item -LiteralPath $cursor -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint){throw (T 'Повторное удаление через ссылку каталога запрещено' 'Retry through a directory link is not allowed')}
                 $cursor=Split-Path $cursor -Parent
             }
             $retried[$target]=$true
-            Write-GuardLog ''DETAIL'' "Remove-Item attribute error; direct file deletion: $target"
+            Write-GuardLog 'DETAIL' "Remove-Item attribute error; direct file deletion: $target"
             $Observation.Step=(T "удаление файла без смены атрибутов: $target" "file deletion without changing attributes: $target")
             [IO.File]::Delete($target)
-            if(Test-Path -LiteralPath $target -ErrorAction Stop){throw (T ''Файл остался после повторного удаления'' ''File remains after retry'')}
+            if(Test-Path -LiteralPath $target -ErrorAction Stop){throw (T 'Файл остался после повторного удаления' 'File remains after retry')}
             $Observation.Detail+=(T "; удалён без смены атрибутов: $target" "; deleted without changing attributes: $target")
             if(-not $Directory){return}
-            $Observation.Step=(T ''удаление (Remove-Item)'' ''removal (Remove-Item)'')
+            $Observation.Step=(T 'удаление (Remove-Item)' 'removal (Remove-Item)')
         }
     }
 }
 function Add-GuardDetail {
     param([string]$Category,[string]$Name,[string]$Outcome,$Found,[string]$Before,[string]$After,[string]$Detail,[string]$Desired,[string]$Identity=$Name,[switch]$Inventory,[string]$ErrorCode)
     $key="$Category|$Identity"
-    $changed=$Outcome -in @(''removed'',''disabled'',''stopped'',''set'',''created'')
+    $changed=$Outcome -in @('removed','disabled','stopped','set','created')
     $known=$Desired -and $guardHistory.ContainsKey($key) -and [string]$guardHistory[$key].Desired -eq $Desired
     $repeated=$changed -and $known
-    $reappeared=$known -and (($Desired -eq ''absent'' -and $Found -eq $true) -or
-        ($Category -eq ''setting'' -and $null -ne $Found -and $Before -ne $Desired) -or
-        ($Category -eq ''service'' -and $Found -eq $true -and $Before -and $Before -ne ''Start=4; Stopped''))
+    $reappeared=$known -and (($Desired -eq 'absent' -and $Found -eq $true) -or
+        ($Category -eq 'setting' -and $null -ne $Found -and $Before -ne $Desired) -or
+        ($Category -eq 'service' -and $Found -eq $true -and $Before -and $Before -ne 'Start=4; Stopped'))
     $guardRows.Add([pscustomobject]@{Category=$Category;Name=$Name;Identity=$Identity;Outcome=$Outcome;Found=$Found;Before=$Before;After=$After;Detail=$Detail;Repeated=[bool]$repeated;Reappeared=[bool]$reappeared;Inventory=[bool]$Inventory;ErrorCode=$ErrorCode})
-    if($Desired -and -not($Category -eq ''service'' -and $Outcome -eq ''absent'') -and $Outcome -in @(''removed'',''disabled'',''stopped'',''set'',''created'',''compliant'',''already_disabled'',''absent'')){
-        $guardNextHistory[$key]=[pscustomobject]@{Key=$key;Desired=$Desired;LastSuccess=(Get-Date).ToString(''o'')}
+    if($Desired -and -not($Category -eq 'service' -and $Outcome -eq 'absent') -and $Outcome -in @('removed','disabled','stopped','set','created','compliant','already_disabled','absent')){
+        $guardNextHistory[$key]=[pscustomobject]@{Key=$key;Desired=$Desired;LastSuccess=(Get-Date).ToString('o')}
     }
 }
 function Invoke-GuardCheck {
-    param([string]$Label, [scriptblock]$Action,[string]$Category=''component'',[string]$Name=$Label,[string]$Desired='''',[string]$Identity=$Name)
+    param([string]$Label, [scriptblock]$Action,[string]$Category='component',[string]$Name=$Label,[string]$Desired='',[string]$Identity=$Name)
     $counts.Checked++
     $guardVisited["$Category|$Identity"]=$true
-    Write-GuardLog ''CHECK'' $Label
-    $observation=@{Found=$null;Before='''';After='''';Detail='''';Step=''''}
+    Write-GuardLog 'CHECK' $Label
+    $observation=@{Found=$null;Before='';After='';Detail='';Step=''}
     try {
         $result = & $Action $observation
-        if ($result -eq ''changed'') {
-            $counts.Changed++; Write-GuardLog ''CHANGED'' $Label
-            $outcome=switch($Category){''setting''{if($observation.Found){''set''}else{''created''}} ''service''{if($observation.Before -like ''Start=4;*''){''stopped''}else{''disabled''}} default{''removed''}}
+        if ($result -eq 'changed') {
+            $counts.Changed++; Write-GuardLog 'CHANGED' $Label
+            $outcome=switch($Category){'setting'{if($observation.Found){'set'}else{'created'}} 'service'{if($observation.Before -like 'Start=4;*'){'stopped'}else{'disabled'}} default{'removed'}}
         }
-        elseif ($result -eq ''pending'') { $outcome=''pending'';$counts.Pending++; Write-GuardLog ''PENDING'' (T "$Label — требуется завершение обслуживания" "$Label - servicing still pending") }
-        elseif ($result -eq ''skipped'') { $outcome=''skipped'';$counts.Skipped++; Write-GuardLog ''SKIP'' $Label }
-        else { $outcome=if($observation.Found -eq $false){''absent''}elseif($Category -eq ''service''){''already_disabled''}else{''compliant''};Write-GuardLog ''OK'' $Label }
+        elseif ($result -eq 'pending') { $outcome='pending';$counts.Pending++; Write-GuardLog 'PENDING' (T "$Label — требуется завершение обслуживания" "$Label - servicing still pending") }
+        elseif ($result -eq 'skipped') { $outcome='skipped';$counts.Skipped++; Write-GuardLog 'SKIP' $Label }
+        else { $outcome=if($observation.Found -eq $false){'absent'}elseif($Category -eq 'service'){'already_disabled'}else{'compliant'};Write-GuardLog 'OK' $Label }
         Add-GuardDetail -Category $Category -Name $Name -Identity $Identity -Outcome $outcome -Found $observation.Found -Before $observation.Before -After $observation.After -Detail $observation.Detail -Desired $Desired
     } catch {
         $counts.Failed++
@@ -2202,26 +2672,26 @@ function Invoke-GuardCheck {
         $problem=$failure.Exception.GetBaseException()
         $detail=$failure.Exception.Message
         if($observation.Step){$detail=(T "Этап: $($observation.Step). $detail" "Stage: $($observation.Step). $detail")}
-        Write-GuardLog ''ERROR'' "$Label : $detail"
-        $diagnostic="$($problem.GetType().FullName); HRESULT=0x$($problem.HResult.ToString(''X8'')); $($failure.FullyQualifiedErrorId)"
+        Write-GuardLog 'ERROR' "$Label : $detail"
+        $diagnostic="$($problem.GetType().FullName); HRESULT=0x$($problem.HResult.ToString('X8')); $($failure.FullyQualifiedErrorId)"
         if($null -ne $failure.TargetObject){$diagnostic+="; Target=$($failure.TargetObject)"}
         $logDiagnostic=$diagnostic
         if($failure.ScriptStackTrace){$logDiagnostic+=[Environment]::NewLine+$failure.ScriptStackTrace}
-        Write-GuardLog ''DETAIL'' $logDiagnostic
+        Write-GuardLog 'DETAIL' $logDiagnostic
         if($observation.Detail){$detail+=[Environment]::NewLine+$observation.Detail}
         $detail+=[Environment]::NewLine+$diagnostic
-        Add-GuardDetail -Category $Category -Name $Name -Identity $Identity -Outcome ''failed'' -Found $observation.Found -Before $observation.Before -After $observation.After -Detail $detail -Desired $Desired -ErrorCode (''0x''+$problem.HResult.ToString(''X8''))
+        Add-GuardDetail -Category $Category -Name $Name -Identity $Identity -Outcome 'failed' -Found $observation.Found -Before $observation.Before -After $observation.After -Detail $detail -Desired $Desired -ErrorCode ('0x'+$problem.HResult.ToString('X8'))
     }
 }
 function Read-GuardInventory {
     param([string]$Label, [scriptblock]$Read,[string]$Category)
     $counts.Checked++
-    Write-GuardLog ''CHECK'' $Label
+    Write-GuardLog 'CHECK' $Label
     try { $items=@(& $Read);$guardInventoryStatus[$Category]=$true;$items }
     catch {
-        $guardInventoryStatus[$Category]=$false;$counts.Failed++;Write-GuardLog ''ERROR'' "$Label : $($_.Exception.Message)"
-        Add-GuardDetail -Category $Category -Name $Label -Outcome ''failed'' -Found $null -Inventory -Detail (T "Список недоступен; отсутствие компонентов не подтверждено. $($_.Exception.Message)" "Inventory unavailable; component absence is unconfirmed. $($_.Exception.Message)")
-        if($Category -in @(''app'',''provisioned'')){
+        $guardInventoryStatus[$Category]=$false;$counts.Failed++;Write-GuardLog 'ERROR' "$Label : $($_.Exception.Message)"
+        Add-GuardDetail -Category $Category -Name $Label -Outcome 'failed' -Found $null -Inventory -Detail (T "Список недоступен; отсутствие компонентов не подтверждено. $($_.Exception.Message)" "Inventory unavailable; component absence is unconfirmed. $($_.Exception.Message)")
+        if($Category -in @('app','provisioned')){
             foreach($name in @(Get-GuardExpectedApps $config)){Add-GuardDetail -Category $Category -Name $name -Outcome not_checked -Found $null -Desired absent}
         }
     }
@@ -2230,7 +2700,7 @@ function Add-MissingGuardTargets {
     param([string]$Category,[string[]]$Patterns,[object[]]$Inventory,[string]$NameProperty)
     if(-not $guardInventoryStatus[$Category]){return}
     $targets=@($Patterns|Where-Object{$_})
-    if($Category -in @(''app'',''provisioned'')){
+    if($Category -in @('app','provisioned')){
         $known=@(Get-GuardExpectedApps $config)
         foreach($name in $known){
             if(@($Inventory|Where-Object{[string]$_.$NameProperty -eq $name}).Count){continue}
@@ -2241,135 +2711,135 @@ function Add-MissingGuardTargets {
     }
     foreach($pattern in $targets){
         if(@($Inventory|Where-Object{[string]$_.$NameProperty -match $pattern}).Count){continue}
-        $label=($pattern -replace ''^\^|\$$'','''' -replace ''\\\.'',''.'')
+        $label=($pattern -replace '^\^|\$$','' -replace '\\\.','.')
         $hint=@($config.TargetLabels|Where-Object{$_.Category -eq $Category -and $_.Pattern -eq $pattern}|Select-Object -First 1)
         if($hint.Count){$label=$hint[0].Name}
         $counts.Checked++
-        Add-GuardDetail -Category $Category -Name $label -Identity $pattern -Outcome ''absent'' -Found $false -After (T ''Нет совпадений в полученном списке'' ''No matches in the retrieved inventory'')
+        Add-GuardDetail -Category $Category -Name $label -Identity $pattern -Outcome 'absent' -Found $false -After (T 'Нет совпадений в полученном списке' 'No matches in the retrieved inventory')
     }
 }
 function Get-GuardOutcomeText {
     param($Row)
     switch($Row.Outcome){
-        ''absent'' {T ''не найдено / уже отсутствует'' ''not found / already absent''}
-        ''removed'' {if($Row.Repeated){T ''снова появилось и успешно удалено'' ''reappeared and successfully removed''}else{T ''найдено и успешно удалено'' ''found and successfully removed''}}
-        ''already_disabled'' {T ''найдена, уже отключена и остановлена'' ''found, already disabled and stopped''}
-        ''disabled'' {if($Row.Repeated){T ''найдена включённой, отключена повторно'' ''found enabled, disabled again''}else{T ''найдена включённой, отключена сейчас'' ''found enabled, disabled now''}}
-        ''stopped'' {if($Row.Repeated){T ''запуск отключён, служба остановлена повторно'' ''startup disabled, service stopped again''}else{T ''запуск уже отключён, работающая служба остановлена'' ''startup already disabled, running service stopped''}}
-        ''compliant'' {T ''найдено, настройка уже соответствует требуемой'' ''found, setting already matches the target''}
-        ''set'' {if($Row.Repeated){T ''настройка найдена и восстановлена повторно'' ''setting found and reapplied''}else{T ''настройка найдена и исправлена'' ''setting found and corrected''}}
-        ''created'' {if($Row.Repeated){T ''настройка отсутствовала, создана повторно'' ''setting was missing and recreated''}else{T ''настройка отсутствовала, создана'' ''setting was missing and created''}}
-        ''pending'' {T ''найдено, удаление ещё не завершено'' ''found, removal still pending''}
-        ''skipped'' {T ''найдено, пропущено'' ''found, skipped''}
-        ''protected'' {T ''найдено, сохранено по правилам защиты'' ''found, retained by protection rules''}
-        ''not_checked'' {T ''не проверено'' ''not checked''}
-        ''failed'' {T ''ошибка; требуемый результат не подтверждён'' ''error; target result is unconfirmed''}
+        'absent' {T 'не найдено / уже отсутствует' 'not found / already absent'}
+        'removed' {if($Row.Repeated){T 'снова появилось и успешно удалено' 'reappeared and successfully removed'}else{T 'найдено и успешно удалено' 'found and successfully removed'}}
+        'already_disabled' {T 'найдена, уже отключена и остановлена' 'found, already disabled and stopped'}
+        'disabled' {if($Row.Repeated){T 'найдена включённой, отключена повторно' 'found enabled, disabled again'}else{T 'найдена включённой, отключена сейчас' 'found enabled, disabled now'}}
+        'stopped' {if($Row.Repeated){T 'запуск отключён, служба остановлена повторно' 'startup disabled, service stopped again'}else{T 'запуск уже отключён, работающая служба остановлена' 'startup already disabled, running service stopped'}}
+        'compliant' {T 'найдено, настройка уже соответствует требуемой' 'found, setting already matches the target'}
+        'set' {if($Row.Repeated){T 'настройка найдена и восстановлена повторно' 'setting found and reapplied'}else{T 'настройка найдена и исправлена' 'setting found and corrected'}}
+        'created' {if($Row.Repeated){T 'настройка отсутствовала, создана повторно' 'setting was missing and recreated'}else{T 'настройка отсутствовала, создана' 'setting was missing and created'}}
+        'pending' {T 'найдено, удаление ещё не завершено' 'found, removal still pending'}
+        'skipped' {T 'найдено, пропущено' 'found, skipped'}
+        'protected' {T 'найдено, сохранено по правилам защиты' 'found, retained by protection rules'}
+        'not_checked' {T 'не проверено' 'not checked'}
+        'failed' {T 'ошибка; требуемый результат не подтверждён' 'error; target result is unconfirmed'}
     }
 }
 function Add-UncheckedGuardTargets {
     if($guardComplete){return}
     foreach($entry in $config.Policies){
-        $parts=$entry -split ''\|'';$identity="$($parts[0])\$($parts[1])"
+        $parts=$entry -split '\|';$identity="$($parts[0])\$($parts[1])"
         if(-not $guardVisited.ContainsKey("setting|$identity")){Add-GuardDetail -Category setting -Name $parts[1] -Identity $identity -Outcome not_checked -Found $null}
     }
     foreach($name in $config.Services){if(-not $guardVisited.ContainsKey("service|$name")){Add-GuardDetail -Category service -Name $name -Outcome not_checked -Found $null}}
     foreach($name in $config.Paths){if(-not $guardVisited.ContainsKey("path|$name")){Add-GuardDetail -Category path -Name $name -Outcome not_checked -Found $null}}
-    if($config.RemoveEdge -and -not $guardVisited.ContainsKey(''component|Microsoft Edge'')){Add-GuardDetail -Category component -Name ''Microsoft Edge'' -Outcome not_checked -Found $null}
-    foreach($category in ''capability'',''app'',''provisioned''){
+    if($config.RemoveEdge -and -not $guardVisited.ContainsKey('component|Microsoft Edge')){Add-GuardDetail -Category component -Name 'Microsoft Edge' -Outcome not_checked -Found $null}
+    foreach($category in 'capability','app','provisioned'){
         if($guardInventoryStatus.ContainsKey($category)){continue}
-        $patterns=if($category -eq ''capability''){@($config.Capabilities)}else{@($config.Apps)}
-        foreach($pattern in $patterns|Where-Object{$_}){Add-GuardDetail -Category $category -Name ($pattern -replace ''^\^|\$$'','''' -replace ''\\\.'',''.'') -Outcome not_checked -Found $null}
+        $patterns=if($category -eq 'capability'){@($config.Capabilities)}else{@($config.Apps)}
+        foreach($pattern in $patterns|Where-Object{$_}){Add-GuardDetail -Category $category -Name ($pattern -replace '^\^|\$$','' -replace '\\\.','.') -Outcome not_checked -Found $null}
     }
 }
 function Get-GuardStateText {
     param([string]$State)
-    if($State -match ''^Start=(\d+); (.+)$''){
-        $start=switch($matches[1]){''0''{T ''при загрузке'' ''boot''} ''1''{T ''системный'' ''system''} ''2''{T ''автоматически'' ''automatic''} ''3''{T ''вручную'' ''manual''} ''4''{T ''отключён'' ''disabled''} default{$matches[1]}}
-        $status=switch($matches[2]){''Running''{T ''работает'' ''running''} ''Stopped''{T ''остановлена'' ''stopped''} default{$matches[2]}}
+    if($State -match '^Start=(\d+); (.+)$'){
+        $start=switch($matches[1]){'0'{T 'при загрузке' 'boot'} '1'{T 'системный' 'system'} '2'{T 'автоматически' 'automatic'} '3'{T 'вручную' 'manual'} '4'{T 'отключён' 'disabled'} default{$matches[1]}}
+        $status=switch($matches[2]){'Running'{T 'работает' 'running'} 'Stopped'{T 'остановлена' 'stopped'} default{$matches[2]}}
         return (T "запуск: $start; состояние: $status" "startup: $start; state: $status")
     }
     switch($State){
-        ''Absent''{T ''отсутствует'' ''absent''}
-        ''NotPresent''{T ''отсутствует'' ''absent''}
-        ''Not Present''{T ''отсутствует'' ''absent''}
-        ''Present''{T ''присутствует'' ''present''}
-        ''Installed''{T ''установлено'' ''installed''}
-        ''Provisioned''{T ''подготовлено для новых пользователей'' ''provisioned for new users''}
-        ''Pending''{T ''ожидается завершение'' ''pending completion''}
-        ''UninstallPending''{T ''ожидается завершение удаления'' ''removal pending''}
-        ''''{T ''не подтверждено'' ''unconfirmed''}
+        'Absent'{T 'отсутствует' 'absent'}
+        'NotPresent'{T 'отсутствует' 'absent'}
+        'Not Present'{T 'отсутствует' 'absent'}
+        'Present'{T 'присутствует' 'present'}
+        'Installed'{T 'установлено' 'installed'}
+        'Provisioned'{T 'подготовлено для новых пользователей' 'provisioned for new users'}
+        'Pending'{T 'ожидается завершение' 'pending completion'}
+        'UninstallPending'{T 'ожидается завершение удаления' 'removal pending'}
+        ''{T 'не подтверждено' 'unconfirmed'}
         default{$State}
     }
 }
 function Save-GuardReport {
     Add-UncheckedGuardTargets
     $lines=[Collections.Generic.List[string]]::new()
-    $lines.Add((T ''ИТОГ ПРОВЕРКИ GUARD'' ''GUARD CHECK REPORT''))
-    $lines.Add((T "Начало: $($guardStartedAt.ToString(''yyyy-MM-dd HH:mm:ss'')); сборка: $($config.BuildId)" "Started: $($guardStartedAt.ToString(''yyyy-MM-dd HH:mm:ss'')); build: $($config.BuildId)"))
-    $status=if($guardSkippedOobe){T ''Отложено: настройка Windows ещё выполняется'' ''Deferred: Windows setup is still running''}elseif(-not $guardComplete){T ''Проверка прервана; часть объектов не проверена'' ''Run interrupted; some objects were not checked''}elseif($counts.Failed){T ''Проверка завершена с ошибками'' ''Run completed with errors''}elseif($counts.Pending){T ''Проверка завершена; есть незавершённое удаление'' ''Run completed; some removals are pending''}else{T ''Проверка завершена'' ''Run completed''}
+    $lines.Add((T 'ИТОГ ПРОВЕРКИ GUARD' 'GUARD CHECK REPORT'))
+    $lines.Add((T "Начало: $($guardStartedAt.ToString('yyyy-MM-dd HH:mm:ss')); сборка: $($config.BuildId)" "Started: $($guardStartedAt.ToString('yyyy-MM-dd HH:mm:ss')); build: $($config.BuildId)"))
+    $status=if($guardSkippedOobe){T 'Отложено: настройка Windows ещё выполняется' 'Deferred: Windows setup is still running'}elseif(-not $guardComplete){T 'Проверка прервана; часть объектов не проверена' 'Run interrupted; some objects were not checked'}elseif($counts.Failed){T 'Проверка завершена с ошибками' 'Run completed with errors'}elseif($counts.Pending){T 'Проверка завершена; есть незавершённое удаление' 'Run completed; some removals are pending'}else{T 'Проверка завершена' 'Run completed'}
     $lines.Add($status)
     $totals=[ordered]@{}
-    foreach($category in ''setting'',''service'',''component'',''capability'',''app'',''provisioned'',''path'',''run''){
+    foreach($category in 'setting','service','component','capability','app','provisioned','path','run'){
         $rows=@($guardRows|Where-Object{$_.Category -eq $category})
         if(-not $rows.Count){continue}
-        $title=switch($category){''setting''{T ''НАСТРОЙКИ'' ''SETTINGS''} ''service''{T ''СЛУЖБЫ И ДРАЙВЕРЫ'' ''SERVICES AND DRIVERS''} ''component''{T ''КОМПОНЕНТЫ'' ''COMPONENTS''} ''capability''{T ''ВОЗМОЖНОСТИ WINDOWS'' ''WINDOWS CAPABILITIES''} ''app''{T ''УСТАНОВЛЕННЫЕ ПРИЛОЖЕНИЯ'' ''INSTALLED APPS''} ''provisioned''{T ''ВСТРОЕННЫЕ ПАКЕТЫ ПРИЛОЖЕНИЙ'' ''PROVISIONED APPS''} ''path''{T ''ФАЙЛЫ И КАТАЛОГИ'' ''FILES AND DIRECTORIES''} ''run''{T ''СОСТОЯНИЕ ПРОВЕРКИ'' ''RUN STATUS''}}
+        $title=switch($category){'setting'{T 'НАСТРОЙКИ' 'SETTINGS'} 'service'{T 'СЛУЖБЫ И ДРАЙВЕРЫ' 'SERVICES AND DRIVERS'} 'component'{T 'КОМПОНЕНТЫ' 'COMPONENTS'} 'capability'{T 'ВОЗМОЖНОСТИ WINDOWS' 'WINDOWS CAPABILITIES'} 'app'{T 'УСТАНОВЛЕННЫЕ ПРИЛОЖЕНИЯ' 'INSTALLED APPS'} 'provisioned'{T 'ВСТРОЕННЫЕ ПАКЕТЫ ПРИЛОЖЕНИЙ' 'PROVISIONED APPS'} 'path'{T 'ФАЙЛЫ И КАТАЛОГИ' 'FILES AND DIRECTORIES'} 'run'{T 'СОСТОЯНИЕ ПРОВЕРКИ' 'RUN STATUS'}}
         $found=@($rows|Where-Object{$_.Found -eq $true}).Count
-        $absent=@($rows|Where-Object{$_.Outcome -eq ''absent''}).Count
-        $changed=@($rows|Where-Object{$_.Outcome -in @(''removed'',''disabled'',''stopped'',''set'',''created'')}).Count
+        $absent=@($rows|Where-Object{$_.Outcome -eq 'absent'}).Count
+        $changed=@($rows|Where-Object{$_.Outcome -in @('removed','disabled','stopped','set','created')}).Count
         $repeated=@($rows|Where-Object{$_.Repeated}).Count
-        $errors=@($rows|Where-Object{$_.Outcome -eq ''failed''}).Count
-        $unchecked=@($rows|Where-Object{$_.Outcome -eq ''not_checked''}).Count
+        $errors=@($rows|Where-Object{$_.Outcome -eq 'failed'}).Count
+        $unchecked=@($rows|Where-Object{$_.Outcome -eq 'not_checked'}).Count
         $totals[$category]=[ordered]@{Total=$rows.Count;Found=$found;Absent=$absent;Changed=$changed;Repeated=$repeated;Errors=$errors;NotChecked=$unchecked}
-        foreach($outcome in @(''compliant'',''already_disabled'',''removed'',''disabled'',''stopped'',''created'',''pending'',''skipped'')){$totals[$category][$outcome]=@($rows|Where-Object{$_.Outcome -eq $outcome}).Count}
-        $lines.Add('''');$lines.Add($title)
-        if($category -eq ''service''){
-            $already=@($rows|Where-Object{$_.Outcome -eq ''already_disabled''}).Count
+        foreach($outcome in @('compliant','already_disabled','removed','disabled','stopped','created','pending','skipped')){$totals[$category][$outcome]=@($rows|Where-Object{$_.Outcome -eq $outcome}).Count}
+        $lines.Add('');$lines.Add($title)
+        if($category -eq 'service'){
+            $already=@($rows|Where-Object{$_.Outcome -eq 'already_disabled'}).Count
             $lines.Add((T "  Найдено: $found; отсутствует: $absent; уже отключено: $already" "  Found: $found; absent: $absent; already disabled: $already"))
             $lines.Add((T "  Отключено/остановлено сейчас: $changed; из них повторно: $repeated; ошибок: $errors" "  Disabled/stopped now: $changed; repeated: $repeated; errors: $errors"))
-        }elseif($category -eq ''setting''){
-            $correct=@($rows|Where-Object{$_.Outcome -eq ''compliant''}).Count;$created=@($rows|Where-Object{$_.Outcome -eq ''created''}).Count
+        }elseif($category -eq 'setting'){
+            $correct=@($rows|Where-Object{$_.Outcome -eq 'compliant'}).Count;$created=@($rows|Where-Object{$_.Outcome -eq 'created'}).Count
             $lines.Add((T "  Найдено: $found; уже верны: $correct; создано отсутствующих: $created" "  Found: $found; already correct: $correct; missing settings created: $created"))
             $lines.Add((T "  Исправлено/создано сейчас: $changed; из них повторно: $repeated; ошибок: $errors" "  Corrected/created now: $changed; repeated: $repeated; errors: $errors"))
-        }elseif($category -eq ''run''){
+        }elseif($category -eq 'run'){
             $lines.Add((T "  Ошибок выполнения: $errors" "  Execution errors: $errors"))
         }else{
-            $pending=@($rows|Where-Object{$_.Outcome -eq ''pending''}).Count
-            $skipped=@($rows|Where-Object{$_.Outcome -in @(''skipped'',''protected'')}).Count
+            $pending=@($rows|Where-Object{$_.Outcome -eq 'pending'}).Count
+            $skipped=@($rows|Where-Object{$_.Outcome -in @('skipped','protected')}).Count
             $lines.Add((T "  Найдено: $found; не найдено: $absent; успешно удалено: $changed" "  Found: $found; not found: $absent; successfully removed: $changed"))
             $lines.Add((T "  Ожидает завершения: $pending; пропущено/сохранено: $skipped; ошибок: $errors" "  Pending: $pending; skipped/retained: $skipped; errors: $errors"))
         }
         if($unchecked){$lines.Add((T "  Не проверено: $unchecked" "  Not checked: $unchecked"))}
         foreach($row in $rows){
-            $prefix=if($row.Outcome -eq ''failed''){''[ERROR]''}else{''-''}
+            $prefix=if($row.Outcome -eq 'failed'){'[ERROR]'}else{'-'}
             $lines.Add("  $prefix $($row.Name): $(Get-GuardOutcomeText $row)")
             if($row.Before -ne $row.After){$lines.Add((T "      Было: $(Get-GuardStateText $row.Before); стало: $(Get-GuardStateText $row.After)" "      Before: $(Get-GuardStateText $row.Before); after: $(Get-GuardStateText $row.After)"))}
-            elseif($row.Category -eq ''setting'' -and $row.After){$lines.Add((T "      Значение: $($row.After)" "      Value: $($row.After)"))}
+            elseif($row.Category -eq 'setting' -and $row.After){$lines.Add((T "      Значение: $($row.After)" "      Value: $($row.After)"))}
             if($row.Detail){$lines.Add("      $($row.Detail)")}
         }
     }
-    $lines.Add('''')
+    $lines.Add('')
     $lines.Add((T "Всего ошибок проверок: $($counts.Failed); ошибок записи журнала: $($counts.LogFailed)." "Total check errors: $($counts.Failed); log write errors: $($counts.LogFailed)."))
-    if(-not $guardHistory.Count){$lines.Add((T ''Предыдущей истории ещё нет: повторные изменения пока не определяются.'' ''No previous history yet: repeated changes cannot be determined.''))}
+    if(-not $guardHistory.Count){$lines.Add((T 'Предыдущей истории ещё нет: повторные изменения пока не определяются.' 'No previous history yet: repeated changes cannot be determined.'))}
     foreach($warning in $guardWarnings){$lines.Add("! $warning")}
     $text=$lines -join "`r`n"
-    Write-GuardLog ''REPORT'' ("`r`n"+$text)
-    $report=[ordered]@{Schema=2;BuildId=$config.BuildId;RunId=$guardRunId;Mode=$guardMode;Started=$guardStartedAt.ToString(''o'');Finished=(Get-Date).ToString(''o'');Complete=$guardComplete;Deferred=$guardSkippedOobe;Errors=$counts.Failed;LogErrors=$counts.LogFailed;ViewErrors=$counts.ViewFailed;Summary=$totals;Items=@($guardRows.ToArray());Warnings=@($guardWarnings.ToArray())}
+    Write-GuardLog 'REPORT' ("`r`n"+$text)
+    $report=[ordered]@{Schema=2;BuildId=$config.BuildId;RunId=$guardRunId;Mode=$guardMode;Started=$guardStartedAt.ToString('o');Finished=(Get-Date).ToString('o');Complete=$guardComplete;Deferred=$guardSkippedOobe;Errors=$counts.Failed;LogErrors=$counts.LogFailed;ViewErrors=$counts.ViewFailed;Summary=$totals;Items=@($guardRows.ToArray());Warnings=@($guardWarnings.ToArray())}
     $brief=Get-GuardBriefReport -Report $report -HasHistory ([bool]$guardHistory.Count)
     $report.Brief=$brief.Counts;$report.BriefText=$brief.Text
     # Publish JSON last so the Standard viewer sees failures writing other files.
-    foreach($name in ''guard-report.txt'',''guard-state.json'',''guard-summary.txt'',''guard-report.json''){
-        if($name -in @(''guard-summary.txt'',''guard-report.json'')){
+    foreach($name in 'guard-report.txt','guard-state.json','guard-summary.txt','guard-report.json'){
+        if($name -in @('guard-summary.txt','guard-report.json')){
             $report.LogErrors=$counts.LogFailed
             $brief=Get-GuardBriefReport -Report $report -HasHistory ([bool]$guardHistory.Count)
             $report.Brief=$brief.Counts;$report.BriefText=$brief.Text
         }
         $document=@{Name=$name;Text=$(switch($name){
-            ''guard-report.txt''{$text}
-            ''guard-state.json''{[ordered]@{Schema=1;BuildId=$config.BuildId;Managed=@($guardNextHistory.Values)}|ConvertTo-Json -Depth 5}
-            ''guard-summary.txt''{$brief.Text}
-            ''guard-report.json''{$report|ConvertTo-Json -Depth 8}
+            'guard-report.txt'{$text}
+            'guard-state.json'{[ordered]@{Schema=1;BuildId=$config.BuildId;Managed=@($guardNextHistory.Values)}|ConvertTo-Json -Depth 5}
+            'guard-summary.txt'{$brief.Text}
+            'guard-report.json'{$report|ConvertTo-Json -Depth 8}
         })}
-        $target=Join-Path $PSScriptRoot $document.Name;$temporary=$target+''.''+$PID+''.tmp''
+        $target=Join-Path $PSScriptRoot $document.Name;$temporary=$target+'.'+$PID+'.tmp'
         try{
             [IO.File]::WriteAllText($temporary,$document.Text,[Text.UTF8Encoding]::new($true))
             for($attempt=0;$attempt -lt 5;$attempt++){
@@ -2382,445 +2852,228 @@ function Save-GuardReport {
         }finally{if(Test-Path -LiteralPath $temporary){Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue}}
     }
 }
-try { $runLock = [IO.File]::Open((Join-Path $PSScriptRoot ''guard.lock''), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
-catch [IO.IOException] { return }
-try {
-    try{
-        $offset=if(Test-Path -LiteralPath $logFile){(Get-Item -LiteralPath $logFile).Length}else{0}
-        $marker=@{RunId=$guardRunId;BuildId=$config.BuildId;Started=$guardStartedAt.ToString(''o'');LogOffset=$offset}|ConvertTo-Json
-        [IO.File]::WriteAllText((Join-Path $PSScriptRoot ''guard-run.json''),$marker,[Text.UTF8Encoding]::new($true))
-    }catch{$counts.LogFailed++;$guardWarnings.Add((T ''Не удалось записать начало проверки.'' ''Could not record the check start.''))}
+
+# ── Requested mode ─────────────────────────────────────────────────────────────
+if (-not $Mode -or $ExtraArguments.Count) { Write-RunnerLog "Unsupported request: Mode='$Mode'; extra='$($ExtraArguments -join ' ')'"; exit 87 }
+if ($Mode -eq 'view') {
+    # Read-only report window. It never starts another process and never runs
+    # as SYSTEM: the task that calls it is limited to the interactive user.
+    $viewMode = 'Standard'
     try {
-        $historyPath=Join-Path $PSScriptRoot ''guard-state.json''
-        if(Test-Path -LiteralPath $historyPath){
-            $prior=Get-Content -LiteralPath $historyPath -Raw|ConvertFrom-Json
-            if($prior.Schema -eq 1 -and $prior.BuildId -eq $config.BuildId){foreach($item in $prior.Managed){$guardHistory[$item.Key]=$item;$guardNextHistory[$item.Key]=$item}}
-        }
-    }catch{$guardWarnings.Add((T ''Не удалось прочитать прошлую историю; повторность изменений не определяется.'' ''Previous history could not be read; repeated changes cannot be determined.''))}
-    Write-GuardLog ''START'' (T "Проверка при входе; сборка $($config.BuildId)" "Logon check; build $($config.BuildId)")
-    $setup = Get-ItemProperty -LiteralPath ''HKLM:\SYSTEM\Setup'' -ErrorAction Stop
-    if ($setup.OOBEInProgress -eq 1 -or $setup.SystemSetupInProgress -eq 1) {
-        $guardSkippedOobe=$true
-        $counts.Skipped++
-        Write-GuardLog ''SKIP'' (T ''OOBE ещё выполняется. Проверка продолжится при следующем входе.'' ''OOBE is still running. Checks will run at the next logon.'')
-        Add-GuardDetail -Category run -Name ''OOBE'' -Outcome ''not_checked'' -Found $null -Detail (T ''Политики, службы и компоненты не проверялись.'' ''Policies, services and components were not checked.'')
-    } else {
-        if($guardMode -eq ''Debug''){Invoke-GuardPresentation}
-        if ($config.RemoveEdge) {
-            Invoke-GuardCheck -Label ''Edge'' -Category component -Name ''Microsoft Edge'' -Desired absent -Action {
-                param($observation)
-                $browserPaths = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ } | Select-Object -Unique | ForEach-Object { Join-Path $_ ''Microsoft\Edge'' }
-                $hadBrowser = @($browserPaths | Where-Object { Test-Path -LiteralPath $_ }).Count -gt 0
-                $observation.Found=$hadBrowser;$observation.Before=if($hadBrowser){''Present''}else{''Absent''}
-                $global:LASTEXITCODE = 0
-                & (Join-Path $PSScriptRoot ''Finalize.ps1'') -EdgeOnly
-                if ($LASTEXITCODE -ne 0) { throw (T ''Ошибка очистки Edge; см. finalize.log'' ''Edge cleanup failed; see finalize.log'') }
-                if (@($browserPaths | Where-Object { Test-Path -LiteralPath $_ }).Count) { throw (T ''Файлы Edge всё ещё присутствуют'' ''Edge files are still present'') }
-                $observation.After=''Absent''
-                if ($hadBrowser) { ''changed'' } else { ''ok'' }
-            }
-        }
-        foreach ($entry in @($config.Policies)) {
-            $parts = $entry -split ''\|''; $path = $parts[0]; $name = $parts[1]; $want = [int]$parts[2]
-            Invoke-GuardCheck -Label (T "Политика $name" "Policy $name") -Category setting -Name $name -Identity "$path\$name" -Desired ([string]$want) -Action {
-                param($observation)
-                $propertyErrors=@()
-                $current = (Get-ItemProperty -LiteralPath $path -Name $name -ErrorAction SilentlyContinue -ErrorVariable propertyErrors).$name
-                $denied=@($propertyErrors|Where-Object{$_.CategoryInfo.Category -in @(''PermissionDenied'',''SecurityError'')})
-                if($denied.Count){throw $denied[0]}
-                $observation.Found=$null -ne $current;$observation.Before=if($null -eq $current){T ''отсутствовала'' ''missing''}else{[string]$current};$observation.Detail=$path
-                if ($null -ne $current -and [int]$current -eq $want) { $observation.After=[string]$want;return ''ok'' }
-                if (-not (Test-Path -LiteralPath $path)) { New-Item -Path $path -Force | Out-Null }
-                Set-ItemProperty -LiteralPath $path -Name $name -Value $want -Type DWord -Force -ErrorAction Stop
-                $actual = (Get-ItemProperty -LiteralPath $path -Name $name -ErrorAction Stop).$name
-                if ($null -eq $actual -or [int]$actual -ne $want) { throw (T ''Значение не изменилось'' ''Value did not change'') }
-                $observation.After=[string]$actual
-                ''changed''
-            }
-        }
-        foreach ($svc in @($config.Services)) {
-            Invoke-GuardCheck -Label (T "Служба $svc" "Service $svc") -Category service -Name $svc -Desired disabled -Action {
-                param($observation)
-                $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$svc"
-                $observation.Found=[bool](Test-Path -LiteralPath $key)
-                if (-not $observation.Found) { $observation.Before=''Absent'';$observation.After=''Absent'';return ''ok'' }
-                $changed = $false
-                $start=(Get-ItemProperty -LiteralPath $key -Name Start -ErrorAction Stop).Start
-                $service = Get-Service -Name $svc -ErrorAction Stop
-                $observation.Before="Start=$start; $($service.Status)"
-                if ($start -ne 4) {
-                    Set-ItemProperty -LiteralPath $key -Name Start -Value 4 -Type DWord -Force -ErrorAction Stop
-                    $changed = $true
-                }
-                if ($service.Status -ne ''Stopped'') {
-                    Stop-Service -Name $svc -Force -ErrorAction Stop
-                    $service.WaitForStatus(''Stopped'', [TimeSpan]::FromSeconds(10))
-                    $changed = $true
-                }
-                if ((Get-ItemProperty -LiteralPath $key -Name Start -ErrorAction Stop).Start -ne 4) { throw (T ''Служба не отключена'' ''Service is not disabled'') }
-                $observation.After="Start=4; $($service.Status)"
-                if ($changed) { ''changed'' } else { ''ok'' }
-            }
-        }
-        if (@($config.Capabilities).Count) {
-            $capabilities = @(Read-GuardInventory -Label (T ''Получение списка возможностей Windows'' ''Reading Windows capabilities'') -Category capability -Read { Get-WindowsCapability -Online -ErrorAction Stop })
-            foreach ($cap in $capabilities) {
-                if (-not (Test-GuardMatch $cap.Name $config.Capabilities)) { continue }
-                Invoke-GuardCheck -Label (T "Возможность $($cap.Name)" "Capability $($cap.Name)") -Category capability -Name $cap.Name -Desired absent -Action {
-                    param($observation)
-                    $observation.Before=[string]$cap.State;$observation.Found=[string]$cap.State -notin @(''NotPresent'',''Not Present'')
-                    if(-not $observation.Found){$observation.After=[string]$cap.State;return ''ok''}
-                    if([string]$cap.State -match ''Pending''){$observation.After=[string]$cap.State;return ''pending''}
-                    if($cap.State -ne ''Installed''){$observation.Detail=(T "Состояние не допускает удаление: $($cap.State)" "State cannot be removed: $($cap.State)");return ''skipped''}
-                    $result = Remove-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop
-                    $state = (Get-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop).State
-                    $observation.After=[string]$state
-                    if ($state -eq ''NotPresent'' -or $state -eq ''Not Present'') { return ''changed'' }
-                    if ($result.RestartNeeded -or [string]$state -match ''Pending'') { return ''pending'' }
-                    throw (T "Возможность осталась: $state" "Capability remains: $state")
-                }
-            }
-            Add-MissingGuardTargets -Category capability -Patterns $config.Capabilities -Inventory $capabilities -NameProperty Name
-        }
-        if (@($config.Apps).Count) {
-            $apps = @(Read-GuardInventory -Label (T ''Получение списка приложений'' ''Reading apps'') -Category app -Read { Get-AppxPackage -AllUsers -ErrorAction Stop })
-            foreach ($pkg in $apps) {
-                if (-not (Test-GuardMatch $pkg.Name $config.Apps)) { continue }
-                Invoke-GuardCheck -Label (T "Приложение $($pkg.PackageFullName)" "App $($pkg.PackageFullName)") -Category app -Name $pkg.Name -Desired absent -Action {
-                    param($observation)
-                    $observation.Found=$true;$observation.Before=''Installed'';$observation.Detail=$pkg.PackageFullName
-                    Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop
-                    if (@(Get-AppxPackage -AllUsers -Name $pkg.Name -ErrorAction Stop | Where-Object { $_.PackageFullName -eq $pkg.PackageFullName }).Count) {$observation.After=''Pending'';''pending''} else {$observation.After=''Absent'';''changed''}
-                }
-            }
-            Add-MissingGuardTargets -Category app -Patterns $config.Apps -Inventory $apps -NameProperty Name
-            $provisioned = @(Read-GuardInventory -Label (T ''Получение списка встроенных пакетов'' ''Reading provisioned apps'') -Category provisioned -Read { Get-AppxProvisionedPackage -Online -ErrorAction Stop })
-            foreach ($pkg in $provisioned) {
-                if (-not (Test-GuardMatch $pkg.DisplayName $config.Apps)) { continue }
-                Invoke-GuardCheck -Label (T "Встроенный пакет $($pkg.PackageName)" "Provisioned app $($pkg.PackageName)") -Category provisioned -Name $pkg.DisplayName -Desired absent -Action {
-                    param($observation)
-                    $observation.Found=$true;$observation.Before=''Provisioned'';$observation.Detail=$pkg.PackageName
-                    Remove-AppxProvisionedPackage -Online -PackageName $pkg.PackageName -ErrorAction Stop | Out-Null
-                    if (@(Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object { $_.PackageName -eq $pkg.PackageName }).Count) {$observation.After=''Pending'';''pending''} else {$observation.After=''Absent'';''changed''}
-                }
-            }
-            Add-MissingGuardTargets -Category provisioned -Patterns $config.Apps -Inventory $provisioned -NameProperty DisplayName
-        }
-        $driveRoot = [IO.Path]::GetFullPath($env:SystemDrive + ''\'')
-        foreach ($relative in @($config.Paths)) {
-            $guardVisited["path|$relative"]=$true
-            Write-GuardLog ''CHECK'' (T "Поиск $relative" "Checking $relative")
-            $pathErrors = @()
-            $items = @(Get-Item -Path (Join-Path $driveRoot $relative) -Force -ErrorAction SilentlyContinue -ErrorVariable pathErrors)
-            $readErrors = @($pathErrors | Where-Object { $_.CategoryInfo.Category -ne ''ObjectNotFound'' })
-            foreach ($readError in $readErrors) { $counts.Failed++; Write-GuardLog ''ERROR'' "$relative : $($readError.Exception.Message)";Add-GuardDetail -Category path -Name $relative -Outcome failed -Found $null -Detail $readError.Exception.Message }
-            if (-not $items.Count -and -not $readErrors.Count) { $counts.Checked++; Write-GuardLog ''OK'' (T "$relative отсутствует" "$relative is absent");Add-GuardDetail -Category path -Name $relative -Outcome absent -Found $false -Before Absent -After Absent -Desired absent }
-            foreach ($item in $items) {
-                Invoke-GuardCheck -Label (T "Файл/каталог $($item.FullName)" "File/directory $($item.FullName)") -Category path -Name $relative -Identity $item.FullName -Desired absent -Action {
-                    param($observation)
-                    $observation.Found=$true;$observation.Before=''Present'';$observation.Detail=$item.FullName
-                    $observation.Step=(T ''проверка границ пути'' ''path boundary validation'')
-                    $full = [IO.Path]::GetFullPath($item.FullName)
-                    if (-not $full.StartsWith($driveRoot, [StringComparison]::OrdinalIgnoreCase) -or $full.TrimEnd(''\'') -eq $driveRoot.TrimEnd(''\'')) { throw (T ''Путь вне системного диска'' ''Path is outside the system drive'') }
-                    $cursor = $full
-                    while ($cursor) {
-                        $observation.Step=(T "проверка ссылки: $cursor" "link inspection: $cursor")
-                        if ((Get-Item -LiteralPath $cursor -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) { $observation.Detail+=(T ''; ссылка файловой системы не удаляется'' ''; filesystem link is not removed'');return ''skipped'' }
-                        $cursor = Split-Path $cursor -Parent
-                    }
-                    Grant-SystemAccess -Path $full -Recurse:$item.PSIsContainer -Observation $observation
-                    $observation.Step=(T ''удаление (Remove-Item)'' ''removal (Remove-Item)'')
-                    Remove-GuardSelectedPath -Path $full -Directory $item.PSIsContainer -Observation $observation
-                    $observation.Step=(T ''проверка после удаления'' ''verification after removal'')
-                    if (Test-Path -LiteralPath $full -ErrorAction Stop) { throw (T ''Объект остался после удаления'' ''Object remains after removal'') }
-                    $observation.After=''Absent''
-                    ''changed''
-                }
-            }
-        }
-        $guardComplete=$true
+        $config = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'guard.json') -Raw | ConvertFrom-Json
+        $viewMode = Get-GuardMode $config
+        Show-GuardView -SupportDirectory $PSScriptRoot -Mode $viewMode -RunId $RunId -WaitSeconds $(if ($WaitSeconds) { $WaitSeconds } else { 120 })
+    } catch {
+        Write-Host (T 'Не удалось показать отчёт guard. Подробности доступны в папке guard.' 'Could not display the guard report. Details are available in the guard folder.') -ForegroundColor Red
+        if ($viewMode -eq 'Debug') { Write-Host $_.Exception.Message -ForegroundColor Red }
+        $null = Read-Host (T 'Нажмите Enter, чтобы закрыть окно' 'Press Enter to close')
+        exit 1
     }
-} catch {
-    $counts.Failed++
-    Write-GuardLog ''ERROR'' $_.Exception.Message
-    Add-GuardDetail -Category run -Name (T ''Прерывание проверки'' ''Interrupted check'') -Outcome failed -Found $null -Detail $_.Exception.Message
-} finally {
+    exit 0
+}
+if (-not $Direct) { exit (Start-GuestChild -ChildMode $Mode) }
+if ($Mode -eq 'prepare' -or $Mode -eq 'prepare-register') {
+    Invoke-Prepare -RegisterOnly:($Mode -eq 'prepare-register')
+    exit 0
+}
+if ($Mode -eq 'finalize' -or $Mode -eq 'finalize-wait') {
+    Invoke-Finalize -FirstLogon:($Mode -eq 'finalize') -WaitForOobe:($Mode -eq 'finalize-wait') -WaitSeconds $(if ($WaitSeconds) { $WaitSeconds } else { 7200 })
+    if ($script:FinalizeFailed) { exit 1 }
+    exit 0
+}
+if ($Mode -eq 'guard') {
+    # The worker keeps its state in script scope: helpers above read and update
+    # these collections while the checks below run.
+    $config = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'guard.json') -Raw | ConvertFrom-Json
+    $counts = @{Checked=0;Changed=0;Pending=0;Failed=0;Skipped=0;LogFailed=0;ViewFailed=0}
+    $guardRows=[Collections.Generic.List[object]]::new()
+    $guardWarnings=[Collections.Generic.List[string]]::new()
+    $guardHistory=@{}; $guardNextHistory=@{}; $guardInventoryStatus=@{}; $guardVisited=@{}
+    $guardStartedAt=Get-Date; $guardComplete=$false; $guardSkippedOobe=$false
+    $guardRunId=[guid]::NewGuid().ToString()
+    $guardMode = Get-GuardMode $config
+    try { $runLock = [IO.File]::Open((Join-Path $PSScriptRoot 'guard.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    catch [IO.IOException] { return }
     try {
-        if($guardMode -eq ''Standard'' -and -not $guardSkippedOobe){Invoke-GuardPresentation}
-        try { Save-GuardReport } catch {$counts.LogFailed++;try{[Console]::Error.WriteLine("[LOG ERROR] Report: $($_.Exception.Message)")}catch{}}
-        Write-GuardLog ''END'' (T "Проверено $($counts.Checked); изменено $($counts.Changed); ожидают завершения $($counts.Pending); пропущено $($counts.Skipped); ошибок $($counts.Failed)" "Checked $($counts.Checked); changed $($counts.Changed); pending $($counts.Pending); skipped $($counts.Skipped); errors $($counts.Failed)")
-    }
-    finally { $runLock.Dispose() }
-}
-if ($counts.LogFailed) {
-    try { [Console]::Error.WriteLine((T "[LOG ERROR] Не записано строк в guard.log: $($counts.LogFailed); строки переданы в stderr (launcher.log при штатном запуске)." "[LOG ERROR] Lines not written to guard.log: $($counts.LogFailed); forwarded to stderr (launcher.log during normal startup).")) } catch { }
-}
-if ($counts.Failed -or $counts.LogFailed -or $counts.ViewFailed) { exit 1 }
-exit 0
-'
-        }
-        'Guard.UI.ps1' {
-'#Requires -Version 5.1
-# Presentation and task helpers. Dot-sourcing this file does not run the guard.
-function Get-GuardMode {
-    param($Config)
-    if($Config.Mode -in @(''Debug'',''Standard'',''Silent'')){return [string]$Config.Mode}
-    ''Standard''
-}
-
-function Get-GuardExpectedApps {
-    param($Config)
-    $known=@(''Microsoft.SecHealthUI'',''Microsoft.Copilot'',''Microsoft.Windows.Ai.Copilot.Provider'',''Clipchamp.Clipchamp'',''Microsoft.BingNews'',''Microsoft.BingWeather'',''Microsoft.GetHelp'',''Microsoft.Getstarted'',''Microsoft.MicrosoftOfficeHub'',''Microsoft.MicrosoftSolitaireCollection'',''Microsoft.WindowsFeedbackHub'',''Microsoft.YourPhone'',''Microsoft.OutlookForWindows'',''MicrosoftTeams'',''MSTeams'')
-    if($Config.ExpectedApps){$known=@($Config.ExpectedApps)}
-    foreach($name in $known){
-        if(@($Config.Protected|Where-Object{$_ -and $name -match $_}).Count){continue}
-        if(@($Config.Apps|Where-Object{$_ -and $name -match $_}).Count){$name}
-    }
-}
-
-function New-GuardViewerAction {
-    param([string]$SupportDirectory)
-    $powershell=Join-Path $env:SystemRoot ''System32\WindowsPowerShell\v1.0\powershell.exe''
-    # Task Scheduler substitutes the worker''s GUID; no intermediate console.
-    $arguments=''-NoLogo -NoProfile -ExecutionPolicy Bypass -File "''+(Join-Path $SupportDirectory ''guard.ps1'')+''" -View -RunId "$(Arg0)"''
-    New-ScheduledTaskAction -Execute $powershell -Argument $arguments
-}
-
-function Register-GuardViewerTask {
-    param([string]$SupportDirectory,[ValidateSet(''Debug'',''Standard'',''Silent'')][string]$Mode=''Standard'')
-    if($Mode -eq ''Silent''){
-        Unregister-ScheduledTask -TaskName ''win-11-lite guard report'' -Confirm:$false -ErrorAction SilentlyContinue
-    }else{
-        $action=New-GuardViewerAction $SupportDirectory
-        $principal=New-ScheduledTaskPrincipal -GroupId ''S-1-5-32-545'' -RunLevel Limited
-        $settings=New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances Parallel -ExecutionTimeLimit ([TimeSpan]::Zero)
-        # Demand start only. The SYSTEM worker opens this task after the OOBE gate.
-        Register-ScheduledTask -TaskName ''win-11-lite guard report'' -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-    }
-    Unregister-ScheduledTask -TaskName ''win-11-lite guard debug'' -Confirm:$false -ErrorAction SilentlyContinue
-}
-
-function Test-GuardOobeComplete {
-    $setup=Get-ItemProperty -LiteralPath ''HKLM:\SYSTEM\Setup'' -ErrorAction Stop
-    if($env:USERNAME -eq ''defaultuser0'' -or $setup.OOBEInProgress -eq 1 -or $setup.SystemSetupInProgress -eq 1){return $false}
-    if(-not (''Win11Lite.GuardOobe'' -as [type])){
-        Add-Type @''
-using System.Runtime.InteropServices;
-namespace Win11Lite {
-    public static class GuardOobe {
-        [DllImport("kernel32.dll", SetLastError=true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static extern bool OOBEComplete([MarshalAs(UnmanagedType.Bool)] out bool complete);
-    }
-}
-''@
-    }
-    $complete=$false
-    [Win11Lite.GuardOobe]::OOBEComplete([ref]$complete) -and $complete
-}
-
-function Start-GuardViewer {
-    param([string]$SupportDirectory,[guid]$RunId,[ValidateSet(''Debug'',''Standard'',''Silent'')][string]$Mode)
-    if($Mode -eq ''Silent'' -or -not (Test-GuardOobeComplete)){return}
-    $sessions=@(Get-Process -Name explorer -IncludeUserName -ErrorAction SilentlyContinue |
-        Where-Object{$_.SessionId -gt 0 -and $_.UserName -and $_.UserName -notmatch ''\\defaultuser0$''} |
-        Select-Object -ExpandProperty SessionId -Unique)
-    if(-not $sessions.Count){return}
-    $scheduler=New-Object -ComObject ''Schedule.Service''
-    $scheduler.Connect()
-    $task=$scheduler.GetFolder(''\'').GetTask(''win-11-lite guard report'')
-    if(-not $task.Enabled){return}
-    foreach($session in $sessions){
-        # TASK_RUN_USE_SESSION_ID: run as the logged-on user, never as SYSTEM.
-        $null=$task.RunEx($RunId.ToString(),4,[int]$session,$null)
-    }
-}
-
-function Get-GuardBriefReport {
-    param($Report,[bool]$HasHistory)
-    $lines=[Collections.Generic.List[string]]::new()
-    $lines.Add((T ''ИТОГ ПРОВЕРКИ GUARD'' ''GUARD SUMMARY''))
-    $lines.Add((T "Проверка: $(([datetime]$Report.Started).ToString(''yyyy-MM-dd HH:mm:ss''))" "Check: $(([datetime]$Report.Started).ToString(''yyyy-MM-dd HH:mm:ss''))"))
-    $programs=@($Report.Items|Where-Object{$_.Category -in @(''app'',''provisioned'',''component'') -and -not $_.Inventory -and $_.Outcome -ne ''protected''}|Group-Object Name)
-    $programReturned=@($programs|Where-Object{@($_.Group|Where-Object{$_.Reappeared}).Count}).Count
-    $programRemoved=@($programs|Where-Object{
-        @($_.Group|Where-Object{$_.Reappeared}).Count -and -not @($_.Group|Where-Object{$_.Outcome -notin @(''removed'',''absent'')}).Count
-    }).Count
-    $settings=@($Report.Items|Where-Object{$_.Category -in @(''setting'',''service'')})
-    $settingsReturned=@($settings|Where-Object{$_.Reappeared}).Count
-    $settingsFixed=@($settings|Where-Object{$_.Repeated -and $_.Outcome -in @(''disabled'',''stopped'',''set'',''created'')}).Count
-    $lines.Add('''')
-    $lines.Add((T "Программ под контролем удаления: $($programs.Count)" "Programs monitored for removal: $($programs.Count)"))
-    $lines.Add((T "Программы, появившиеся снова: $programReturned" "Programs that reappeared: $programReturned"))
-    $lines.Add((T "Программы, успешно удалённые повторно: $programRemoved" "Programs successfully removed again: $programRemoved"))
-    $lines.Add('''')
-    $lines.Add((T "Настроек и служб под контролем отключения: $($settings.Count)" "Settings and services monitored for disabling: $($settings.Count)"))
-    $lines.Add((T "Настройки и службы, сбившиеся или включившиеся снова: $settingsReturned" "Settings and services changed or enabled again: $settingsReturned"))
-    $lines.Add((T "Настройки и службы, успешно восстановленные повторно: $settingsFixed" "Settings and services successfully restored again: $settingsFixed"))
-    $present=@($programs|Where-Object{@($_.Group|Where-Object{$_.Found -eq $true}).Count}).Count
-    $removed=@($programs|Where-Object{@($_.Group|Where-Object{$_.Outcome -eq ''removed''}).Count -and -not @($_.Group|Where-Object{$_.Outcome -notin @(''removed'',''absent'')}).Count}).Count
-    $fixed=@($settings|Where-Object{$_.Outcome -in @(''disabled'',''stopped'',''set'',''created'')}).Count
-    if($present -or $fixed){$lines.Add((T "Найдено сейчас программ: $present; удалено: $removed; исправлено настроек/служб: $fixed" "Programs found now: $present; removed: $removed; settings/services corrected: $fixed"))}
-    foreach($category in ''capability'',''path''){
-        $rows=@($Report.Items|Where-Object{$_.Category -eq $category -and -not $_.Inventory})
-        $found=@($rows|Where-Object{$_.Found -eq $true}).Count
-        $cleared=@($rows|Where-Object{$_.Outcome -eq ''removed''}).Count
-        if($found){
-            $label=if($category -eq ''path''){T ''Файлы и каталоги'' ''Files and directories''}else{T ''Компоненты Windows'' ''Windows capabilities''}
-            $lines.Add((T "${label}: найдено $found; удалено $cleared" "${label}: found $found; removed $cleared"))
-        }
-    }
-    $pending=@($Report.Items|Where-Object{$_.Outcome -eq ''pending''}).Count
-    $unchecked=@($Report.Items|Where-Object{$_.Outcome -eq ''not_checked''}).Count
-    if($pending){$lines.Add((T "Ожидают завершения удаления: $pending" "Removals still pending: $pending"))}
-    if(-not $Report.Complete -or $Report.Deferred -or $unchecked){$lines.Add((T "Проверка не завершена; непроверенных пунктов: $unchecked" "Check is incomplete; unchecked items: $unchecked"))}
-    if(-not $HasHistory){$lines.Add((T ''Первый запуск: повторность пока неизвестна; история начинается с этой проверки.'' ''First run: recurrence is not yet known; history starts with this check.''))}
-    $lines.Add('''')
-    $lines.Add((T "Ошибок проверки: $($Report.Errors); записи: $($Report.LogErrors); показа: $($Report.ViewErrors)." "Check errors: $($Report.Errors); writing errors: $($Report.LogErrors); display errors: $($Report.ViewErrors)."))
-    foreach($row in $Report.Items|Where-Object{$_.Outcome -eq ''failed''}){
-        $name=if($row.Category -eq ''path''){($row.Name -split ''[\\/]'')[-1]}else{$row.Name}
-        if($row.Category -eq ''path'' -and $row.Detail -match ''(?:^|;)\s*Target=([^\r\n;]+)''){
-            $leaf=($matches[1] -split ''[\\/]'')[-1]
-            if($leaf -and $leaf -ne $name){$name+=" ($leaf)"}
-        }
-        $reason=switch($row.Category){''path''{T ''ошибка удаления/проверки'' ''removal/check error''} ''service''{T ''ошибка проверки службы'' ''service check error''} ''setting''{T ''ошибка проверки настройки'' ''setting check error''} default{T ''ошибка проверки'' ''check error''}}
-        $code=if($row.ErrorCode){$row.ErrorCode}elseif($row.Detail -match ''HRESULT=(0x[0-9A-Fa-f]+)''){$matches[1]}else{''''}
-        $lines.Add("  $name — $reason$(if($code){'' (''+$code+'')''})")
-    }
-    foreach($warning in $Report.Warnings){$lines.Add("! $warning")}
-    [pscustomobject]@{
-        Text=($lines -join "`r`n")
-        Counts=[ordered]@{Programs=$programs.Count;ProgramsReappeared=$programReturned;ProgramsRemovedAgain=$programRemoved;Settings=$settings.Count;SettingsReappeared=$settingsReturned;SettingsRestoredAgain=$settingsFixed;HasHistory=$HasHistory}
-    }
-}
-
-function Show-GuardView {
-    param([string]$SupportDirectory,[ValidateSet(''Debug'',''Standard'',''Silent'')][string]$Mode,[string]$RunId,[int]$WaitSeconds=120)
-    if($Mode -eq ''Silent'' -or -not (Test-GuardOobeComplete)){return}
-    if($RunId -and $RunId -ne ''$(Arg0)''){$null=[guid]::Parse($RunId)}else{$RunId=''''}
-    $Host.UI.RawUI.WindowTitle=''win-11-lite guard - ''+$Mode
-    $deadline=(Get-Date).AddSeconds($WaitSeconds)
-    $reportPath=Join-Path $SupportDirectory ''guard-report.json''
-    if($Mode -eq ''Debug''){
-        $marker=Get-Content -LiteralPath (Join-Path $SupportDirectory ''guard-run.json'') -Raw -Encoding UTF8|ConvertFrom-Json
-        if($RunId -and $marker.RunId -ne $RunId){throw (T ''Этот запуск уже завершён; откройте последний отчёт из папки guard.'' ''This run has been superseded; open the latest report from the guard folder.'')}
-        $log=Join-Path $SupportDirectory ''guard.log''
-        $stream=[IO.File]::Open($log,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
         try{
-            $null=$stream.Seek([long]$marker.LogOffset,[IO.SeekOrigin]::Begin)
-            $reader=[IO.StreamReader]::new($stream,[Text.Encoding]::UTF8,$true)
-            try{
-                $done=$false;$deadline=(Get-Date).AddMinutes(25)
-                while(-not $done){
-                    while($null -ne ($line=$reader.ReadLine())){
-                        $color=if($line -match ''\[ERROR\]''){''Red''}elseif($line -match ''\[CHANGED\]|\[END\]''){''Green''}else{''Gray''}
-                        Write-Host $line -ForegroundColor $color
-                        if($line -match ''\[END\]''){$done=$true;break}
-                    }
-                    if(-not $done){if((Get-Date) -ge $deadline){throw (T ''Истекло время ожидания guard.'' ''Timed out waiting for guard.'')} ;Start-Sleep -Milliseconds 200}
-                }
-            }finally{$reader.Dispose()}
-        }finally{$stream.Dispose()}
-    }else{
-        while($true){
-            $report=$null
-            try{if(Test-Path -LiteralPath $reportPath){$report=Get-Content -LiteralPath $reportPath -Raw -Encoding UTF8|ConvertFrom-Json}}catch{}
-            if($report -and (-not $RunId -or $report.RunId -eq $RunId)){
-                if(-not $report.BriefText){throw (T ''Краткий отчёт ещё не создан. Дождитесь новой проверки guard.'' ''No summary is available yet. Wait for a new guard check.'')}
-                Write-Host $report.BriefText
-                break
+            $offset=if(Test-Path -LiteralPath $logFile){(Get-Item -LiteralPath $logFile).Length}else{0}
+            $marker=@{RunId=$guardRunId;BuildId=$config.BuildId;Started=$guardStartedAt.ToString('o');LogOffset=$offset}|ConvertTo-Json
+            [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'guard-run.json'),$marker,[Text.UTF8Encoding]::new($true))
+        }catch{$counts.LogFailed++;$guardWarnings.Add((T 'Не удалось записать начало проверки.' 'Could not record the check start.'))}
+        try {
+            $historyPath=Join-Path $PSScriptRoot 'guard-state.json'
+            if(Test-Path -LiteralPath $historyPath){
+                $prior=Get-Content -LiteralPath $historyPath -Raw|ConvertFrom-Json
+                if($prior.Schema -eq 1 -and $prior.BuildId -eq $config.BuildId){foreach($item in $prior.Managed){$guardHistory[$item.Key]=$item;$guardNextHistory[$item.Key]=$item}}
             }
-            if((Get-Date) -ge $deadline){throw (T ''Отчёт этого запуска не создан. Проверьте guard.log в папке guard.'' ''No report was created for this run. Check guard.log in the guard folder.'')}
-            Start-Sleep -Milliseconds 200
+        }catch{$guardWarnings.Add((T 'Не удалось прочитать прошлую историю; повторность изменений не определяется.' 'Previous history could not be read; repeated changes cannot be determined.'))}
+        Write-GuardLog 'START' (T "Проверка при входе; сборка $($config.BuildId)" "Logon check; build $($config.BuildId)")
+        $setup = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\Setup' -ErrorAction Stop
+        if ($setup.OOBEInProgress -eq 1 -or $setup.SystemSetupInProgress -eq 1) {
+            $guardSkippedOobe=$true
+            $counts.Skipped++
+            Write-GuardLog 'SKIP' (T 'OOBE ещё выполняется. Проверка продолжится при следующем входе.' 'OOBE is still running. Checks will run at the next logon.')
+            Add-GuardDetail -Category run -Name 'OOBE' -Outcome 'not_checked' -Found $null -Detail (T 'Политики, службы и компоненты не проверялись.' 'Policies, services and components were not checked.')
+        } else {
+            if($guardMode -eq 'Debug'){Invoke-GuardPresentation}
+            if ($config.RemoveEdge) {
+                Invoke-GuardCheck -Label 'Edge' -Category component -Name 'Microsoft Edge' -Desired absent -Action {
+                    param($observation)
+                    $browserPaths = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ } | Select-Object -Unique | ForEach-Object { Join-Path $_ 'Microsoft\Edge' }
+                    $hadBrowser = @($browserPaths | Where-Object { Test-Path -LiteralPath $_ }).Count -gt 0
+                    $observation.Found=$hadBrowser;$observation.Before=if($hadBrowser){'Present'}else{'Absent'}
+                    Invoke-Finalize -EdgeOnly
+                    if ($script:FinalizeFailed) { throw (T 'Ошибка очистки Edge; см. finalize.log' 'Edge cleanup failed; see finalize.log') }
+                    if (@($browserPaths | Where-Object { Test-Path -LiteralPath $_ }).Count) { throw (T 'Файлы Edge всё ещё присутствуют' 'Edge files are still present') }
+                    $observation.After='Absent'
+                    if ($hadBrowser) { 'changed' } else { 'ok' }
+                }
+            }
+            foreach ($entry in @($config.Policies)) {
+                $parts = $entry -split '\|'; $path = $parts[0]; $name = $parts[1]; $want = [int]$parts[2]
+                Invoke-GuardCheck -Label (T "Политика $name" "Policy $name") -Category setting -Name $name -Identity "$path\$name" -Desired ([string]$want) -Action {
+                    param($observation)
+                    $propertyErrors=@()
+                    $current = (Get-ItemProperty -LiteralPath $path -Name $name -ErrorAction SilentlyContinue -ErrorVariable propertyErrors).$name
+                    $denied=@($propertyErrors|Where-Object{$_.CategoryInfo.Category -in @('PermissionDenied','SecurityError')})
+                    if($denied.Count){throw $denied[0]}
+                    $observation.Found=$null -ne $current;$observation.Before=if($null -eq $current){T 'отсутствовала' 'missing'}else{[string]$current};$observation.Detail=$path
+                    if ($null -ne $current -and [int]$current -eq $want) { $observation.After=[string]$want;return 'ok' }
+                    if (-not (Test-Path -LiteralPath $path)) { New-Item -Path $path -Force | Out-Null }
+                    Set-ItemProperty -LiteralPath $path -Name $name -Value $want -Type DWord -Force -ErrorAction Stop
+                    $actual = (Get-ItemProperty -LiteralPath $path -Name $name -ErrorAction Stop).$name
+                    if ($null -eq $actual -or [int]$actual -ne $want) { throw (T 'Значение не изменилось' 'Value did not change') }
+                    $observation.After=[string]$actual
+                    'changed'
+                }
+            }
+            foreach ($svc in @($config.Services)) {
+                Invoke-GuardCheck -Label (T "Служба $svc" "Service $svc") -Category service -Name $svc -Desired disabled -Action {
+                    param($observation)
+                    $key = "HKLM:\SYSTEM\CurrentControlSet\Services\$svc"
+                    $observation.Found=[bool](Test-Path -LiteralPath $key)
+                    if (-not $observation.Found) { $observation.Before='Absent';$observation.After='Absent';return 'ok' }
+                    $changed = $false
+                    $start=(Get-ItemProperty -LiteralPath $key -Name Start -ErrorAction Stop).Start
+                    $service = Get-Service -Name $svc -ErrorAction Stop
+                    $observation.Before="Start=$start; $($service.Status)"
+                    if ($start -ne 4) {
+                        Set-ItemProperty -LiteralPath $key -Name Start -Value 4 -Type DWord -Force -ErrorAction Stop
+                        $changed = $true
+                    }
+                    if ($service.Status -ne 'Stopped') {
+                        Stop-Service -Name $svc -Force -ErrorAction Stop
+                        $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(10))
+                        $changed = $true
+                    }
+                    if ((Get-ItemProperty -LiteralPath $key -Name Start -ErrorAction Stop).Start -ne 4) { throw (T 'Служба не отключена' 'Service is not disabled') }
+                    $observation.After="Start=4; $($service.Status)"
+                    if ($changed) { 'changed' } else { 'ok' }
+                }
+            }
+            if (@($config.Capabilities).Count) {
+                $capabilities = @(Read-GuardInventory -Label (T 'Получение списка возможностей Windows' 'Reading Windows capabilities') -Category capability -Read { Get-WindowsCapability -Online -ErrorAction Stop })
+                foreach ($cap in $capabilities) {
+                    if (-not (Test-GuardMatch $cap.Name $config.Capabilities)) { continue }
+                    Invoke-GuardCheck -Label (T "Возможность $($cap.Name)" "Capability $($cap.Name)") -Category capability -Name $cap.Name -Desired absent -Action {
+                        param($observation)
+                        $observation.Before=[string]$cap.State;$observation.Found=[string]$cap.State -notin @('NotPresent','Not Present')
+                        if(-not $observation.Found){$observation.After=[string]$cap.State;return 'ok'}
+                        if([string]$cap.State -match 'Pending'){$observation.After=[string]$cap.State;return 'pending'}
+                        if($cap.State -ne 'Installed'){$observation.Detail=(T "Состояние не допускает удаление: $($cap.State)" "State cannot be removed: $($cap.State)");return 'skipped'}
+                        $result = Remove-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop
+                        $state = (Get-WindowsCapability -Online -Name $cap.Name -ErrorAction Stop).State
+                        $observation.After=[string]$state
+                        if ($state -eq 'NotPresent' -or $state -eq 'Not Present') { return 'changed' }
+                        if ($result.RestartNeeded -or [string]$state -match 'Pending') { return 'pending' }
+                        throw (T "Возможность осталась: $state" "Capability remains: $state")
+                    }
+                }
+                Add-MissingGuardTargets -Category capability -Patterns $config.Capabilities -Inventory $capabilities -NameProperty Name
+            }
+            if (@($config.Apps).Count) {
+                $apps = @(Read-GuardInventory -Label (T 'Получение списка приложений' 'Reading apps') -Category app -Read { Get-AppxPackage -AllUsers -ErrorAction Stop })
+                foreach ($pkg in $apps) {
+                    if (-not (Test-GuardMatch $pkg.Name $config.Apps)) { continue }
+                    Invoke-GuardCheck -Label (T "Приложение $($pkg.PackageFullName)" "App $($pkg.PackageFullName)") -Category app -Name $pkg.Name -Desired absent -Action {
+                        param($observation)
+                        $observation.Found=$true;$observation.Before='Installed';$observation.Detail=$pkg.PackageFullName
+                        Remove-AppxPackage -Package $pkg.PackageFullName -AllUsers -ErrorAction Stop
+                        if (@(Get-AppxPackage -AllUsers -Name $pkg.Name -ErrorAction Stop | Where-Object { $_.PackageFullName -eq $pkg.PackageFullName }).Count) {$observation.After='Pending';'pending'} else {$observation.After='Absent';'changed'}
+                    }
+                }
+                Add-MissingGuardTargets -Category app -Patterns $config.Apps -Inventory $apps -NameProperty Name
+                $provisioned = @(Read-GuardInventory -Label (T 'Получение списка встроенных пакетов' 'Reading provisioned apps') -Category provisioned -Read { Get-AppxProvisionedPackage -Online -ErrorAction Stop })
+                foreach ($pkg in $provisioned) {
+                    if (-not (Test-GuardMatch $pkg.DisplayName $config.Apps)) { continue }
+                    Invoke-GuardCheck -Label (T "Встроенный пакет $($pkg.PackageName)" "Provisioned app $($pkg.PackageName)") -Category provisioned -Name $pkg.DisplayName -Desired absent -Action {
+                        param($observation)
+                        $observation.Found=$true;$observation.Before='Provisioned';$observation.Detail=$pkg.PackageName
+                        Remove-AppxProvisionedPackage -Online -PackageName $pkg.PackageName -ErrorAction Stop | Out-Null
+                        if (@(Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object { $_.PackageName -eq $pkg.PackageName }).Count) {$observation.After='Pending';'pending'} else {$observation.After='Absent';'changed'}
+                    }
+                }
+                Add-MissingGuardTargets -Category provisioned -Patterns $config.Apps -Inventory $provisioned -NameProperty DisplayName
+            }
+            $driveRoot = [IO.Path]::GetFullPath($env:SystemDrive + '\')
+            foreach ($relative in @($config.Paths)) {
+                $guardVisited["path|$relative"]=$true
+                Write-GuardLog 'CHECK' (T "Поиск $relative" "Checking $relative")
+                $pathErrors = @()
+                $items = @(Get-Item -Path (Join-Path $driveRoot $relative) -Force -ErrorAction SilentlyContinue -ErrorVariable pathErrors)
+                $readErrors = @($pathErrors | Where-Object { $_.CategoryInfo.Category -ne 'ObjectNotFound' })
+                foreach ($readError in $readErrors) { $counts.Failed++; Write-GuardLog 'ERROR' "$relative : $($readError.Exception.Message)";Add-GuardDetail -Category path -Name $relative -Outcome failed -Found $null -Detail $readError.Exception.Message }
+                if (-not $items.Count -and -not $readErrors.Count) { $counts.Checked++; Write-GuardLog 'OK' (T "$relative отсутствует" "$relative is absent");Add-GuardDetail -Category path -Name $relative -Outcome absent -Found $false -Before Absent -After Absent -Desired absent }
+                foreach ($item in $items) {
+                    Invoke-GuardCheck -Label (T "Файл/каталог $($item.FullName)" "File/directory $($item.FullName)") -Category path -Name $relative -Identity $item.FullName -Desired absent -Action {
+                        param($observation)
+                        $observation.Found=$true;$observation.Before='Present';$observation.Detail=$item.FullName
+                        $observation.Step=(T 'проверка границ пути' 'path boundary validation')
+                        $full = [IO.Path]::GetFullPath($item.FullName)
+                        if (-not $full.StartsWith($driveRoot, [StringComparison]::OrdinalIgnoreCase) -or $full.TrimEnd('\') -eq $driveRoot.TrimEnd('\')) { throw (T 'Путь вне системного диска' 'Path is outside the system drive') }
+                        $cursor = $full
+                        while ($cursor) {
+                            $observation.Step=(T "проверка ссылки: $cursor" "link inspection: $cursor")
+                            if ((Get-Item -LiteralPath $cursor -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) { $observation.Detail+=(T '; ссылка файловой системы не удаляется' '; filesystem link is not removed');return 'skipped' }
+                            $cursor = Split-Path $cursor -Parent
+                        }
+                        Grant-SystemAccess -Path $full -Recurse:$item.PSIsContainer -Observation $observation
+                        $observation.Step=(T 'удаление (Remove-Item)' 'removal (Remove-Item)')
+                        Remove-GuardSelectedPath -Path $full -Directory $item.PSIsContainer -Observation $observation
+                        $observation.Step=(T 'проверка после удаления' 'verification after removal')
+                        if (Test-Path -LiteralPath $full -ErrorAction Stop) { throw (T 'Объект остался после удаления' 'Object remains after removal') }
+                        $observation.After='Absent'
+                        'changed'
+                    }
+                }
+            }
+            $guardComplete=$true
         }
-    }
-    $null=Read-Host (T ''Нажмите Enter, чтобы закрыть окно'' ''Press Enter to close'')
-}
-'
+    } catch {
+        $counts.Failed++
+        Write-GuardLog 'ERROR' $_.Exception.Message
+        Add-GuardDetail -Category run -Name (T 'Прерывание проверки' 'Interrupted check') -Outcome failed -Found $null -Detail $_.Exception.Message
+    } finally {
+        try {
+            if($guardMode -eq 'Standard' -and -not $guardSkippedOobe){Invoke-GuardPresentation}
+            try { Save-GuardReport } catch {$counts.LogFailed++;try{[Console]::Error.WriteLine("[LOG ERROR] Report: $($_.Exception.Message)")}catch{}}
+            Write-GuardLog 'END' (T "Проверено $($counts.Checked); изменено $($counts.Changed); ожидают завершения $($counts.Pending); пропущено $($counts.Skipped); ошибок $($counts.Failed)" "Checked $($counts.Checked); changed $($counts.Changed); pending $($counts.Pending); skipped $($counts.Skipped); errors $($counts.Failed)")
         }
-        'Run-Setup.ps1' {
-'#Requires -Version 5.1
-# Standard PowerShell entry point for Windows Setup and scheduled tasks.
-param([string]$Mode, [Parameter(ValueFromRemainingArguments=$true)][string[]]$ExtraArguments)
-$ErrorActionPreference=''Stop''
-$ProgressPreference=''SilentlyContinue''
-$logPath=Join-Path $PSScriptRoot ''launcher.log''
-function Write-RunnerLog {
-    param([string]$Message)
-    for($attempt=0;$attempt -lt 5;$attempt++){
-        try{[IO.File]::AppendAllText($logPath,"$(Get-Date -Format s) [$Mode] $Message`r`n",[Text.UTF8Encoding]::new($true));return}
-        catch [IO.IOException]{Start-Sleep -Milliseconds 50}
-        catch [UnauthorizedAccessException]{return} # Limited debug observer can read the support folder.
+        finally { $runLock.Dispose() }
     }
-}
-function Test-SetupOobeComplete {
-    if(-not (''Win11Lite.RunnerOobe'' -as [type])){
-        Add-Type @''
-using System.Runtime.InteropServices;
-namespace Win11Lite {
-    public static class RunnerOobe {
-        [DllImport("kernel32.dll", SetLastError=true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static extern bool OOBEComplete([MarshalAs(UnmanagedType.Bool)] out bool complete);
+    if ($counts.LogFailed) {
+        try { [Console]::Error.WriteLine((T "[LOG ERROR] Не записано строк в guard.log: $($counts.LogFailed); строки переданы в stderr (launcher.log при штатном запуске)." "[LOG ERROR] Lines not written to guard.log: $($counts.LogFailed); forwarded to stderr (launcher.log during normal startup).")) } catch { }
     }
+    if ($counts.Failed -or $counts.LogFailed -or $counts.ViewFailed) { exit 1 }
+    exit 0
 }
-''@
-    }
-    $complete=$false
-    if(-not [Win11Lite.RunnerOobe]::OOBEComplete([ref]$complete)){return $false}
-    $complete
+exit 0
+'@
+    # Canonical Windows newlines and a final line break, so a Git LF checkout
+    # still writes byte-identical content into the image.
+    ($text -replace '\r?\n', "`r`n") + "`r`n"
 }
-$entry=switch($Mode){
-    ''prepare''          {@{File=''Prepare.ps1'';Arguments=''''}}
-    ''prepare-register'' {@{File=''Prepare.ps1'';Arguments=''-RegisterOnly''}}
-    ''finalize''         {@{File=''Finalize.ps1'';Arguments=''-FirstLogon''}}
-    ''finalize-wait''    {@{File=''Finalize.ps1'';Arguments=''-WaitForOobe''}}
-    ''guard''            {@{File=''guard.ps1'';Arguments=''''}}
-    ''guard-debug''      {@{File=''guard.ps1'';Arguments=''-ShowDebugWindow''}}
-}
-if(-not $entry -or $ExtraArguments.Count){Write-RunnerLog ''Unsupported mode'';exit 87}
-try{
-    $scriptPath=Join-Path $PSScriptRoot $entry.File
-    if(-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)){Write-RunnerLog "Script not found: $($entry.File)";exit 2}
-    if($Mode -eq ''guard-debug''){
-        $deadline=(Get-Date).AddHours(2);$waiting=$false
-        while(-not (Test-SetupOobeComplete)){
-            if(-not $waiting){Write-RunnerLog ''WAIT OOBE completion before opening the debug viewer'';$waiting=$true}
-            if((Get-Date) -ge $deadline){Write-RunnerLog ''OOBE wait timed out'';exit 1460}
-            Start-Sleep -Milliseconds 500
-        }
-    }
-    $psi=[Diagnostics.ProcessStartInfo]::new()
-    $psi.FileName=Join-Path $env:SystemRoot ''System32\WindowsPowerShell\v1.0\powershell.exe''
-    $psi.Arguments=''-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "''+$scriptPath+''" ''+$entry.Arguments
-    $psi.WorkingDirectory=$PSScriptRoot
-    $psi.UseShellExecute=$false;$psi.CreateNoWindow=$true;$psi.WindowStyle=[Diagnostics.ProcessWindowStyle]::Hidden
-    $psi.RedirectStandardInput=$true;$psi.RedirectStandardOutput=$true;$psi.RedirectStandardError=$true
-    # Windows PowerShell uses the system OEM code page when its output is redirected.
-    $codePage=[int](Get-ItemProperty -LiteralPath ''HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage'' -Name OEMCP).OEMCP
-    $psi.StandardOutputEncoding=[Text.Encoding]::GetEncoding($codePage)
-    $psi.StandardErrorEncoding=$psi.StandardOutputEncoding
-    $process=[Diagnostics.Process]::new();$process.StartInfo=$psi
-    try{
-        if(-not $process.Start()){throw ''PowerShell did not start''}
-        Write-RunnerLog "START PID=$($process.Id)"
-        $process.StandardInput.Close()
-        $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
-        $process.WaitForExit()
-        $output=$stdout.GetAwaiter().GetResult();$errorText=$stderr.GetAwaiter().GetResult()
-        if($output.Trim()){Write-RunnerLog $output.Trim()}
-        if($errorText.Trim()){Write-RunnerLog (''STDERR ''+$errorText.Trim())}
-        $code=$process.ExitCode;Write-RunnerLog "END ExitCode=$code"
-    }finally{$process.Dispose()}
-    exit $code
-}catch{Write-RunnerLog (''ERROR ''+($_|Out-String).Trim());exit 1}
-'
-        }
-        default { throw (T "Нет встроенного ресурса: $Name" "Bundled resource not found: $Name") }
-    }
-    $text -replace '\r?\n', "`r`n"
-}
-#endregion Bundled resources
+#endregion Guest script
 
 #region ── Каталоги ADK: чтение установщиков Microsoft ──────────────────────────
 
@@ -3042,8 +3295,6 @@ function Get-AdkCatalog {
 
 #endregion
 
-function Get-GuardScript { Get-BundledResource -Name 'guard.ps1' }
-
 function Get-NativeToolVersion {
     param([string]$Path)
     if (-not $Path -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) { return [version]'0.0' }
@@ -3141,282 +3392,6 @@ function Ensure-WimMountDriver {
     if (-not (Test-DismSuccess $code) -or -not (Test-Path $key)) { throw (T "Не удалось зарегистрировать WIMMount (код $code)" "Could not register WIMMount (exit code $code)") }
 }
 
-function Get-SetupRunnerScript {
-    if($Guard){$null=Get-BundledResource 'guard.ps1';$null=Get-BundledResource 'Guard.UI.ps1'}
-    Get-BundledResource -Name 'Run-Setup.ps1'
-}
-function Get-SetupSupportScripts {
-    param([bool]$BlockNetwork, [bool]$RemoveEdge, [bool]$EnableGuard, [bool]$ManageOobe = $true, [string]$Language = 'en-US', [bool]$ShowGuardWindow = $true, [ValidateSet('Debug','Standard','Silent')][string]$GuardMode='Standard')
-    if($PSBoundParameters.ContainsKey('ShowGuardWindow') -and -not $ShowGuardWindow){$GuardMode='Silent'}
-    $prepare = @'
-#Requires -Version 5.1
-param([switch]$RegisterOnly)
-$ErrorActionPreference = 'Stop'
-function T { param([string]$Ru, [string]$En) if ('__LANG__' -like 'ru*') { $Ru } else { $En } }
-$log = Join-Path $PSScriptRoot 'prepare.log'
-function Write-PrepareLog {
-    param([string]$Message)
-    try { "$(Get-Date -Format s) $Message" | Add-Content -LiteralPath $log -Encoding UTF8 }
-    catch { Write-Warning $Message }
-}
-Write-PrepareLog (T "START: RegisterOnly=$RegisterOnly; пользователь=$env:USERNAME" "START: RegisterOnly=$RegisterOnly; user=$env:USERNAME")
-# The answer file calls Finalize.ps1 directly at the first real user logon.
-# Scheduler availability during specialize must not prevent network blocking.
-if (__NETWORK__ -and -not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'oobe-complete'))) {
-    # Блок действует и для интерфейсов, которые PnP добавит после specialize.
-    # SetupComplete повторяет проверку: RegisterOnly больше не пропускает сеть.
-    $firewallName = 'Win11Lite-OOBE-Temporary-Outbound-Block'
-    $firewallReady = $false
-    try {
-        $rule = Get-NetFirewallRule -Name $firewallName -PolicyStore PersistentStore -ErrorAction SilentlyContinue
-        if ($rule) {
-            Set-NetFirewallRule -Name $firewallName -PolicyStore PersistentStore -Enabled True -Direction Outbound -Action Block -Profile Any | Out-Null
-        } else {
-            New-NetFirewallRule -Name $firewallName -DisplayName $firewallName -PolicyStore PersistentStore -Enabled True -Direction Outbound -Action Block -Profile Any | Out-Null
-        }
-        $firewallReady = $true
-        Write-PrepareLog (T 'OOBE: временная блокировка исходящей сети включена' 'OOBE: temporary outbound network block enabled')
-    } catch {
-        Write-PrepareLog (T "OOBE: блокировка брандмауэра недоступна: $($_.Exception.Message); проверяю адаптеры" "OOBE: firewall block unavailable: $($_.Exception.Message); checking adapters")
-    }
-    $statePath = Join-Path $PSScriptRoot 'network-state.clixml'
-    $saved = @()
-    if (Test-Path -LiteralPath $statePath) { $saved = @(Import-Clixml -LiteralPath $statePath) }
-    $allAdapters = @()
-    for ($attempt = 0; $attempt -lt 15; $attempt++) {
-        try { $allAdapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop) }
-        catch {
-            if ($attempt -eq 14) {
-                Write-PrepareLog (T "OOBE: ошибка получения адаптеров: $($_.Exception.Message)" "OOBE: adapter enumeration failed: $($_.Exception.Message)")
-                if ($firewallReady) { break }
-                throw
-            }
-        }
-        if ($allAdapters.Count) { break }
-        if ($attempt -lt 14) { Start-Sleep -Seconds 1 }
-    }
-    $adapters = @($allAdapters | Where-Object { [string]$_.AdminStatus -in @('Up', '1') })
-    $saved = @(@($saved) + @($adapters | Select-Object InterfaceGuid) | Sort-Object InterfaceGuid -Unique)
-    Export-Clixml -LiteralPath $statePath -InputObject $saved
-    foreach ($adapter in $adapters) { $adapter | Disable-NetAdapter -Confirm:$false }
-    foreach ($adapter in $adapters) { Write-PrepareLog (T "OOBE: отключён $($adapter.Name), GUID=$($adapter.InterfaceGuid)" "OOBE: disabled $($adapter.Name), GUID=$($adapter.InterfaceGuid)") }
-    $changedIds = @($adapters | ForEach-Object { [string]$_.InterfaceGuid })
-    for ($attempt = 0; $attempt -lt 5; $attempt++) {
-        $remaining = @(Get-NetAdapter -IncludeHidden | Where-Object { [string]$_.InterfaceGuid -in $changedIds -and [string]$_.AdminStatus -in @('Up','1') })
-        if (-not $remaining.Count) { break }
-        Start-Sleep -Milliseconds 500
-    }
-    if ($remaining.Count) {
-        $message = T 'Не все адаптеры отключены для OOBE' 'Some adapters remain enabled for OOBE'
-        Write-PrepareLog $message
-        throw $message
-    }
-    Write-PrepareLog (T "OOBE: отключено адаптеров $($adapters.Count); сохранено для восстановления $($saved.Count)" "OOBE: $($adapters.Count) adapters disabled; $($saved.Count) saved for restoration")
-    if (-not $allAdapters.Count) {
-        if (-not $firewallReady) { throw (T 'OOBE: нет доступных адаптеров и не удалось установить сетевой блок; отключение сети не подтверждено' 'OOBE: no adapters are available and firewall blocking failed; network isolation is unconfirmed') }
-        Write-PrepareLog (T 'OOBE: адаптеры пока не появились; остаётся временный сетевой блок, SetupComplete повторит проверку' 'OOBE: no adapters have appeared yet; temporary network block remains and SetupComplete will retry')
-    }
-}
-try {
-$taskName = 'win-11-lite finalize'
-$exe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-$runnerArguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}\Run-Setup.ps1" -Mode ' -f $PSScriptRoot
-$action = New-ScheduledTaskAction -Execute $exe -Argument ($runnerArguments + 'finalize-wait')
-$trigger = New-ScheduledTaskTrigger -AtLogOn
-$trigger.Delay = 'PT30S'
-$principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
-$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 20)
-$finalizeSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 3)
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $finalizeSettings -Force | Out-Null
-if (__GUARD__) {
-    $guardAction = New-ScheduledTaskAction -Execute $exe -Argument ($runnerArguments + 'guard')
-    Register-ScheduledTask -TaskName 'win-11-lite guard' -Action $guardAction -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-    . (Join-Path $PSScriptRoot 'Guard.UI.ps1')
-    $viewerMode='__GUARDMODE__'
-    $guardConfigPath=Join-Path $PSScriptRoot 'guard.json'
-    if(Test-Path -LiteralPath $guardConfigPath){$viewerMode=Get-GuardMode (Get-Content -LiteralPath $guardConfigPath -Raw|ConvertFrom-Json)}
-    Register-GuardViewerTask -SupportDirectory $PSScriptRoot -Mode $viewerMode
-}
-Write-PrepareLog (T 'Задачи первого входа зарегистрированы' 'First-logon tasks registered')
-} catch {
-    Write-PrepareLog (T "Планировщик недоступен: $($_.Exception.Message)" "Task Scheduler unavailable: $($_.Exception.Message)")
-    if (-not __OOBE__) { throw }
-    Write-PrepareLog (T 'Завершение установки выполнит FirstLogonCommands' 'FirstLogonCommands will finalize setup')
-}
-'@
-    $finalize = @'
-#Requires -Version 5.1
-param([switch]$EdgeOnly, [switch]$FirstLogon, [switch]$WaitForOobe, [ValidateRange(1,86400)][int]$WaitSeconds = 7200)
-$ErrorActionPreference = 'Stop'
-function T { param([string]$Ru, [string]$En) if ('__LANG__' -like 'ru*') { $Ru } else { $En } }
-$log = Join-Path $PSScriptRoot 'finalize.log'
-function Write-FinalizeLog {
-    param([string]$Message)
-    try { "$(Get-Date -Format s) $Message" | Add-Content -LiteralPath $log -Encoding UTF8 }
-    catch { Write-Warning $Message }
-}
-function Test-OobeComplete {
-    try {
-    if (-not ('Win11Lite.OobeStatus' -as [type])) {
-        Add-Type -TypeDefinition @"
-using System.Runtime.InteropServices;
-namespace Win11Lite {
-    public static class OobeStatus {
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        public static extern bool OOBEComplete([MarshalAs(UnmanagedType.Bool)] out bool complete);
-    }
-}
-"@
-    }
-    $complete = $false
-    if (-not [Win11Lite.OobeStatus]::OOBEComplete([ref]$complete)) {
-        throw (T "Не удалось проверить окончание OOBE: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" "Could not query OOBE completion: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())")
-    }
-    return $complete
-    } catch {
-        if ($script:OobeProbeError -ne $_.Exception.Message) {
-            Write-FinalizeLog (T "WAIT: состояние OOBE недоступно: $($_.Exception.Message)" "WAIT: OOBE state unavailable: $($_.Exception.Message)")
-        }
-        $script:OobeProbeError = $_.Exception.Message
-        return $false
-    }
-}
-Write-FinalizeLog (T "START: FirstLogon=$FirstLogon; WaitForOobe=$WaitForOobe; EdgeOnly=$EdgeOnly; пользователь=$env:USERNAME" "START: FirstLogon=$FirstLogon; WaitForOobe=$WaitForOobe; EdgeOnly=$EdgeOnly; user=$env:USERNAME")
-if (-not $EdgeOnly) {
-    if ($env:USERNAME -match '^defaultuser\d+$') { Write-FinalizeLog (T 'SKIP: временный пользователь OOBE' 'SKIP: temporary OOBE user'); return }
-    $complete = Test-OobeComplete
-    if (-not $complete -and $WaitForOobe) {
-        Write-FinalizeLog (T 'WAIT: OOBE ещё выполняется, сеть остаётся заблокирована' 'WAIT: OOBE is still running; network remains blocked')
-        $deadline = (Get-Date).AddSeconds($WaitSeconds)
-        while (-not (Test-OobeComplete)) {
-            if ((Get-Date) -ge $deadline) { throw (T 'Истекло ожидание OOBE; задача сохранена для следующего входа' 'OOBE wait timed out; task retained for next logon') }
-            Start-Sleep -Seconds 2
-        }
-    } elseif (-not $complete) {
-        Write-FinalizeLog (T 'WAIT: первый вход ещё не подтверждает окончание OOBE' 'WAIT: first logon does not yet confirm OOBE completion')
-        if ($FirstLogon) {
-            # Не удерживаем FirstLogonCommands: это может задержать открытие рабочего стола.
-            $exe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-            Start-Process -FilePath $exe -WindowStyle Hidden -ArgumentList ('-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}\Run-Setup.ps1" -Mode finalize-wait' -f $PSScriptRoot) | Out-Null
-        }
-        return
-    }
-    Write-FinalizeLog 'OOBEComplete=True'
-}
-# The logon task and FirstLogonCommands may start together; allow one finalizer.
-try { $finalizeLock = [IO.File]::Open((Join-Path $PSScriptRoot 'finalize.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
-catch [IO.IOException] { return }
-try {
-$failed = $false
-if (-not $EdgeOnly -and __OOBE__) {
-    # Поздний SetupComplete не должен снова отключать сеть после завершения OOBE.
-    try { Set-Content -LiteralPath (Join-Path $PSScriptRoot 'oobe-complete') -Value (Get-Date -Format o) -Encoding ascii }
-    catch { $failed = $true; Write-FinalizeLog (T "Не удалось записать окончание OOBE: $($_.Exception.Message)" "Could not record OOBE completion: $($_.Exception.Message)") }
-}
-try {
-    if (__EDGE__) {
-        # EdgeUpdate/WebView2 and their shared EdgeCore files are preserved.
-        foreach ($programRoot in @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Select-Object -Unique) {
-            if (-not $programRoot) { continue }
-            $browser = [IO.Path]::GetFullPath((Join-Path $programRoot 'Microsoft\Edge'))
-            if (-not $browser.StartsWith(([IO.Path]::GetFullPath($programRoot).TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase)) { throw (T 'Неверный путь Edge' 'Invalid Edge path') }
-            if (Test-Path -LiteralPath $browser) {
-                $cursor = $browser
-                while ($cursor) {
-                    if ((Get-Item -LiteralPath $cursor -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw (T "Обнаружена ссылка файловой системы: $cursor" "Reparse point: $cursor") }
-                    $cursor = Split-Path $cursor -Parent
-                }
-                Get-Process -Name msedge -ErrorAction SilentlyContinue | Where-Object {
-                    $_.Path -and $_.Path.StartsWith("$browser\", [StringComparison]::OrdinalIgnoreCase)
-                } | Stop-Process -Force
-                & {
-                    # takeown/icacls write to stderr; under PowerShell 5.1 with Stop that would throw before Remove-Item.
-                    $ErrorActionPreference = 'Continue'
-                    & takeown.exe /F $browser /A /R /D Y *> $null
-                    & icacls.exe $browser /grant '*S-1-5-18:(OI)(CI)F' /T /C /Q *> $null
-                }
-                Remove-Item -LiteralPath $browser -Recurse -Force
-                if (Test-Path -LiteralPath $browser) { throw (T "Не удалось удалить Edge: $browser" "Edge removal failed: $browser") }
-            }
-        }
-        $stable = '{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}'
-        foreach ($view in @('SOFTWARE', 'SOFTWARE\WOW6432Node')) {
-            foreach ($suffix in @("Microsoft\EdgeUpdate\Clients\$stable", "Microsoft\EdgeUpdate\ClientState\$stable", "Microsoft\EdgeUpdate\ClientStateMedium\$stable", 'Microsoft\Windows\CurrentVersion\Uninstall\Microsoft Edge', 'Microsoft\Windows\CurrentVersion\App Paths\msedge.exe', 'Clients\StartMenuInternet\Microsoft Edge')) {
-                $key = "HKLM:\$view\$suffix"
-                if (Test-Path -LiteralPath $key) { Remove-Item -LiteralPath $key -Recurse -Force }
-            }
-        }
-        $shortcuts = @((Join-Path $env:PUBLIC 'Desktop\Microsoft Edge.lnk'), (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Microsoft Edge.lnk'))
-        foreach ($profile in Get-CimInstance Win32_UserProfile | Where-Object { -not $_.Special -and $_.LocalPath }) {
-            $shortcuts += Join-Path $profile.LocalPath 'Desktop\Microsoft Edge.lnk'
-        }
-        foreach ($shortcut in $shortcuts) { if (Test-Path -LiteralPath $shortcut) { Remove-Item -LiteralPath $shortcut -Force } }
-    }
-} catch {
-    $failed = $true
-    "$(Get-Date -Format s) $($_.Exception.Message)" | Add-Content -LiteralPath $log -Encoding UTF8
-} finally {
-    # Always restore connectivity, even if optional cleanup failed.
-    if (-not $EdgeOnly -and __OOBE__) {
-    try {
-        $statePath = Join-Path $PSScriptRoot 'network-state.clixml'
-        if (Test-Path -LiteralPath $statePath) {
-            $saved = @(Import-Clixml -LiteralPath $statePath)
-            foreach ($adapter in Get-NetAdapter -IncludeHidden) {
-                if ([string]$adapter.InterfaceGuid -in @($saved | ForEach-Object { [string]$_.InterfaceGuid })) {
-                    $adapter | Enable-NetAdapter -Confirm:$false
-                    Write-FinalizeLog (T "Сеть: включён GUID=$($adapter.InterfaceGuid)" "Network: enabled GUID=$($adapter.InterfaceGuid)")
-                }
-            }
-            Remove-Item -LiteralPath $statePath -Force
-        }
-    } catch {
-        $failed = $true
-        Write-FinalizeLog (T "Ошибка возврата адаптеров: $($_.Exception.Message)" "Adapter restoration failed: $($_.Exception.Message)")
-    }
-    # Независимо от отказа отдельного адаптера снимаем только собственный сетевой блок.
-    if (__NETWORK__) {
-    try {
-        $firewallName = 'Win11Lite-OOBE-Temporary-Outbound-Block'
-        # Не путать недоступность провайдера с отсутствием правила.
-        $rules = @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction Stop | Where-Object { $_.Name -eq $firewallName })
-        if ($rules.Count) {
-            Remove-NetFirewallRule -Name $firewallName -PolicyStore PersistentStore -ErrorAction Stop
-            Write-FinalizeLog (T 'Сеть: временная блокировка брандмауэра снята' 'Network: temporary firewall block removed')
-        }
-    } catch {
-        $failed = $true
-        Write-FinalizeLog (T "Ошибка снятия сетевого блока: $($_.Exception.Message)" "Network block removal failed: $($_.Exception.Message)")
-    }
-    }
-    try {
-        foreach ($entry in @(
-            @('HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU', 'NoAutoUpdate'),
-            @('HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate', 'DoNotConnectToWindowsUpdateInternetLocations'),
-            @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\OOBE', 'DisableOOBEUpdate')
-        )) {
-            if (Get-ItemProperty -LiteralPath $entry[0] -Name $entry[1] -ErrorAction SilentlyContinue) {
-                Remove-ItemProperty -LiteralPath $entry[0] -Name $entry[1]
-            }
-        }
-    } catch {
-        $failed = $true
-        "$(Get-Date -Format s) $(T 'Ошибка восстановления' 'Restore failed'): $($_.Exception.Message)" | Add-Content -LiteralPath $log -Encoding UTF8
-    }
-    }
-}
-if (-not $failed -and -not $EdgeOnly) {
-    "$(Get-Date -Format s) $(T 'Завершение установки выполнено' 'Finalization completed')" | Add-Content -LiteralPath $log -Encoding UTF8
-    Unregister-ScheduledTask -TaskName 'win-11-lite finalize' -Confirm:$false -ErrorAction SilentlyContinue
-}
-} finally { $finalizeLock.Dispose() }
-if ($failed) { exit 1 }
-'@
-    $prepare = $prepare.Replace('__NETWORK__', ('$' + $BlockNetwork.ToString().ToLowerInvariant())).Replace('__GUARD__', ('$' + $EnableGuard.ToString().ToLowerInvariant())).Replace('__GUARDMODE__', $GuardMode).Replace('__OOBE__', ('$' + $ManageOobe.ToString().ToLowerInvariant())).Replace('__LANG__', $Language)
-    $finalize = $finalize.Replace('__EDGE__', ('$' + $RemoveEdge.ToString().ToLowerInvariant())).Replace('__NETWORK__', ('$' + $BlockNetwork.ToString().ToLowerInvariant())).Replace('__OOBE__', ('$' + $ManageOobe.ToString().ToLowerInvariant())).Replace('__LANG__', $Language)
-    @{ Prepare = $prepare; Finalize = $finalize }
-}
 
 function Get-LanguageRepairUpdate {
     param([string]$Revision, [string]$Destination)
@@ -4288,8 +4263,8 @@ if (-not $DryRun) {
             $setupLang = $sourceImageLanguage
         }
     }
-    # Обязательный локальный помощник готовится до любых изменений образа.
-    $setupRunner = Get-SetupRunnerScript
+    # Обязательный гостевой сценарий готовится до любых изменений образа.
+    $guestScript = Get-GuestScript
     $script:DownloadsClosed = $true
     Write-Ok (T 'Все компоненты подготовлены. Дальнейшая сборка не требует интернета.' 'All components are prepared. The remaining build requires no internet connection.')
     if ($script:SkippedDownloads.Count) { Write-Note (T "Исключено по вашему выбору: $($script:SkippedDownloads -join '; ')" "Skipped by your choice: $($script:SkippedDownloads -join '; ')") }
@@ -4931,7 +4906,7 @@ if (Test-GroupActive -RulePreset 'safe' -Group 'Edge') {
     Set-Reg -Path $eu -Name 'Install{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -Type REG_DWORD -Value 1  # WebView2 — разрешён
     Set-Reg -Path $eu -Name 'Update{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'  -Type REG_DWORD -Value 1
     Set-Reg -Path $eu -Name 'DoNotUpdateToEdgeWithChromium' -Type REG_DWORD -Value 1
-    # Тот же набор ключей, что чистит Finalize.ps1 после OOBE
+    # Тот же набор ключей, что гостевой сценарий чистит после OOBE
     $stableGuid = '{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}'
     foreach ($view in @('', '\WOW6432Node')) {
         foreach ($suffix in @("Microsoft\EdgeUpdate\Clients\$stableGuid", "Microsoft\EdgeUpdate\ClientState\$stableGuid",
@@ -5109,7 +5084,7 @@ if ($Guard) {
     $guardConfig = [ordered]@{
         Mode = $GuardMode
         ViewerTask = $GuardMode -ne 'Silent'
-        Language = $imgLang
+        # The language lives in build-info.json only: one source for the guest.
         BuildId = $script:StartedAt.ToString('yyyyMMdd-HHmmss')
         RemoveEdge = (Test-GroupActive -RulePreset 'safe' -Group 'Edge')
         Policies = @($guardPolicies | Sort-Object -Unique)
@@ -5121,9 +5096,7 @@ if ($Guard) {
         TargetLabels = @($script:CapabilityRules | Where-Object { Test-GroupActive -RulePreset $_.Preset -Group $_.Group } | ForEach-Object { [ordered]@{Category='capability';Pattern=$_.Pattern;Name=$_.Desc} })
     }
     [IO.File]::WriteAllText((Join-Path $guardDir 'guard.json'), ($guardConfig | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($true))
-    $guardScript = Get-GuardScript
-    [IO.File]::WriteAllText((Join-Path $guardDir 'Guard.UI.ps1'),(Get-BundledResource 'Guard.UI.ps1'),[Text.UTF8Encoding]::new($true))
-    [IO.File]::WriteAllText((Join-Path $guardDir 'guard.ps1'), $guardScript, [Text.UTF8Encoding]::new($true))
+
     Write-Ok (T "Сторож встроен: проверяет систему при каждом входе ($(($guardFolders + $guardServices + $guardAppx + $guardCaps).Count) объектов, $($guardPolicies.Count) политик)" "Guard embedded: checks the system at every logon ($(($guardFolders + $guardServices + $guardAppx + $guardCaps).Count) objects, $($guardPolicies.Count) policies)")
 }
 
@@ -5134,14 +5107,8 @@ if ($Guard) {
 $scriptsDir = Join-Path $mountDir 'Windows\Setup\Scripts'
 $supportDir = Join-Path $scriptsDir 'Win11Lite'
 $null = New-Item -ItemType Directory -Path $supportDir -Force
-[IO.File]::WriteAllText((Join-Path $supportDir 'Run-Setup.ps1'),$setupRunner,[Text.UTF8Encoding]::new($true))
-Remove-Item -LiteralPath (Join-Path $supportDir 'Win11Lite.Run.exe') -Force -ErrorAction SilentlyContinue
-$support = Get-SetupSupportScripts -BlockNetwork ($script:ManageOobe -and -not $NoOobeNetworkBlock) `
-    -RemoveEdge (Test-GroupActive -RulePreset 'safe' -Group 'Edge') -EnableGuard ([bool]$Guard) `
-    -ManageOobe $script:ManageOobe -Language $imgLang -GuardMode $GuardMode
-foreach ($name in @('Prepare', 'Finalize')) {
-    [IO.File]::WriteAllText((Join-Path $supportDir "$name.ps1"), $support[$name], [Text.UTF8Encoding]::new($true))
-}
+# One guest file serves every entry point; build-info.json carries the choices.
+[IO.File]::WriteAllText((Join-Path $supportDir 'Win11Lite.ps1'), $guestScript, [Text.UTF8Encoding]::new($true))
 $buildInfo = [ordered]@{
     BuildId = $script:StartedAt.ToString('yyyyMMdd-HHmmss')
     StartedAt = $script:StartedAt.ToString('o')
@@ -5162,8 +5129,10 @@ $buildInfo = [ordered]@{
     GuardMode = $GuardMode
     GuardDebug = [bool]($Guard -and $GuardMode -eq 'Debug')
     OobeNetworkBlock = [bool]($script:ManageOobe -and -not $NoOobeNetworkBlock)
+    ManageOobe = [bool]$script:ManageOobe
+    RemoveEdge = [bool](Test-GroupActive -RulePreset 'safe' -Group 'Edge')
     OobeCompletionCheck = 'OOBEComplete'
-    SetupScriptLauncher = 'PowerShell / Run-Setup.ps1'
+    SetupScriptLauncher = 'PowerShell / Win11Lite.ps1'
     ServicingDismVersion = [string](Get-NativeToolVersion $script:Dism)
     AccountMode = $AccountMode
 } | ConvertTo-Json -Depth 4
@@ -5172,7 +5141,7 @@ $buildInfo = [ordered]@{
 Write-Ok (T "ID сборки: $($script:StartedAt.ToString('yyyyMMdd-HHmmss')) — записан в ISO и установленную Windows" "Build ID: $($script:StartedAt.ToString('yyyyMMdd-HHmmss')) - recorded in the ISO and installed Windows")
 $setupComplete = @"
 @echo off
-"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "%SystemRoot%\Setup\Scripts\Win11Lite\Run-Setup.ps1" -Mode prepare-register >> "%SystemRoot%\Setup\Scripts\Win11Lite\setupcomplete.log" 2>&1
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "%SystemRoot%\Setup\Scripts\Win11Lite\Win11Lite.ps1" -Mode prepare-register >> "%SystemRoot%\Setup\Scripts\Win11Lite\setupcomplete.log" 2>&1
 exit /b %errorlevel%
 "@
 Write-WindowsBatchFile -Path (Join-Path $scriptsDir 'SetupComplete.cmd') -Content $setupComplete
@@ -5370,7 +5339,7 @@ if ($Unattend -eq 'none') {
                 <RunSynchronousCommand wcm:action="add">
                     <Order>1</Order>
                     <Description>Prepare first logon and OOBE</Description>
-                    <Path>"%WINDIR%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "%WINDIR%\Setup\Scripts\Win11Lite\Run-Setup.ps1" -Mode prepare</Path>
+                    <Path>"%WINDIR%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "%WINDIR%\Setup\Scripts\Win11Lite\Win11Lite.ps1" -Mode prepare</Path>
                 </RunSynchronousCommand>
             </RunSynchronous>
         </component>
@@ -5419,7 +5388,7 @@ if ($Unattend -eq 'none') {
                 <SynchronousCommand wcm:action="add">
                     <Order>1</Order>
                     <Description>Finish installation</Description>
-                    <CommandLine>"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "%SystemRoot%\Setup\Scripts\Win11Lite\Run-Setup.ps1" -Mode finalize</CommandLine>
+                    <CommandLine>"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "%SystemRoot%\Setup\Scripts\Win11Lite\Win11Lite.ps1" -Mode finalize</CommandLine>
                 </SynchronousCommand>
             </FirstLogonCommands>$localAccountXml
         </component>

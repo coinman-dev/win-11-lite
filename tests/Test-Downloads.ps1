@@ -39,7 +39,7 @@ function Invoke-Dism { throw 'IMAGE SERVICING DISABLED BY TEST' }
 function Get-DiskImage { throw 'DISK API DISABLED BY TEST' }
 function Mount-DiskImage { throw 'DISK API DISABLED BY TEST' }
 function curl.exe { throw 'NETWORK DISABLED BY TEST' }
-function Get-SetupRunnerScript { '# fixture runner' }
+function Get-GuestScript { '# fixture guest script' }
 function Initialize-DeploymentTools { param($Build,$Directory,$ExplicitDism,[switch]$Install) }
 
 $testRoot = Join-Path $repo ('tmp\downloads-' + [guid]::NewGuid().ToString('N'))

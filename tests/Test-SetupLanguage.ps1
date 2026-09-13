@@ -30,7 +30,7 @@ function Invoke-RestMethod {throw 'NETWORK DISABLED BY TEST'}
 function Invoke-WebRequest {throw 'NETWORK DISABLED BY TEST'}
 function Invoke-NativeQuiet {throw 'NATIVE PROCESS DISABLED BY TEST'}
 function Invoke-Dism {throw 'DISM DISABLED BY TEST'}
-function Get-SetupRunnerScript {'# fixture runner'}
+function Get-GuestScript {'# fixture guest script'}
 function Initialize-DeploymentTools {param($Build,$Directory,$ExplicitDism,[switch]$Install)}
 $root=Join-Path $repo ('tmp\setup-tests-'+[guid]::NewGuid().ToString('N'))
 $null=New-Item -ItemType Directory -Path $root

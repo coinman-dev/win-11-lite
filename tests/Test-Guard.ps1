@@ -8,7 +8,7 @@ $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'win-11
 if($e.Count){throw ($e|Out-String)}
 $script:checks=0
 function Assert([bool]$Value,[string]$Message){if(-not $Value){throw "FAIL: $Message"};$script:checks++}
-foreach($name in @('T','Get-BundledResource','Test-GroupActive','Get-ProtectedPatterns','Get-GuardScript','Get-SetupSupportScripts')){
+foreach($name in @('T','Test-GroupActive','Get-ProtectedPatterns','Get-GuestScript')){
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     . ([scriptblock]::Create($node.Extent.Text))
 }
@@ -19,12 +19,17 @@ foreach($name in @('CapabilityRules','PackageRules','FolderRules','FileRules','A
 }
 $root=Join-Path $repo ('tmp\guard-tests-'+[guid]::NewGuid().ToString('N'))
 $null=New-Item -ItemType Directory -Path $root
-[IO.File]::WriteAllText((Join-Path $root 'Guard.UI.ps1'),(Get-BundledResource 'Guard.UI.ps1'),[Text.UTF8Encoding]::new($true))
+# One guest file serves every mode; build-info.json carries the build choices.
+$guest=Join-Path $root 'Win11Lite.ps1'
+[IO.File]::WriteAllText($guest,(Get-GuestScript),[Text.UTF8Encoding]::new($true))
+$buildInfo=[ordered]@{BuildId='test';Language='en-US';Guard=$true;GuardMode='Standard';OobeNetworkBlock=$false;ManageOobe=$true;RemoveEdge=$true}
+function Write-BuildInfo {$buildInfo|ConvertTo-Json -Depth 4|Set-Content -LiteralPath (Join-Path $root 'build-info.json') -Encoding UTF8}
+Write-BuildInfo
 try{
     & {
         # Only the native-output helper runs here, with a harmless child script.
         # No takeown/icacls or guard system operations are invoked on the host.
-        $guardAst=[Management.Automation.Language.Parser]::ParseInput((Get-GuardScript),[ref]$t,[ref]$e)
+        $guardAst=[Management.Automation.Language.Parser]::ParseInput((Get-GuestScript),[ref]$t,[ref]$e)
         if($e.Count){throw ($e|Out-String)}
         $helper=$guardAst.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-GuardAccessCommand'},$false)
         . ([scriptblock]::Create($helper.Extent.Text))
@@ -37,13 +42,13 @@ try{
         Assert ($observation.Detail -match 'ExitCode=7' -and $observation.Detail -match 'native stderr probe') 'Real native stderr and exit status are captured on both PowerShell runtimes'
         Assert (-not $unexpected.Count -and $diagnostics.Count -eq 1 -and $ErrorActionPreference -eq 'Stop') 'Native diagnostics do not leak to stdout or change the caller error preference'
     }
-    # Evaluate the actual embedding block: rules -> guard.json + guard.ps1.
+    # Evaluate the actual embedding block: build rules become guard.json.
     $mountDir=Join-Path $root 'image'; $guardDir=Join-Path $mountDir 'Windows\Setup\Scripts\Win11Lite'; $Guard=$true
     function Write-Ok {param($Message)}
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -eq '$Guard' -and $n.Extent.Text -match '\$guardConfig ='},$true)
     & ([scriptblock]::Create($node.Extent.Text))
     $cfg=Get-Content -LiteralPath (Join-Path $guardDir 'guard.json') -Raw | ConvertFrom-Json
-    Assert (Test-Path -LiteralPath (Join-Path $guardDir 'guard.ps1')) 'Guard is embedded into the image'
+    Assert ($cfg.Mode -eq 'Standard' -and $cfg.ViewerTask -and -not (Get-Member -InputObject $cfg -Name Language)) 'Guard targets are embedded with the chosen mode and no duplicate language setting'
     Assert (@($cfg.Apps | Where-Object {'Microsoft.BingWeather' -match $_}).Count -gt 0) 'Consumer app rules reach guard'
     Assert (@($cfg.Capabilities | Where-Object {'App.StepsRecorder~~~~0.0.1.0' -match $_}).Count -gt 0) 'Build capability rules reach guard'
     Assert (-not @($cfg.Paths | Where-Object {$_ -match 'EdgeWebView|NativeImages|WinSxS\\Backup'}).Count) 'Balanced guard preserves WebView2, NGEN and component backups'
@@ -67,20 +72,18 @@ try{
         function New-ScheduledTaskSettingsSet {param([switch]$StartWhenAvailable,[switch]$AllowStartIfOnBatteries,[switch]$DontStopIfGoingOnBatteries,$MultipleInstances,$ExecutionTimeLimit)[pscustomobject]@{MultipleInstances=$MultipleInstances;Limit=$ExecutionTimeLimit}}
         function Register-ScheduledTask {param($TaskName,$Action,$Trigger,$Principal,$Settings,[switch]$Force)$tasks[$TaskName]=[pscustomobject]@{Action=$Action;Trigger=$Trigger;Principal=$Principal;Settings=$Settings}}
         function Unregister-ScheduledTask {[CmdletBinding(SupportsShouldProcess)]param($TaskName)$tasks.Remove($TaskName)}
-        $scripts=Get-SetupSupportScripts -BlockNetwork $false -RemoveEdge $true -EnableGuard $true -ShowGuardWindow $true
-        $prepare=Join-Path $root 'Prepare.ps1'
-        [IO.File]::WriteAllText($prepare,$scripts.Prepare,[Text.UTF8Encoding]::new($true))
-        & $prepare -RegisterOnly
+        & $guest -Mode prepare-register -Direct
         Assert ($tasks.ContainsKey('win-11-lite guard') -and $tasks.ContainsKey('win-11-lite guard report')) 'Worker and report observer are registered'
         $worker=$tasks['win-11-lite guard']; $viewer=$tasks['win-11-lite guard report']
         Assert ($worker.Principal.UserId -eq 'S-1-5-18' -and $worker.Principal.LogonType -eq 'ServiceAccount') 'Worker retains SYSTEM privileges'
         Assert ($worker.Trigger.AtLogOn -and $worker.Settings.MultipleInstances -eq 'IgnoreNew') 'Worker triggers on logon and prevents overlap'
         Assert ($viewer.Principal.GroupId -eq 'S-1-5-32-545' -and $viewer.Principal.RunLevel -eq 'Limited') 'Observer uses the interactive user group without elevation'
-        Assert ($viewer.Action.Argument -match 'guard\.ps1" -View -RunId' -and $viewer.Action.Execute -like '*\powershell.exe' -and -not $viewer.Trigger) 'Report task runs the viewer directly on demand without an intermediate logon process'
-        $scripts=Get-SetupSupportScripts -BlockNetwork $false -RemoveEdge $true -EnableGuard $true -ShowGuardWindow $false
-        [IO.File]::WriteAllText($prepare,$scripts.Prepare,[Text.UTF8Encoding]::new($true))
-        & $prepare -RegisterOnly
+        Assert ($viewer.Action.Argument -match 'Win11Lite\.ps1" -Mode view -RunId' -and $viewer.Action.Execute -like '*\powershell.exe' -and -not $viewer.Trigger) 'Report task runs the viewer directly on demand without an intermediate logon process'
+        Assert ($worker.Action.Argument -match 'Win11Lite\.ps1" -Mode guard$') 'Every scheduled task starts the same guest file by mode'
+        $buildInfo.GuardMode='Silent';Write-BuildInfo
+        & $guest -Mode prepare-register -Direct
         Assert ($tasks.ContainsKey('win-11-lite guard') -and -not $tasks.ContainsKey('win-11-lite guard report')) 'Silent mode removes only the observer'
+        $buildInfo.GuardMode='Standard';Write-BuildInfo
     }
 
     & {
@@ -88,15 +91,15 @@ try{
         $fixture=@{Oobe=0;SetupReadFails=$false;Policy=1;MissingPolicy=$null;ServiceStart=4;DenyPolicy=$false;Cap='Installed';DenyCap=$false;PendingCap=$false;InventoryFails=$false;App=$true;Provisioned=$true;WatchReads=0;Launched=$false}
         $service=[pscustomobject]@{Status='Running'}
         $service | Add-Member -MemberType ScriptMethod -Name WaitForStatus -Value {param($Want,$Timeout)if($this.Status -ne $Want){throw 'Service did not stop'}}
-        $oldDrive=$env:SystemDrive; $oldPf=$env:ProgramFiles; $oldPf86=${env:ProgramFiles(x86)}
+        $oldDrive=$env:SystemDrive; $oldPf=$env:ProgramFiles; $oldPf86=${env:ProgramFiles(x86)}; $oldPublic=$env:PUBLIC; $oldData=$env:ProgramData
         try{
             $env:SystemDrive=Join-Path $root 'os'; $env:ProgramFiles=Join-Path $env:SystemDrive 'Program Files'; ${env:ProgramFiles(x86)}=Join-Path $env:SystemDrive 'Program Files (x86)'
+            # Edge shortcut cleanup must never look at the real host profiles.
+            $env:PUBLIC=Join-Path $env:SystemDrive 'Users\Public'; $env:ProgramData=Join-Path $env:SystemDrive 'ProgramData'
             $browser=Join-Path $env:ProgramFiles 'Microsoft\Edge'; $webview=Join-Path $env:ProgramFiles 'Microsoft\EdgeWebView'; $remove=Join-Path $env:SystemDrive 'remove-me'
-            $null=New-Item -ItemType Directory -Path $browser,$webview,$remove -Force
-            $guard=Join-Path $root 'guard.ps1'; $configFile=Join-Path $root 'guard.json'; $log=Join-Path $root 'guard.log'
-            [IO.File]::WriteAllText($guard,(Get-GuardScript),[Text.UTF8Encoding]::new($true))
-            [IO.File]::WriteAllText((Join-Path $root 'Finalize.ps1'),'param([switch]$EdgeOnly) Invoke-FakeEdgeCleanup',[Text.UTF8Encoding]::new($true))
-            $testConfig=@{Language='en-US';BuildId='test';RemoveEdge=$true;Policies=@('HKLM:\SOFTWARE\TestGuard|AllowTelemetry|0');Services=@('TestSvc');Capabilities=@('^TestCapability$','^Language\.', '');Apps=@('^Microsoft\.BingWeather$');Protected=@('^Language\.Basic~');Paths=@('remove-me')}
+            $null=New-Item -ItemType Directory -Path $browser,$webview,$remove,$env:PUBLIC,$env:ProgramData -Force
+            $configFile=Join-Path $root 'guard.json'; $log=Join-Path $root 'guard.log'
+            $testConfig=@{BuildId='test';RemoveEdge=$true;Policies=@('HKLM:\SOFTWARE\TestGuard|AllowTelemetry|0');Services=@('TestSvc');Capabilities=@('^TestCapability$','^Language\.', '');Apps=@('^Microsoft\.BingWeather$');Protected=@('^Language\.Basic~');Paths=@('remove-me')}
             $testConfig | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $configFile -Encoding UTF8
             function Get-ItemProperty {
                 param($LiteralPath,$Name,$ErrorAction)
@@ -111,6 +114,8 @@ try{
                 $p=if($LiteralPath){$LiteralPath}else{$Path}
                 if($p -eq $remove -and $fixture.DenyVerify){Write-Error 'Mock verification denied' -Category PermissionDenied;return $false}
                 if($p -like '*\Services\MissingSvc'){return $false}
+                # Edge registration is reported absent so no real hive is touched.
+                if($p -like 'HKLM:*Edge*' -or $p -like 'HKLM:*msedge*'){return $false}
                 if($p -like 'HKLM:*'){return $true}
                 Microsoft.PowerShell.Management\Test-Path -LiteralPath $p
             }
@@ -141,15 +146,25 @@ try{
                 if($full -eq $remove -and $fixture.DenyRemove){Write-Error 'Mock removal denied' -TargetObject (Join-Path $full 'locked.dll') -Category PermissionDenied -ErrorAction Stop}
                 Microsoft.PowerShell.Management\Remove-Item -LiteralPath $full -Recurse:$Recurse -Force:$Force -ErrorAction Stop
             }
-            function Invoke-FakeEdgeCleanup {if(Test-Path -LiteralPath $browser){Remove-Item -LiteralPath $browser -Recurse -Force;$calls.Add('edge')};$global:LASTEXITCODE=0}
-            & $guard
-            if($LASTEXITCODE -ne 0){throw ((Get-Content -LiteralPath $log -Tail 30)-join "`n")}
+            # The guard now calls the real in-process finalizer for Edge cleanup.
+            function Get-Process {param($Name,$ErrorAction,[switch]$IncludeUserName)}
+            function Stop-Process {param([switch]$Force)}
+            function Get-CimInstance {param($ClassName)}
+            # Edge-only cleanup must never restore OOBE networking or updates.
+            function Get-NetAdapter {throw 'Edge-only cleanup must not touch networking'}
+            function Enable-NetAdapter {throw 'Edge-only cleanup must not touch networking'}
+            function Get-NetFirewallRule {throw 'Edge-only cleanup must not touch the firewall'}
+            function Remove-NetFirewallRule {throw 'Edge-only cleanup must not touch the firewall'}
+            function Import-Clixml {throw 'Edge-only cleanup must not restore adapters'}
+            function Remove-ItemProperty {throw 'Edge-only cleanup must not re-enable updates'}
+            & $guest -Mode guard -Direct
+            if($LASTEXITCODE -ne 0){throw (((Get-Content -LiteralPath $log -Tail 90)-join "`n")+"`n--- finalize.log ---`n"+((Get-Content -LiteralPath (Join-Path $root 'finalize.log') -ErrorAction SilentlyContinue)-join "`n"))}
             Assert ($LASTEXITCODE -eq 0 -and $fixture.Policy -eq 0) 'Guard checks run even while the finalization task still exists'
             Assert ($calls -contains 'stop-service') 'A running service is stopped even when Start is already 4'
             Assert ($calls -contains 'cap:TestCapability' -and $calls -notcontains 'cap:UnselectedCapability') 'Selected capability removed; empty regex never matches everything'
             Assert ($calls -notcontains 'cap:Language.Basic~~~en-US~0.0.1.0') 'Protected language survives guard'
             Assert ($calls -contains 'app' -and $calls -contains 'provisioned') 'Installed and provisioned consumer apps are checked'
-            Assert (-not (Test-Path -LiteralPath $browser) -and (Test-Path -LiteralPath $webview)) 'Edge is removed while WebView2 survives'
+            Assert (-not (Test-Path -LiteralPath $browser) -and (Test-Path -LiteralPath $webview)) 'Edge is removed in process while WebView2 survives, and the networking mocks prove OOBE connectivity was left alone'
             Assert (-not (Test-Path -LiteralPath $remove)) 'Selected directory is removed'
             $text=Get-Content -LiteralPath $log -Raw
             Assert ($text -match '\[START\]' -and $text -match '\[END\]' -and $text -notmatch '\[ERROR\]') 'A successful run always records start and summary'
@@ -160,7 +175,7 @@ try{
             $human=Get-Content -LiteralPath (Join-Path $root 'guard-report.txt') -Raw
             Assert ($human -match 'SERVICES AND DRIVERS' -and $human -match 'Before: startup: disabled; state: running' -and $human -match 'successfully removed') 'Human report contains categories, names, previous state and actual outcomes'
             $fixture.Policy=1;$fixture.ServiceStart=2;$service.Status='Running';$calls.Clear()
-            & $guard
+            & $guest -Mode guard -Direct
             Assert ($fixture.Policy -eq 0 -and $calls -contains 'policy') 'A second logon rechecks and repairs restored values'
             Assert ([regex]::Matches((Get-Content -LiteralPath $log -Raw),'\[START\]').Count -eq 2) 'Guard runs repeatedly rather than only once'
             $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
@@ -171,7 +186,7 @@ try{
             # this handle is open, even though the reader permits writes.
             $fixture.Policy=1;$fixture.App=$true;$fixture.Provisioned=$true;$calls.Clear()
             $reader=[IO.File]::Open($log,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
-            try { & $guard; $sharedExit=$LASTEXITCODE } finally { $reader.Dispose() }
+            try { & $guest -Mode guard -Direct; $sharedExit=$LASTEXITCODE } finally { $reader.Dispose() }
             Assert ($sharedExit -eq 0 -and $fixture.Policy -eq 0) 'A live reader does not block logging or policy checks'
             Assert ($calls -contains 'app' -and $calls -contains 'provisioned') 'Checks continue through app inventory and removal while a reader holds the log'
             Assert ((Get-Content -LiteralPath $log -Raw) -notmatch '\[ERROR\]') 'Shared logging does not produce false component failures'
@@ -179,7 +194,7 @@ try{
             $lockedReport=Join-Path $root 'guard-report.txt'
             $reportLock=[IO.File]::Open($lockedReport,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::None)
             $oldError=[Console]::Error;$captured=[IO.StringWriter]::new()
-            try{[Console]::SetError($captured); & $guard; $reportExit=$LASTEXITCODE}
+            try{[Console]::SetError($captured); & $guest -Mode guard -Direct; $reportExit=$LASTEXITCODE}
             finally{[Console]::SetError($oldError);$reportLock.Dispose();$captured.Dispose()}
             $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
             Assert ($reportExit -eq 1 -and $report.LogErrors -gt 0 -and $report.Errors -eq 0) 'Standard JSON records a failure writing the full report separately from check errors'
@@ -187,21 +202,21 @@ try{
 
             Clear-Content -LiteralPath $log
             $fixture.Policy=1;$fixture.DenyPolicy=$true;$fixture.Cap='Installed';$fixture.DenyCap=$true
-            & $guard
+            & $guest -Mode guard -Direct
             $text=Get-Content -LiteralPath $log -Raw
             Assert ($LASTEXITCODE -eq 1 -and $text -match 'Policy denied' -and $text -match 'Capability denied') 'Failures remain visible and produce a nonzero task result'
             Assert ($text -notmatch '\[CHANGED\].*(AllowTelemetry|TestCapability)') 'Failed changes cannot be logged as successful'
             $fixture.DenyPolicy=$false;$fixture.DenyCap=$false;$fixture.InventoryFails=$true;$fixture.App=$true
-            & $guard
+            & $guest -Mode guard -Direct
             Assert (-not $fixture.App -and $LASTEXITCODE -eq 1) 'Capability inventory failure does not prevent independent app checks'
             $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
             Assert (@($report.Items|Where-Object{$_.Category -eq 'capability' -and $_.Outcome -eq 'failed' -and $null -eq $_.Found}).Count -eq 1 -and @($report.Items|Where-Object{$_.Category -eq 'capability' -and $_.Outcome -eq 'absent'}).Count -eq 0) 'Unreadable inventory is reported as unknown rather than not found'
             Clear-Content -LiteralPath $log
             $fixture.InventoryFails=$false;$fixture.Cap='Installed';$fixture.PendingCap=$true
-            & $guard
+            & $guest -Mode guard -Direct
             Assert ($LASTEXITCODE -eq 0 -and (Get-Content -LiteralPath $log -Raw) -match '\[PENDING\].*TestCapability') 'Pending removals are distinguished from completed removals'
             $fixture.Oobe=1;$fixture.Policy=1;$calls.Clear()
-            & $guard
+            & $guest -Mode guard -Direct
             Assert ($calls.Count -eq 0 -and $fixture.Policy -eq 1) 'OOBE logon performs no cleanup'
             $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
             Assert ($report.Deferred -and -not $report.Complete -and $report.Summary.setting.NotChecked -eq 1 -and $report.Summary.service.NotChecked -eq 1) 'Deferred reports list unexamined settings and services'
@@ -209,24 +224,24 @@ try{
 
             $null=New-Item -ItemType Directory -Path $remove -Force
             $fixture.DenyAccess=$true;$fixture.DenyRemove=$true;$calls.Clear()
-            & $guard
+            & $guest -Mode guard -Direct
             $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
             $row=@($report.Items|Where-Object{$_.Category -eq 'path'})[0]
             Assert ($LASTEXITCODE -eq 1 -and $row.Outcome -eq 'failed' -and $row.Found -and (Test-Path -LiteralPath $remove)) 'Denied removal is reported as found but not removed'
             Assert ($row.Detail -match 'removal \(Remove-Item\)' -and $row.Detail -match 'HRESULT=0x' -and $row.Detail -match 'locked.dll') 'Failure identifies the stage, exception code and failing child path'
             Assert ($row.Detail -match 'takeown.exe ExitCode=1' -and $row.Detail -match 'icacls.exe ExitCode=5' -and $row.Detail -match 'Mock takeown denied' -and $row.Detail -match 'Mock icacls denied') 'Native exit codes and stderr survive in the final failure report'
             $fixture.DenyRemove=$false
-            & $guard
+            & $guest -Mode guard -Direct
             $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
             Assert ($LASTEXITCODE -eq 0 -and -not(Test-Path -LiteralPath $remove) -and $report.Summary.path.removed -eq 1) 'Permission preparation errors do not prevent deletion when existing access suffices'
             $fixture.DenyAccess=$false;$fixture.DenyInspect=$true;$calls.Clear()
             $null=New-Item -ItemType Directory -Path $remove -Force
-            & $guard
+            & $guest -Mode guard -Direct
             $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
             $row=@($report.Items|Where-Object{$_.Category -eq 'path'})[0]
             Assert ($LASTEXITCODE -eq 1 -and $row.Detail -match 'link inspection:' -and $row.Detail -match 'HRESULT=0x80070005' -and $calls -notcontains 'takeown') 'An access failure before permission preparation is distinguished from failed removal'
             $fixture.DenyInspect=$false;$fixture.DenyVerify=$true
-            & $guard
+            & $guest -Mode guard -Direct
             $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
             $row=@($report.Items|Where-Object{$_.Category -eq 'path'})[0]
             Assert ($LASTEXITCODE -eq 1 -and $row.Outcome -eq 'failed' -and $row.Detail -match 'verification after removal' -and -not $row.After) 'An unreadable post-removal path cannot be reported as successfully absent'
@@ -238,18 +253,18 @@ try{
             $null=New-Item -ItemType Junction -Path $link -Target $outside
             $testConfig.Paths=@('linked')
             $testConfig | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $configFile -Encoding UTF8
-            & $guard
+            & $guest -Mode guard -Direct
             Assert ((Test-Path -LiteralPath $marker) -and (Get-Content -LiteralPath $log -Raw) -match '\[SKIP\].*linked') 'Guard does not traverse a junction when removing files'
             $testConfig.Paths=@('..')
             $testConfig | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $configFile -Encoding UTF8
-            & $guard
+            & $guest -Mode guard -Direct
             Assert ($LASTEXITCODE -eq 1 -and (Test-Path -LiteralPath $marker)) 'A configured parent path cannot escape the system drive'
             $testConfig.Paths=@()
             $testConfig.Services=@('TestSvc','MissingSvc')
             $testConfig.Policies+=@('HKLM:\SOFTWARE\TestGuard|MissingSetting|0')
             $testConfig | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $configFile -Encoding UTF8
 
-            & $guard
+            & $guest -Mode guard -Direct
             $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
             Assert ($report.Summary.setting.created -eq 1 -and @($report.Items|Where-Object{$_.Name -eq 'MissingSetting' -and $_.Found -eq $false -and $_.After -eq '0'}).Count -eq 1) 'Missing settings are distinguished from existing settings and record creation'
             Assert (@($report.Items|Where-Object{$_.Name -eq 'MissingSvc' -and $_.Found -eq $false -and $_.Outcome -eq 'absent'}).Count -eq 1) 'Absent services are named explicitly'
@@ -261,7 +276,7 @@ try{
             $oldError=[Console]::Error;$captured=[IO.StringWriter]::new()
             try {
                 [Console]::SetError($captured)
-                & $guard
+                & $guest -Mode guard -Direct
                 $lockedExit=$LASTEXITCODE
             } finally { [Console]::SetError($oldError);$exclusive.Dispose() }
             $fallback=$captured.ToString();$captured.Dispose()
@@ -271,20 +286,19 @@ try{
             $lockProbe=[IO.File]::Open((Join-Path $root 'guard.lock'),[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
             $lockProbe.Dispose()
             Assert $true 'Run lock is released after logging failures'
-            & $guard
+            & $guest -Mode guard -Direct
             Assert ($LASTEXITCODE -eq 0) 'The next run recovers after the external log lock is released'
             $fixture.SetupReadFails=$true;$calls.Clear()
-            & $guard
+            & $guest -Mode guard -Direct
             $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
             Assert ($LASTEXITCODE -eq 1 -and -not $report.Complete -and $report.Summary.setting.NotChecked -eq 2 -and $report.Summary.service.NotChecked -eq 2 -and $calls.Count -eq 0) 'Interrupted runs explicitly name work that was not performed'
-            $fixture.SetupReadFails=$false;$testConfig.Language='ru-RU'
-            $testConfig|ConvertTo-Json -Depth 5|Set-Content -LiteralPath $configFile -Encoding utf8
-            & $guard
+            $fixture.SetupReadFails=$false;$buildInfo.Language='ru-RU';Write-BuildInfo
+            & $guest -Mode guard -Direct
             $human=Get-Content -LiteralPath (Join-Path $root 'guard-report.txt') -Raw
             Assert ($LASTEXITCODE -eq 0 -and $human.Contains('ИТОГ ПРОВЕРКИ GUARD') -and $human.Contains('уже отключена и остановлена') -and $human.Contains('MissingSvc: не найдено')) 'Russian report is readable and keeps exact object names'
 
             # Replace only the native OOBE probe in the private helper fixture.
-            $uiPath=Join-Path $root 'Guard.UI.ps1';$ui=[IO.File]::ReadAllText($uiPath)
+            $uiPath=$guest;$ui=[IO.File]::ReadAllText($uiPath)
             $uiAst=[Management.Automation.Language.Parser]::ParseInput($ui,[ref]$t,[ref]$e)
             $probe=$uiAst.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Test-GuardOobeComplete'},$false)
             $ui=$ui.Remove($probe.Extent.StartOffset,$probe.Extent.EndOffset-$probe.Extent.StartOffset).Insert($probe.Extent.StartOffset,'function Test-GuardOobeComplete { $fixture.Oobe -eq 0 }')
@@ -293,12 +307,14 @@ try{
             function Start-Process {param($FilePath,$WindowStyle,$ArgumentList)$fixture.Launched=$true;throw 'Unexpected intermediate process'}
             function Write-Host {param($Object,$ForegroundColor)$viewLines.Add([string]$Object)}
             function Read-Host {param($Prompt)''}
-            $calls.Clear(); & $guard -ShowDebugWindow
+            $testConfig.Mode='Debug';$testConfig|ConvertTo-Json -Depth 5|Set-Content -LiteralPath $configFile -Encoding utf8
+            $calls.Clear(); & $guest -Mode view
             Assert (-not $fixture.Launched -and @($viewLines|Where-Object{$_ -match '\[END\]'}).Count -eq 1) 'Debug displays this run in the same process without launching another PowerShell'
             $viewLines.Clear();$fixture.Oobe=1
-            & $guard -ShowDebugWindow
+            & $guest -Mode view
             Assert (-not $viewLines.Count -and -not $fixture.Launched) 'Observer performs no display during OOBE'
-            $fixture.Oobe=0; & $guard -View
+            $fixture.Oobe=0;$testConfig.Mode='Standard';$testConfig|ConvertTo-Json -Depth 5|Set-Content -LiteralPath $configFile -Encoding utf8
+            & $guest -Mode view
             Assert ($calls.Count -eq 0 -and $viewLines[0] -match 'ИТОГ ПРОВЕРКИ GUARD' -and $viewLines[0] -notmatch 'HKLM:|C:\\|\[CHECK\]') 'Standard viewer shows only the summary without privileged cleanup or full paths'
             $ui=[IO.File]::ReadAllText($uiPath);$uiAst=[Management.Automation.Language.Parser]::ParseInput($ui,[ref]$t,[ref]$e)
             $start=$uiAst.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Start-GuardViewer'},$false)
@@ -309,13 +325,13 @@ try{
             foreach($mode in 'Debug','Standard','Silent'){
                 $testConfig.Mode=$mode;$fixture.Cap='Installed';$fixture.ViewCalls.Clear()
                 $testConfig|ConvertTo-Json -Depth 5|Set-Content -LiteralPath $configFile -Encoding utf8
-                & $guard
+                & $guest -Mode guard -Direct
                 $report=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
                 if($mode -eq 'Silent'){Assert (-not $fixture.ViewCalls.Count) 'Silent worker never requests a viewer'}
                 else{Assert ($fixture.ViewCalls.Count -eq 1 -and $fixture.ViewCalls[0].RunId -eq $report.RunId -and $fixture.ViewCalls[0].Capability -eq $(if($mode -eq 'Debug'){'Installed'}else{'NotPresent'})) "Worker requests $mode at the correct stage and passes its report ID"}
                 Assert ($report.Mode -eq $mode -and (Test-Path -LiteralPath (Join-Path $root 'guard-summary.txt')) -and $report.Brief.Programs -eq 2) "Full and concise reports are saved in $mode with deduplicated program counts"
             }
-        }finally{$env:SystemDrive=$oldDrive;$env:ProgramFiles=$oldPf;${env:ProgramFiles(x86)}=$oldPf86}
+        }finally{$env:SystemDrive=$oldDrive;$env:ProgramFiles=$oldPf;${env:ProgramFiles(x86)}=$oldPf86;$env:PUBLIC=$oldPublic;$env:ProgramData=$oldData}
     }
     Write-Host "PASS: $script:checks guard checks; PowerShell $($PSVersionTable.PSVersion)"
 }finally{

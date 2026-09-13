@@ -2,7 +2,20 @@
 # No real guard, registry changes, task registration, or system-file removal.
 $ErrorActionPreference='Stop'
 $repo=Split-Path $PSScriptRoot -Parent
-. (Join-Path $repo 'data\Guard.UI.ps1')
+# Load the report helpers straight out of the embedded guest runtime.
+$t=$null;$e=$null
+$ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'win-11-lite.ps1'),[ref]$t,[ref]$e)
+if($e.Count){throw ($e|Out-String)}
+$accessor=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-GuestScript'},$false)
+if(-not $accessor){throw 'Missing Get-GuestScript'}
+. ([scriptblock]::Create($accessor.Extent.Text))
+$guestAst=[Management.Automation.Language.Parser]::ParseInput((Get-GuestScript),[ref]$t,[ref]$e)
+if($e.Count){throw ($e|Out-String)}
+foreach($name in 'Get-GuardMode','Get-GuardExpectedApps','Get-GuardBriefReport','Start-GuardViewer','Show-GuardView','New-GuardViewerAction','Register-GuardViewerTask','Remove-GuardSelectedPath'){
+    $node=$guestAst.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
+    if(-not $node){throw "Missing guest function: $name"}
+    . ([scriptblock]::Create($node.Extent.Text))
+}
 $config=@{Language='ru-RU'}
 function T {param($Ru,$En)if($config.Language -like 'ru*'){$Ru}else{$En}}
 $script:checks=0

@@ -6,7 +6,6 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 $script:ScriptRoot=$repo
 $sourcePath = Join-Path $repo 'win-11-lite.ps1'
-& (Join-Path $repo 'tools\Update-BundledResources.ps1') -Check | Out-Null
 $tokens = $null; $errors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($sourcePath, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw ($errors | Out-String) }
@@ -21,7 +20,7 @@ function Assert-Throws([scriptblock]$Action, [string]$Message) {
     Assert $thrown $Message
 }
 # Load declarations and pure configuration only, never execute the build pipeline.
-foreach ($name in @('T','Get-BundledResource','Test-DismSuccess','ConvertFrom-DismList','Test-GroupActive','Test-Protected','Get-ProtectedPatterns','Get-WindowsRelease','Get-EditionConfig','Assert-ChildPath','Test-SafeToWipe','Get-FodSourceName','Get-UpdateTarget','Get-SetupSupportScripts','Get-GuardScript','Get-ElevationCommand','Invoke-RegCommand','Invoke-NativeQuiet','Set-Reg','Mount-Hive','Dismount-Hives','Remove-Reg','Save-ImageAudit','Write-ComponentStoreReport','Write-ServicingRemovalFailure','Get-PackageRemovalSkipReason','Get-RequestedRemovalItems','Remove-OfflineRecall','Write-RemainingRemovalReport','Get-WebViewRuntimeRoots','Assert-ImageFileState','Get-ProgressLine','Update-ProgressState','Invoke-ProgressProcess','Get-CopyPercent','Assert-ImageLanguages','Write-WindowsBatchFile','Write-DiagnosticLog','Invoke-Dism')) {
+foreach ($name in @('T','Get-GuestScript','Test-DismSuccess','ConvertFrom-DismList','Test-GroupActive','Test-Protected','Get-ProtectedPatterns','Get-WindowsRelease','Get-EditionConfig','Assert-ChildPath','Test-SafeToWipe','Get-FodSourceName','Get-UpdateTarget','Get-ElevationCommand','Invoke-RegCommand','Invoke-NativeQuiet','Set-Reg','Mount-Hive','Dismount-Hives','Remove-Reg','Save-ImageAudit','Write-ComponentStoreReport','Write-ServicingRemovalFailure','Get-PackageRemovalSkipReason','Get-RequestedRemovalItems','Remove-OfflineRecall','Write-RemainingRemovalReport','Get-WebViewRuntimeRoots','Assert-ImageFileState','Get-ProgressLine','Update-ProgressState','Invoke-ProgressProcess','Get-CopyPercent','Assert-ImageLanguages','Write-WindowsBatchFile','Write-DiagnosticLog','Invoke-Dism')) {
     $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
     if (-not $node) { throw "Missing function: $name" }
     . ([scriptblock]::Create($node.Extent.Text))
@@ -463,17 +462,11 @@ try {
         $script:ImageAuditPath = $null
     }
 
-    foreach ($lang in @('ru-RU','en-US')) {
-        foreach ($block in @($true,$false)) {
-            $support = Get-SetupSupportScripts -BlockNetwork $block -RemoveEdge $true -EnableGuard $true -Language $lang
-            foreach ($name in @('Prepare','Finalize')) {
-                $t = $null; $e = $null
-                $null = [Management.Automation.Language.Parser]::ParseInput($support[$name], [ref]$t, [ref]$e)
-                Assert ($e.Count -eq 0) "Generated $name parses ($lang, network=$block): $e"
-                Assert ($support[$name] -notmatch '__[A-Z]+__') "No unresolved placeholders in $name"
-            }
-        }
-    }
+    $guestScript = Get-GuestScript
+    $t = $null; $e = $null
+    $null = [Management.Automation.Language.Parser]::ParseInput($guestScript, [ref]$t, [ref]$e)
+    Assert ($e.Count -eq 0) "The embedded guest runtime parses: $e"
+    Assert ($guestScript -notmatch '__[A-Z]+__') 'The guest runtime carries no build-time placeholder'
     # Evaluate the actual answer-file expressions, then parse the resulting XML.
     $imgLang = 'ru-RU'; $setupLang = 'en-US'; $ProductKey = ''; $CompactOS = $false; $NoOobeNetworkBlock = $false
     $selected=[pscustomobject]@{EditionId='IoTEnterpriseS'}; $LocalUserName=''; $LocalUserPassword=$null
@@ -487,13 +480,13 @@ try {
     Assert (@($xml.SelectNodes('//u:InputLocale',$ns) | Where-Object { $_.InnerText -ne '0419:00000419;0409:00000409' }).Count -eq 0) 'Windows Setup configures both Russian and English keyboards without a logon language script'
     Assert ($xml.SelectSingleNode('//u:settings[@pass="windowsPE"]/u:component[@name="Microsoft-Windows-International-Core-WinPE"]/u:UILanguage',$ns).InnerText -eq 'ru-RU') 'Windows default language is not overwritten by English Setup UI'
     $firstCommand = $xml.SelectSingleNode('//u:FirstLogonCommands/u:SynchronousCommand/u:CommandLine',$ns).InnerText
-    Assert ($firstCommand -match 'Run-Setup\.ps1" -Mode finalize$' -and $firstCommand -match 'powershell\.exe') 'Answer file starts finalization through standard PowerShell'
-    Assert ($xml.SelectSingleNode('//u:RunSynchronousCommand/u:Path',$ns).InnerText -match 'Run-Setup\.ps1" -Mode prepare$') 'Specialize uses the hidden PowerShell runner'
+    Assert ($firstCommand -match 'Win11Lite\.ps1" -Mode finalize$' -and $firstCommand -match 'powershell\.exe') 'Answer file starts finalization through standard PowerShell'
+    Assert ($xml.SelectSingleNode('//u:RunSynchronousCommand/u:Path',$ns).InnerText -match 'Win11Lite\.ps1" -Mode prepare$') 'Specialize uses the hidden PowerShell runner'
     $node = $ast.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$setupComplete'}, $true)
     . ([scriptblock]::Create($node.Extent.Text))
-    Assert ($setupComplete -match 'powershell\.exe".*Run-Setup\.ps1" -Mode prepare-register' -and $setupComplete -match 'setupcomplete.log' -and $setupComplete -notmatch '>>[^\r\n]*prepare.log') 'SetupComplete waits for PowerShell without locking the preparation log'
+    Assert ($setupComplete -match 'powershell\.exe".*Win11Lite\.ps1" -Mode prepare-register' -and $setupComplete -match 'setupcomplete.log' -and $setupComplete -notmatch '>>[^\r\n]*prepare.log') 'SetupComplete waits for PowerShell without locking the preparation log'
     Assert ($xml.SelectSingleNode('//u:settings[@pass="specialize"]/u:component[@name="Microsoft-Windows-International-Core"]/u:UILanguage',$ns).InnerText -eq 'ru-RU') 'System language applied before OOBE'
-    Assert ($xml.SelectSingleNode('//u:RunSynchronousCommand/u:Path',$ns).InnerText -match 'Run-Setup\.ps1" -Mode prepare$') 'Specialize registers finalization through the preparation mode'
+    Assert ($xml.SelectSingleNode('//u:RunSynchronousCommand/u:Path',$ns).InnerText -match 'Win11Lite\.ps1" -Mode prepare$') 'Specialize registers finalization through the preparation mode'
     & {
         function Invoke-Dism { param($Arguments,[switch]$Quiet) [pscustomobject]@{ExitCode=0;Output=@('State : Installed')} }
         $image = Join-Path $testRoot 'language-image'
@@ -511,10 +504,6 @@ try {
         Clear-Content -LiteralPath $path
         Assert-Throws { Assert-ImageLanguages -Image $image -Languages 'ru-RU' -SourceLanguage 'en-US' } 'Empty Settings PRI is rejected'
     }
-    $guardScript = Get-GuardScript
-    $t=$null; $e=$null
-    $null=[Management.Automation.Language.Parser]::ParseInput($guardScript,[ref]$t,[ref]$e)
-    Assert ($e.Count -eq 0) 'Generated guard parses'
 
     # Execute generated scripts with mocked privileged APIs and a fake file tree.
     & {
@@ -545,11 +534,11 @@ try {
         function icacls.exe { $global:LASTEXITCODE=0 }
         function Test-Path { [CmdletBinding()]param([Parameter(Position=0)]$Path,$LiteralPath) $p=if($LiteralPath){$LiteralPath}else{$Path}; if($p -like 'HKLM:*'){$false}else{Microsoft.PowerShell.Management\Test-Path -LiteralPath $p} }
         $oldProgramFiles=$env:ProgramFiles; $oldX86=${env:ProgramFiles(x86)}; $oldPublic=$env:PUBLIC; $oldData=$env:ProgramData
-        if (-not ('Win11Lite.OobeStatus' -as [type])) {
+        if (-not ('Win11Lite.Oobe' -as [type])) {
             $compileTemp=$env:TEMP; $compileTmp=$env:TMP
             try {
                 $env:TEMP=$testRoot; $env:TMP=$testRoot
-                Add-Type 'namespace Win11Lite { public static class OobeStatus { public static bool Complete = true; public static bool OOBEComplete(out bool complete) { complete = Complete; return true; } } }'
+                Add-Type 'namespace Win11Lite { public static class Oobe { public static bool Complete = true; public static bool OOBEComplete(out bool complete) { complete = Complete; return true; } } }'
             } finally { $env:TEMP=$compileTemp; $env:TMP=$compileTmp }
         }
         try {
@@ -559,12 +548,15 @@ try {
             $null=New-Item -ItemType Directory -Path $browser,$webview
             Set-Content -LiteralPath (Join-Path $browser 'msedge.exe') -Value 'browser'
             Set-Content -LiteralPath (Join-Path $webview 'msedgewebview2.exe') -Value 'runtime'
-            $support=Get-SetupSupportScripts -BlockNetwork $true -RemoveEdge $true -EnableGuard $false -Language 'en-US'
-            foreach($name in @('Prepare','Finalize')) { [IO.File]::WriteAllText((Join-Path $testRoot "$name.ps1"),$support[$name],[Text.UTF8Encoding]::new($true)) }
-            & (Join-Path $testRoot 'Prepare.ps1')
+            $guest=Join-Path $testRoot 'Win11Lite.ps1'
+            [IO.File]::WriteAllText($guest,(Get-GuestScript),[Text.UTF8Encoding]::new($true))
+            $guestInfo=[ordered]@{BuildId='test';Language='en-US';Guard=$false;GuardMode='Silent';OobeNetworkBlock=$true;ManageOobe=$true;RemoveEdge=$true}
+            function Write-GuestInfo {$guestInfo|ConvertTo-Json -Depth 4|Set-Content -LiteralPath (Join-Path $testRoot 'build-info.json') -Encoding UTF8}
+            Write-GuestInfo
+            & $guest -Mode prepare -Direct
             Assert ($testEvents[0] -eq 'disable:adapter-enabled') 'Specialize blocks network independently of Task Scheduler availability'
             Assert (@($testEvents | Where-Object {$_ -like 'disable:*'}).Count -eq 1) 'Only enabled adapters are disabled'
-            & (Join-Path $testRoot 'Finalize.ps1')
+            & $guest -Mode finalize -Direct
             Assert (-not (Test-Path -LiteralPath $browser)) 'Restored Edge removed at first logon'
             Assert (Test-Path -LiteralPath (Join-Path $webview 'msedgewebview2.exe')) 'WebView2 survives finalization'
             Assert ($testEvents -contains 'enable:adapter-enabled') 'Changed adapter is restored'
@@ -580,34 +572,33 @@ try {
                 if ($LiteralPath -eq $browser) { throw 'Simulated locked browser' }
                 Microsoft.PowerShell.Management\Remove-Item -LiteralPath $LiteralPath -Recurse:$Recurse -Force:$Force
             }
-            & (Join-Path $testRoot 'Prepare.ps1')
-            & (Join-Path $testRoot 'Finalize.ps1')
+            & $guest -Mode prepare -Direct
+            & $guest -Mode finalize -Direct
             Assert ($LASTEXITCODE -eq 1) 'Cleanup failure returns nonzero status'
             Assert ($testEvents -contains 'enable:adapter-enabled') 'Network restored despite Edge cleanup failure'
             Assert ($testEvents -notcontains 'unregister') 'Failed finalizer retains its retry task'
             $testEvents.Clear()
             Remove-Item -LiteralPath (Join-Path $testRoot 'oobe-complete') -Force
-            [Win11Lite.OobeStatus]::Complete = $false
+            [Win11Lite.Oobe]::Complete = $false
             function Get-ItemProperty { param($LiteralPath,$Name,$ErrorAction) if($LiteralPath -eq 'HKLM:\SYSTEM\Setup') { [pscustomobject]@{OOBEInProgress=1;SystemSetupInProgress=0} } }
-            & (Join-Path $testRoot 'Prepare.ps1')
-            & (Join-Path $testRoot 'Finalize.ps1')
+            & $guest -Mode prepare -Direct
+            & $guest -Mode finalize -Direct
             Assert ($testEvents -notcontains 'enable:adapter-enabled') 'OOBE defaultuser0 logon does not restore network early'
             Assert ($testEvents -notcontains 'unregister') 'OOBE logon retains the task for the real user'
-            & (Join-Path $testRoot 'Finalize.ps1') -FirstLogon
+            & $guest -Mode finalize -Direct
             Assert ($testEvents -notcontains 'enable:adapter-enabled' -and $testEvents -contains 'wait-oobe') 'FirstLogon cannot restore connectivity until Windows confirms OOBE completion'
-            [Win11Lite.OobeStatus]::Complete = $true
-            & (Join-Path $testRoot 'Finalize.ps1') -FirstLogon
+            [Win11Lite.Oobe]::Complete = $true
+            & $guest -Mode finalize -Direct
             Assert ($testEvents -contains 'enable:adapter-enabled') 'Native OOBE completion permits restoration even if registry flags lag behind'
 
-            $support=Get-SetupSupportScripts -BlockNetwork $true -RemoveEdge $true -EnableGuard $false -Language 'ru-RU'
-            Assert ($support.Count -eq 2) 'Only preparation and finalization scripts are generated'
-            foreach($name in @('Prepare','Finalize')) { [IO.File]::WriteAllText((Join-Path $testRoot "$name.ps1"),$support[$name],[Text.UTF8Encoding]::new($true)) }
+            Assert (-not @('Prepare.ps1','Finalize.ps1','Run-Setup.ps1','Guard.UI.ps1','guard.ps1' | Where-Object { Test-Path -LiteralPath (Join-Path $testRoot $_) }).Count) 'One guest file serves preparation and finalization with no companion scripts'
+            $guestInfo.Language='ru-RU';Write-GuestInfo
             $taskFailure.Enabled = $true
             $testEvents.Clear()
             Remove-Item -LiteralPath (Join-Path $testRoot 'oobe-complete') -Force
-            & (Join-Path $testRoot 'Prepare.ps1')
+            & $guest -Mode prepare -Direct
             Assert ($testAdapters[0].AdminStatus -eq 'Down' -and $testEvents -notcontains 'register') 'Unavailable scheduler cannot leave OOBE online'
-            & (Join-Path $testRoot 'Finalize.ps1') -FirstLogon
+            & $guest -Mode finalize -Direct
             Assert ($testAdapters[0].AdminStatus -eq 'Up' -and $testAdapters[1].AdminStatus -eq 'Down') 'Direct first-logon callback restores only changed adapters without a registered task'
         } finally {
             $env:ProgramFiles=$oldProgramFiles; ${env:ProgramFiles(x86)}=$oldX86; $env:PUBLIC=$oldPublic; $env:ProgramData=$oldData
