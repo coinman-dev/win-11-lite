@@ -1,37 +1,21 @@
 ﻿#Requires -Version 5.1
-param([switch]$Watch, [switch]$ShowDebugWindow, [int]$WaitSeconds = 120)
+param([switch]$View, [switch]$Watch, [switch]$ShowDebugWindow, [string]$RunId, [int]$WaitSeconds = 120)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $config = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'guard.json') -Raw | ConvertFrom-Json
 function T { param([string]$Ru, [string]$En) if ($config.Language -like 'ru*') { $Ru } else { $En } }
 $logFile = Join-Path $PSScriptRoot 'guard.log'
 $reportFile = Join-Path $PSScriptRoot 'guard-report.txt'
-if ($ShowDebugWindow) {
-    $setup = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\Setup' -ErrorAction Stop
-    if ($env:USERNAME -eq 'defaultuser0' -or $setup.OOBEInProgress -eq 1 -or $setup.SystemSetupInProgress -eq 1) { return }
-    $exe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    Start-Process -FilePath $exe -WindowStyle Normal -ArgumentList ('-NoLogo -NoExit -NoProfile -ExecutionPolicy Bypass -File "{0}\guard.ps1" -Watch' -f $PSScriptRoot)
-    return
-}
-if ($Watch) {
-    $Host.UI.RawUI.WindowTitle = 'win-11-lite guard - debug'
-    Write-Host (T 'Живой журнал guard. Проверки выполняются от SYSTEM.' 'Live guard log. Checks run as SYSTEM.') -ForegroundColor Cyan
-    Write-Host (T 'Это окно можно закрыть: работа guard продолжится.' 'Closing this window does not stop the guard.')
-    Write-Host $logFile
-    $deadline = (Get-Date).AddSeconds($WaitSeconds)
-    while (-not (Test-Path -LiteralPath $logFile)) {
-        if ((Get-Date) -ge $deadline) { Write-Host (T 'Журнал ещё не создан. Проверьте задачу win-11-lite guard.' 'No log was created. Check the win-11-lite guard task.') -ForegroundColor Yellow; return }
-        Start-Sleep -Seconds 1
-    }
-    $tail = 60
-    if (Test-Path -LiteralPath $reportFile) {
-        Get-Content -LiteralPath $reportFile -Encoding UTF8 | ForEach-Object { Write-Host $_ }
-        $tail = 0
-    }
-    Write-Host (T 'Последние записи и дальнейшие действия:' 'Recent records and subsequent activity:')
-    Get-Content -LiteralPath $logFile -Encoding UTF8 -Tail $tail -Wait | ForEach-Object {
-        $color = if ($_ -match '\[ERROR\]') { 'Red' } elseif ($_ -match '\[CHANGED\]|\[END\]') { 'Green' } elseif ($_ -match '\[SKIP\]|\[PENDING\]') { 'Yellow' } else { 'Gray' }
-        Write-Host $_ -ForegroundColor $color
+. (Join-Path $PSScriptRoot 'Guard.UI.ps1')
+$guardMode=Get-GuardMode $config
+if($View -or $Watch -or $ShowDebugWindow){
+    $mode=if($Watch -or $ShowDebugWindow){'Debug'}else{$guardMode}
+    try{Show-GuardView -SupportDirectory $PSScriptRoot -Mode $mode -RunId $RunId -WaitSeconds $WaitSeconds}
+    catch{
+        Write-Host (T 'Не удалось показать отчёт guard. Подробности доступны в папке guard.' 'Could not display the guard report. Details are available in the guard folder.') -ForegroundColor Red
+        if($mode -eq 'Debug'){Write-Host $_.Exception.Message -ForegroundColor Red}
+        $null=Read-Host (T 'Нажмите Enter, чтобы закрыть окно' 'Press Enter to close')
+        exit 1
     }
     return
 }
@@ -98,17 +82,61 @@ function Test-GuardMatch {
     foreach ($pattern in $Patterns) { if ($pattern -and $Name -match $pattern) { return $true } }
     return $false
 }
-$counts = @{Checked=0;Changed=0;Pending=0;Failed=0;Skipped=0;LogFailed=0}
+$counts = @{Checked=0;Changed=0;Pending=0;Failed=0;Skipped=0;LogFailed=0;ViewFailed=0}
 $guardRows=[Collections.Generic.List[object]]::new()
 $guardWarnings=[Collections.Generic.List[string]]::new()
 $guardHistory=@{}; $guardNextHistory=@{}; $guardInventoryStatus=@{}; $guardVisited=@{}
 $guardStartedAt=Get-Date; $guardComplete=$false; $guardSkippedOobe=$false
+$guardRunId=[guid]::NewGuid().ToString()
+function Invoke-GuardPresentation {
+    if(-not $config.ViewerTask -or $guardMode -eq 'Silent'){return}
+    try{Start-GuardViewer -SupportDirectory $PSScriptRoot -RunId $guardRunId -Mode $guardMode}
+    catch{
+        $counts.ViewFailed++
+        $guardWarnings.Add((T 'Не удалось открыть окно guard; проверьте файлы отчёта в папке guard.' 'Could not open the guard window; check the report files in the guard folder.'))
+        Write-GuardLog 'ERROR' ("Viewer: "+$_.Exception.Message)
+    }
+}
+function Remove-GuardSelectedPath {
+    param([string]$Path,[bool]$Directory,[hashtable]$Observation)
+    $selectedRoot=[IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $retried=@{}
+    while($true){
+        try{Remove-Item -LiteralPath $Path -Recurse:$Directory -Force -ErrorAction Stop;return}
+        catch{
+            # Remove-Item -Force sets attributes before deleting, even when that
+            # change is unnecessary. Some serviced files reject that operation.
+            # Only this provider error permits a direct, single-file retry.
+            $failure=$_
+            if($failure.FullyQualifiedErrorId -notlike 'RemoveFileSystemItemArgumentError*' -or $failure.TargetObject -isnot [IO.FileInfo]){throw}
+            $target=[IO.Path]::GetFullPath($failure.TargetObject.FullName)
+            if(($target -ne $selectedRoot -and -not $target.StartsWith($selectedRoot+'\',[StringComparison]::OrdinalIgnoreCase)) -or $retried.ContainsKey($target)){throw}
+            $cursor=Split-Path $target -Parent
+            while($cursor){
+                if((Get-Item -LiteralPath $cursor -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint){throw (T 'Повторное удаление через ссылку каталога запрещено' 'Retry through a directory link is not allowed')}
+                $cursor=Split-Path $cursor -Parent
+            }
+            $retried[$target]=$true
+            Write-GuardLog 'DETAIL' "Remove-Item attribute error; direct file deletion: $target"
+            $Observation.Step=(T "удаление файла без смены атрибутов: $target" "file deletion without changing attributes: $target")
+            [IO.File]::Delete($target)
+            if(Test-Path -LiteralPath $target -ErrorAction Stop){throw (T 'Файл остался после повторного удаления' 'File remains after retry')}
+            $Observation.Detail+=(T "; удалён без смены атрибутов: $target" "; deleted without changing attributes: $target")
+            if(-not $Directory){return}
+            $Observation.Step=(T 'удаление (Remove-Item)' 'removal (Remove-Item)')
+        }
+    }
+}
 function Add-GuardDetail {
-    param([string]$Category,[string]$Name,[string]$Outcome,$Found,[string]$Before,[string]$After,[string]$Detail,[string]$Desired,[string]$Identity=$Name)
+    param([string]$Category,[string]$Name,[string]$Outcome,$Found,[string]$Before,[string]$After,[string]$Detail,[string]$Desired,[string]$Identity=$Name,[switch]$Inventory,[string]$ErrorCode)
     $key="$Category|$Identity"
     $changed=$Outcome -in @('removed','disabled','stopped','set','created')
-    $repeated=$changed -and $guardHistory.ContainsKey($key) -and [string]$guardHistory[$key].Desired -eq $Desired
-    $guardRows.Add([pscustomobject]@{Category=$Category;Name=$Name;Identity=$Identity;Outcome=$Outcome;Found=$Found;Before=$Before;After=$After;Detail=$Detail;Repeated=[bool]$repeated})
+    $known=$Desired -and $guardHistory.ContainsKey($key) -and [string]$guardHistory[$key].Desired -eq $Desired
+    $repeated=$changed -and $known
+    $reappeared=$known -and (($Desired -eq 'absent' -and $Found -eq $true) -or
+        ($Category -eq 'setting' -and $null -ne $Found -and $Before -ne $Desired) -or
+        ($Category -eq 'service' -and $Found -eq $true -and $Before -and $Before -ne 'Start=4; Stopped'))
+    $guardRows.Add([pscustomobject]@{Category=$Category;Name=$Name;Identity=$Identity;Outcome=$Outcome;Found=$Found;Before=$Before;After=$After;Detail=$Detail;Repeated=[bool]$repeated;Reappeared=[bool]$reappeared;Inventory=[bool]$Inventory;ErrorCode=$ErrorCode})
     if($Desired -and -not($Category -eq 'service' -and $Outcome -eq 'absent') -and $Outcome -in @('removed','disabled','stopped','set','created','compliant','already_disabled','absent')){
         $guardNextHistory[$key]=[pscustomobject]@{Key=$key;Desired=$Desired;LastSuccess=(Get-Date).ToString('o')}
     }
@@ -143,7 +171,7 @@ function Invoke-GuardCheck {
         Write-GuardLog 'DETAIL' $logDiagnostic
         if($observation.Detail){$detail+=[Environment]::NewLine+$observation.Detail}
         $detail+=[Environment]::NewLine+$diagnostic
-        Add-GuardDetail -Category $Category -Name $Name -Identity $Identity -Outcome 'failed' -Found $observation.Found -Before $observation.Before -After $observation.After -Detail $detail
+        Add-GuardDetail -Category $Category -Name $Name -Identity $Identity -Outcome 'failed' -Found $observation.Found -Before $observation.Before -After $observation.After -Detail $detail -Desired $Desired -ErrorCode ('0x'+$problem.HResult.ToString('X8'))
     }
 }
 function Read-GuardInventory {
@@ -153,7 +181,10 @@ function Read-GuardInventory {
     try { $items=@(& $Read);$guardInventoryStatus[$Category]=$true;$items }
     catch {
         $guardInventoryStatus[$Category]=$false;$counts.Failed++;Write-GuardLog 'ERROR' "$Label : $($_.Exception.Message)"
-        Add-GuardDetail -Category $Category -Name $Label -Outcome 'failed' -Found $null -Detail (T "Список недоступен; отсутствие компонентов не подтверждено. $($_.Exception.Message)" "Inventory unavailable; component absence is unconfirmed. $($_.Exception.Message)")
+        Add-GuardDetail -Category $Category -Name $Label -Outcome 'failed' -Found $null -Inventory -Detail (T "Список недоступен; отсутствие компонентов не подтверждено. $($_.Exception.Message)" "Inventory unavailable; component absence is unconfirmed. $($_.Exception.Message)")
+        if($Category -in @('app','provisioned')){
+            foreach($name in @(Get-GuardExpectedApps $config)){Add-GuardDetail -Category $Category -Name $name -Outcome not_checked -Found $null -Desired absent}
+        }
     }
 }
 function Add-MissingGuardTargets {
@@ -161,9 +192,7 @@ function Add-MissingGuardTargets {
     if(-not $guardInventoryStatus[$Category]){return}
     $targets=@($Patterns|Where-Object{$_})
     if($Category -in @('app','provisioned')){
-        $known=@('Microsoft.SecHealthUI','Microsoft.Copilot','Microsoft.Windows.Ai.Copilot.Provider','Clipchamp.Clipchamp','Microsoft.BingNews','Microsoft.BingWeather','Microsoft.GetHelp','Microsoft.Getstarted','Microsoft.MicrosoftOfficeHub','Microsoft.MicrosoftSolitaireCollection','Microsoft.WindowsFeedbackHub','Microsoft.YourPhone','Microsoft.OutlookForWindows','MicrosoftTeams','MSTeams')
-        if($config.ExpectedApps){$known=@($config.ExpectedApps)}
-        $known=@($known|Where-Object{Test-GuardMatch $_ $Patterns})
+        $known=@(Get-GuardExpectedApps $config)
         foreach($name in $known){
             if(@($Inventory|Where-Object{[string]$_.$NameProperty -eq $name}).Count){continue}
             $counts.Checked++
@@ -285,12 +314,22 @@ function Save-GuardReport {
     foreach($warning in $guardWarnings){$lines.Add("! $warning")}
     $text=$lines -join "`r`n"
     Write-GuardLog 'REPORT' ("`r`n"+$text)
-    $report=[ordered]@{Schema=1;BuildId=$config.BuildId;Started=$guardStartedAt.ToString('o');Finished=(Get-Date).ToString('o');Complete=$guardComplete;Deferred=$guardSkippedOobe;Errors=$counts.Failed;LogErrors=$counts.LogFailed;Summary=$totals;Items=@($guardRows.ToArray());Warnings=@($guardWarnings.ToArray())}
-    foreach($document in @(
-        @{Name='guard-report.txt';Text=$text},
-        @{Name='guard-report.json';Text=($report|ConvertTo-Json -Depth 8)},
-        @{Name='guard-state.json';Text=([ordered]@{Schema=1;BuildId=$config.BuildId;Managed=@($guardNextHistory.Values)}|ConvertTo-Json -Depth 5)}
-    )){
+    $report=[ordered]@{Schema=2;BuildId=$config.BuildId;RunId=$guardRunId;Mode=$guardMode;Started=$guardStartedAt.ToString('o');Finished=(Get-Date).ToString('o');Complete=$guardComplete;Deferred=$guardSkippedOobe;Errors=$counts.Failed;LogErrors=$counts.LogFailed;ViewErrors=$counts.ViewFailed;Summary=$totals;Items=@($guardRows.ToArray());Warnings=@($guardWarnings.ToArray())}
+    $brief=Get-GuardBriefReport -Report $report -HasHistory ([bool]$guardHistory.Count)
+    $report.Brief=$brief.Counts;$report.BriefText=$brief.Text
+    # Publish JSON last so the Standard viewer sees failures writing other files.
+    foreach($name in 'guard-report.txt','guard-state.json','guard-summary.txt','guard-report.json'){
+        if($name -in @('guard-summary.txt','guard-report.json')){
+            $report.LogErrors=$counts.LogFailed
+            $brief=Get-GuardBriefReport -Report $report -HasHistory ([bool]$guardHistory.Count)
+            $report.Brief=$brief.Counts;$report.BriefText=$brief.Text
+        }
+        $document=@{Name=$name;Text=$(switch($name){
+            'guard-report.txt'{$text}
+            'guard-state.json'{[ordered]@{Schema=1;BuildId=$config.BuildId;Managed=@($guardNextHistory.Values)}|ConvertTo-Json -Depth 5}
+            'guard-summary.txt'{$brief.Text}
+            'guard-report.json'{$report|ConvertTo-Json -Depth 8}
+        })}
         $target=Join-Path $PSScriptRoot $document.Name;$temporary=$target+'.'+$PID+'.tmp'
         try{
             [IO.File]::WriteAllText($temporary,$document.Text,[Text.UTF8Encoding]::new($true))
@@ -307,6 +346,11 @@ function Save-GuardReport {
 try { $runLock = [IO.File]::Open((Join-Path $PSScriptRoot 'guard.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
 catch [IO.IOException] { return }
 try {
+    try{
+        $offset=if(Test-Path -LiteralPath $logFile){(Get-Item -LiteralPath $logFile).Length}else{0}
+        $marker=@{RunId=$guardRunId;BuildId=$config.BuildId;Started=$guardStartedAt.ToString('o');LogOffset=$offset}|ConvertTo-Json
+        [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'guard-run.json'),$marker,[Text.UTF8Encoding]::new($true))
+    }catch{$counts.LogFailed++;$guardWarnings.Add((T 'Не удалось записать начало проверки.' 'Could not record the check start.'))}
     try {
         $historyPath=Join-Path $PSScriptRoot 'guard-state.json'
         if(Test-Path -LiteralPath $historyPath){
@@ -322,6 +366,7 @@ try {
         Write-GuardLog 'SKIP' (T 'OOBE ещё выполняется. Проверка продолжится при следующем входе.' 'OOBE is still running. Checks will run at the next logon.')
         Add-GuardDetail -Category run -Name 'OOBE' -Outcome 'not_checked' -Found $null -Detail (T 'Политики, службы и компоненты не проверялись.' 'Policies, services and components were not checked.')
     } else {
+        if($guardMode -eq 'Debug'){Invoke-GuardPresentation}
         if ($config.RemoveEdge) {
             Invoke-GuardCheck -Label 'Edge' -Category component -Name 'Microsoft Edge' -Desired absent -Action {
                 param($observation)
@@ -446,11 +491,7 @@ try {
                     }
                     Grant-SystemAccess -Path $full -Recurse:$item.PSIsContainer -Observation $observation
                     $observation.Step=(T 'удаление (Remove-Item)' 'removal (Remove-Item)')
-                    if ($item.PSIsContainer) {
-                        Remove-Item -LiteralPath $full -Recurse -Force -ErrorAction Stop
-                    } else {
-                        Remove-Item -LiteralPath $full -Force -ErrorAction Stop
-                    }
+                    Remove-GuardSelectedPath -Path $full -Directory $item.PSIsContainer -Observation $observation
                     $observation.Step=(T 'проверка после удаления' 'verification after removal')
                     if (Test-Path -LiteralPath $full -ErrorAction Stop) { throw (T 'Объект остался после удаления' 'Object remains after removal') }
                     $observation.After='Absent'
@@ -466,6 +507,7 @@ try {
     Add-GuardDetail -Category run -Name (T 'Прерывание проверки' 'Interrupted check') -Outcome failed -Found $null -Detail $_.Exception.Message
 } finally {
     try {
+        if($guardMode -eq 'Standard' -and -not $guardSkippedOobe){Invoke-GuardPresentation}
         try { Save-GuardReport } catch {$counts.LogFailed++;try{[Console]::Error.WriteLine("[LOG ERROR] Report: $($_.Exception.Message)")}catch{}}
         Write-GuardLog 'END' (T "Проверено $($counts.Checked); изменено $($counts.Changed); ожидают завершения $($counts.Pending); пропущено $($counts.Skipped); ошибок $($counts.Failed)" "Checked $($counts.Checked); changed $($counts.Changed); pending $($counts.Pending); skipped $($counts.Skipped); errors $($counts.Failed)")
     }
@@ -474,5 +516,5 @@ try {
 if ($counts.LogFailed) {
     try { [Console]::Error.WriteLine((T "[LOG ERROR] Не записано строк в guard.log: $($counts.LogFailed); строки переданы в stderr (launcher.log при штатном запуске)." "[LOG ERROR] Lines not written to guard.log: $($counts.LogFailed); forwarded to stderr (launcher.log during normal startup).")) } catch { }
 }
-if ($counts.Failed -or $counts.LogFailed) { exit 1 }
+if ($counts.Failed -or $counts.LogFailed -or $counts.ViewFailed) { exit 1 }
 exit 0

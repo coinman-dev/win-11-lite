@@ -179,9 +179,11 @@ param(
     [Alias('Watchdog')]
     [switch]$Guard,
 
-    # Временно включено для проверки guard: видимое окно живого журнала при входе.
-    # Отключить для следующего ISO: -GuardDebug:$false (сам guard продолжит работу).
-    [switch]$GuardDebug = $true,
+    # Standard: только итог; Debug: живой журнал; Silent: отчёты только в файлах.
+    [ValidateSet('Debug','Standard','Silent')]
+    [string]$GuardMode = 'Standard',
+    # Совместимость со старыми командами: true -> Debug, false -> Silent.
+    [switch]$GuardDebug,
 
     # Языки, которые надо встроить в образ: ru-RU, de-DE, fr-FR и любые другие.
     # Первый в списке становится языком интерфейса по умолчанию.
@@ -324,6 +326,11 @@ $script:WizardMode = $Interactive -or ($PSBoundParameters.Count -eq 0) -or ($Ele
 
 # Паузу держим там, где окно закроется само: диалог или перезапуск от администратора
 $script:PauseOnExit = $script:WizardMode -or $Elevated
+if($PSBoundParameters.ContainsKey('GuardDebug')){
+    $legacyGuardMode=if($GuardDebug){'Debug'}else{'Silent'}
+    if($PSBoundParameters.ContainsKey('GuardMode') -and $GuardMode -ne $legacyGuardMode){throw (T 'GuardMode противоречит GuardDebug; укажите один режим guard.' 'GuardMode conflicts with GuardDebug; specify one guard mode.')}
+    $GuardMode=$legacyGuardMode
+}
 
 function Test-CanPrompt {
     -not [Console]::IsInputRedirected -and [Environment]::UserInteractive
@@ -2125,10 +2132,12 @@ function Get-SetupRunnerPath {
     $path=Join-Path $script:ScriptRoot 'data\Run-Setup.ps1'
     if(-not (Test-Path -LiteralPath $path -PathType Leaf)){throw (T 'Не найден data\Run-Setup.ps1 — скачайте полный репозиторий' 'data\Run-Setup.ps1 was not found - download the full repository')}
     if($Guard -and -not(Test-Path -LiteralPath (Join-Path $script:ScriptRoot 'data\guard.ps1') -PathType Leaf)){throw (T 'Не найден data\guard.ps1 — скачайте полный репозиторий' 'data\guard.ps1 was not found - download the full repository')}
+    if($Guard -and -not(Test-Path -LiteralPath (Join-Path $script:ScriptRoot 'data\Guard.UI.ps1') -PathType Leaf)){throw (T 'Не найден data\Guard.UI.ps1 — скачайте полный репозиторий' 'data\Guard.UI.ps1 was not found - download the full repository')}
     $path
 }
 function Get-SetupSupportScripts {
-    param([bool]$BlockNetwork, [bool]$RemoveEdge, [bool]$EnableGuard, [bool]$ManageOobe = $true, [string]$Language = 'en-US', [bool]$ShowGuardWindow = $true)
+    param([bool]$BlockNetwork, [bool]$RemoveEdge, [bool]$EnableGuard, [bool]$ManageOobe = $true, [string]$Language = 'en-US', [bool]$ShowGuardWindow = $true, [ValidateSet('Debug','Standard','Silent')][string]$GuardMode='Standard')
+    if($PSBoundParameters.ContainsKey('ShowGuardWindow') -and -not $ShowGuardWindow){$GuardMode='Silent'}
     $prepare = @'
 #Requires -Version 5.1
 param([switch]$RegisterOnly)
@@ -2212,16 +2221,11 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Pr
 if (__GUARD__) {
     $guardAction = New-ScheduledTaskAction -Execute $exe -Argument ($runnerArguments + 'guard')
     Register-ScheduledTask -TaskName 'win-11-lite guard' -Action $guardAction -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-    if (__GUARDDEBUG__) {
-        $viewerAction = New-ScheduledTaskAction -Execute $exe -Argument ($runnerArguments + 'guard-debug')
-        $viewerPrincipal = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited
-        $viewerTrigger = New-ScheduledTaskTrigger -AtLogOn
-        $viewerTrigger.Delay = 'PT30S'
-        $viewerSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances Parallel -ExecutionTimeLimit ([TimeSpan]::Zero)
-        Register-ScheduledTask -TaskName 'win-11-lite guard debug' -Action $viewerAction -Trigger $viewerTrigger -Principal $viewerPrincipal -Settings $viewerSettings -Force | Out-Null
-    } else {
-        Unregister-ScheduledTask -TaskName 'win-11-lite guard debug' -Confirm:$false -ErrorAction SilentlyContinue
-    }
+    . (Join-Path $PSScriptRoot 'Guard.UI.ps1')
+    $viewerMode='__GUARDMODE__'
+    $guardConfigPath=Join-Path $PSScriptRoot 'guard.json'
+    if(Test-Path -LiteralPath $guardConfigPath){$viewerMode=Get-GuardMode (Get-Content -LiteralPath $guardConfigPath -Raw|ConvertFrom-Json)}
+    Register-GuardViewerTask -SupportDirectory $PSScriptRoot -Mode $viewerMode
 }
 Write-PrepareLog (T 'Задачи первого входа зарегистрированы' 'First-logon tasks registered')
 } catch {
@@ -2399,7 +2403,7 @@ if (-not $failed -and -not $EdgeOnly) {
 } finally { $finalizeLock.Dispose() }
 if ($failed) { exit 1 }
 '@
-    $prepare = $prepare.Replace('__NETWORK__', ('$' + $BlockNetwork.ToString().ToLowerInvariant())).Replace('__GUARD__', ('$' + $EnableGuard.ToString().ToLowerInvariant())).Replace('__GUARDDEBUG__', ('$' + $ShowGuardWindow.ToString().ToLowerInvariant())).Replace('__OOBE__', ('$' + $ManageOobe.ToString().ToLowerInvariant())).Replace('__LANG__', $Language)
+    $prepare = $prepare.Replace('__NETWORK__', ('$' + $BlockNetwork.ToString().ToLowerInvariant())).Replace('__GUARD__', ('$' + $EnableGuard.ToString().ToLowerInvariant())).Replace('__GUARDMODE__', $GuardMode).Replace('__OOBE__', ('$' + $ManageOobe.ToString().ToLowerInvariant())).Replace('__LANG__', $Language)
     $finalize = $finalize.Replace('__EDGE__', ('$' + $RemoveEdge.ToString().ToLowerInvariant())).Replace('__NETWORK__', ('$' + $BlockNetwork.ToString().ToLowerInvariant())).Replace('__OOBE__', ('$' + $ManageOobe.ToString().ToLowerInvariant())).Replace('__LANG__', $Language)
     @{ Prepare = $prepare; Finalize = $finalize }
 }
@@ -2654,6 +2658,13 @@ if ($script:WizardMode) {
     Write-Host (T '  AI-компоненты — и сбрасывает политики обратно. Сторож встраивается в образ' '  AI components - and resets the policies. The guard is embedded into the image') -ForegroundColor DarkGray
     Write-Host (T '  и при каждом входе в систему тихо удаляет их снова и возвращает настройки.' '  and at every logon quietly removes them again and restores the settings.') -ForegroundColor DarkGray
     $Guard = Read-YesNo -Question (T 'Встроить сторож в образ?' 'Embed the guard into the image?') -Default $true
+    if($Guard){
+        $GuardMode=Read-Option -Question (T 'Режим работы guard' 'Guard mode') -Items @(
+            (T 'Стандарт — только итоговый отчёт и ошибки' 'Standard - summary and errors only'),
+            (T 'Debug — полный живой журнал' 'Debug - full live log'),
+            (T 'Тихий — без окна, отчёты в папке guard' 'Silent - no window, reports in the guard folder')
+        ) -Values @('Standard','Debug','Silent') -Default ([array]::IndexOf(@('standard','debug','silent'),$GuardMode.ToLowerInvariant())+1)
+    }
 
     # 6. Язык — спрашиваем, только если образ англоязычный
     if ($wizardLang -like 'en-*') {
@@ -2748,7 +2759,7 @@ if ($script:WizardMode) {
     if ($RemoveWinRE)        { $cmd += ' -RemoveWinRE' }
     if ($SaveWinRE)          { $cmd += ' -SaveWinRE' }
     if ($Guard)              { $cmd += ' -Guard' }
-    if ($Guard -and -not $GuardDebug) { $cmd += ' -GuardDebug:$false' }
+    if ($Guard) { $cmd += " -GuardMode $GuardMode" }
     if ($script:DebugMode)   { $cmd += ' -Debug' }
 
     Write-Host ''
@@ -3339,7 +3350,7 @@ $vGuard = if ($Guard) { T 'встроить (проверка при каждо�
 Write-Host (T "  winget         : $vWinget" "  winget         : $vWinget")
 if ($Preset -ne 'max') { Write-Host (T '  Store / MSIX   : сохранить имеющиеся Store, App Installer и зависимости' '  Store / MSIX   : preserve existing Store, App Installer and dependencies') }
 Write-Host (T "  Сторож         : $vGuard" "  Guard          : $vGuard")
-if ($Guard) { Write-Host (T "  Окно guard     : $([bool]$GuardDebug) (выключить: -GuardDebug:`$false)" "  Guard window   : $([bool]$GuardDebug) (disable: -GuardDebug:`$false)") }
+if ($Guard) { Write-Host (T "  Режим guard    : $GuardMode" "  Guard mode     : $GuardMode") }
 Write-Host (T "  Обновления     : $vUpd" "  Updates        : $vUpd")
 if (-not $DryRun -and $dotNetPayload) { Write-Host (T "  .NET           : $DotNetUpdateFile" "  .NET           : $DotNetUpdateFile") }
 $vOobeNet = if ($NoOobeNetworkBlock) { T 'сеть включена  (OOBE скачает обновления)' 'network on  (OOBE will download updates)' }
@@ -4086,6 +4097,8 @@ if ($Guard) {
     }
 
     $guardConfig = [ordered]@{
+        Mode = $GuardMode
+        ViewerTask = $GuardMode -ne 'Silent'
         Language = $imgLang
         BuildId = $script:StartedAt.ToString('yyyyMMdd-HHmmss')
         RemoveEdge = (Test-GroupActive -RulePreset 'safe' -Group 'Edge')
@@ -4099,6 +4112,7 @@ if ($Guard) {
     }
     [IO.File]::WriteAllText((Join-Path $guardDir 'guard.json'), ($guardConfig | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($true))
     $guardScript = Get-GuardScript
+    Copy-Item -LiteralPath (Join-Path $script:ScriptRoot 'data\Guard.UI.ps1') -Destination (Join-Path $guardDir 'Guard.UI.ps1') -Force
     [IO.File]::WriteAllText((Join-Path $guardDir 'guard.ps1'), $guardScript, [Text.UTF8Encoding]::new($true))
     Write-Ok (T "Сторож встроен: проверяет систему при каждом входе ($(($guardFolders + $guardServices + $guardAppx + $guardCaps).Count) объектов, $($guardPolicies.Count) политик)" "Guard embedded: checks the system at every logon ($(($guardFolders + $guardServices + $guardAppx + $guardCaps).Count) objects, $($guardPolicies.Count) policies)")
 }
@@ -4114,7 +4128,7 @@ Copy-Item -LiteralPath $setupRunner -Destination (Join-Path $supportDir 'Run-Set
 Remove-Item -LiteralPath (Join-Path $supportDir 'Win11Lite.Run.exe') -Force -ErrorAction SilentlyContinue
 $support = Get-SetupSupportScripts -BlockNetwork ($script:ManageOobe -and -not $NoOobeNetworkBlock) `
     -RemoveEdge (Test-GroupActive -RulePreset 'safe' -Group 'Edge') -EnableGuard ([bool]$Guard) `
-    -ManageOobe $script:ManageOobe -Language $imgLang -ShowGuardWindow ([bool]$GuardDebug)
+    -ManageOobe $script:ManageOobe -Language $imgLang -GuardMode $GuardMode
 foreach ($name in @('Prepare', 'Finalize')) {
     [IO.File]::WriteAllText((Join-Path $supportDir "$name.ps1"), $support[$name], [Text.UTF8Encoding]::new($true))
 }
@@ -4135,7 +4149,8 @@ $buildInfo = [ordered]@{
     DotNetUpdateFile = $(if ($dotNetPayload) { $DotNetUpdateFile } else { $null })
     SkippedDownloads = @($script:SkippedDownloads)
     Guard = [bool]$Guard
-    GuardDebug = [bool]($Guard -and $GuardDebug)
+    GuardMode = $GuardMode
+    GuardDebug = [bool]($Guard -and $GuardMode -eq 'Debug')
     OobeNetworkBlock = [bool]($script:ManageOobe -and -not $NoOobeNetworkBlock)
     OobeCompletionCheck = 'OOBEComplete'
     SetupScriptLauncher = 'PowerShell / Run-Setup.ps1'
