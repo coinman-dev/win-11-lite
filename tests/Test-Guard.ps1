@@ -144,6 +144,7 @@ try{
                 $full=[IO.Path]::GetFullPath($LiteralPath)
                 if(-not $full.StartsWith($root+'\',[StringComparison]::OrdinalIgnoreCase)){throw "Unsafe test deletion: $full"}
                 if($full -eq $remove -and $fixture.DenyRemove){Write-Error 'Mock removal denied' -TargetObject (Join-Path $full 'locked.dll') -Category PermissionDenied -ErrorAction Stop}
+                if($full -eq $browser -and $fixture.DenyEdge){throw 'Mock locked browser'}
                 Microsoft.PowerShell.Management\Remove-Item -LiteralPath $full -Recurse:$Recurse -Force:$Force -ErrorAction Stop
             }
             # The guard now calls the real in-process finalizer for Edge cleanup.
@@ -247,6 +248,17 @@ try{
             Assert ($LASTEXITCODE -eq 1 -and $row.Outcome -eq 'failed' -and $row.Detail -match 'verification after removal' -and -not $row.After) 'An unreadable post-removal path cannot be reported as successfully absent'
             $fixture.DenyVerify=$false
 
+            # The in-process finalizer reports through a flag, not an exit code.
+            & {
+                $null=New-Item -ItemType Directory -Path $browser -Force
+                $fixture.DenyEdge=$true
+                try{& $guest -Mode guard -Direct}finally{$fixture.DenyEdge=$false}
+                $edgeReport=Get-Content -LiteralPath (Join-Path $root 'guard-report.json') -Raw|ConvertFrom-Json
+                $edgeRow=@($edgeReport.Items|Where-Object{$_.Category -eq 'component' -and $_.Name -eq 'Microsoft Edge'})
+                Assert ($LASTEXITCODE -eq 1 -and $edgeRow.Count -eq 1 -and $edgeRow[0].Outcome -eq 'failed' -and (Test-Path -LiteralPath $browser)) 'A failed Edge cleanup is reported as a failed component instead of ending the guard run'
+                Assert (@($edgeReport.Items|Where-Object{$_.Category -eq 'setting' -and $_.Outcome -eq 'not_checked'}).Count -eq 0) 'The remaining checks still run after the Edge failure'
+                Remove-Item -LiteralPath $browser -Recurse -Force
+            }
             $outside=Join-Path $root 'outside-system'; $null=New-Item -ItemType Directory -Path $outside
             $marker=Join-Path $outside 'keep.txt'; Set-Content -LiteralPath $marker -Value 'must survive'
             $link=Join-Path $env:SystemDrive 'linked'
