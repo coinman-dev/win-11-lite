@@ -12,7 +12,7 @@ foreach($name in @('T','Test-GroupActive','Get-ProtectedPatterns','Get-GuestScri
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     . ([scriptblock]::Create($node.Extent.Text))
 }
-$script:Lang='en'; $script:ImageLanguages=@('en-US'); $AddLanguage=@(); $DownloadLanguage=@(); $RemoveExtra=@(); $Keep=@(); $Preset='balanced'; $imgLang='en-US'; $script:StartedAt=Get-Date; $GuardMode='Standard'
+$script:Lang='en'; $script:ImageLanguages=@('en-US'); $AddLanguage=@(); $DownloadLanguage=@(); $RemoveExtra=@(); $Keep=@(); $Preset='balanced'; $imgLang='en-US'; $script:StartedAt=Get-Date; $Guard='Standard'
 foreach($name in @('CapabilityRules','PackageRules','FolderRules','FileRules','AppxRules','NeverRemove','AppPlatformProtected','DisableServices','AiFolderPatterns')){
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq ('$script:'+$name)},$false)
     . ([scriptblock]::Create($node.Extent.Text))
@@ -22,7 +22,7 @@ $null=New-Item -ItemType Directory -Path $root
 # One guest file serves every mode; build-info.json carries the build choices.
 $guest=Join-Path $root 'Win11Lite.ps1'
 [IO.File]::WriteAllText($guest,(Get-GuestScript),[Text.UTF8Encoding]::new($true))
-$buildInfo=[ordered]@{BuildId='test';Language='en-US';Guard=$true;GuardMode='Standard';OobeNetworkBlock=$false;ManageOobe=$true;RemoveEdge=$true}
+$buildInfo=[ordered]@{BuildId='test';Language='en-US';Guard='Standard';OobeNetworkBlock=$false;ManageOobe=$true;RemoveEdge=$true}
 function Write-BuildInfo {$buildInfo|ConvertTo-Json -Depth 4|Set-Content -LiteralPath (Join-Path $root 'build-info.json') -Encoding UTF8}
 Write-BuildInfo
 try{
@@ -43,9 +43,9 @@ try{
         Assert (-not $unexpected.Count -and $diagnostics.Count -eq 1 -and $ErrorActionPreference -eq 'Stop') 'Native diagnostics do not leak to stdout or change the caller error preference'
     }
     # Evaluate the actual embedding block: build rules become guard.json.
-    $mountDir=Join-Path $root 'image'; $guardDir=Join-Path $mountDir 'Windows\Setup\Scripts\Win11Lite'; $Guard=$true
+    $mountDir=Join-Path $root 'image'; $guardDir=Join-Path $mountDir 'Windows\Setup\Scripts\Win11Lite'; $Guard='Standard'
     function Write-Ok {param($Message)}
-    $node=$ast.Find({param($n)$n -is [Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -eq '$Guard' -and $n.Extent.Text -match '\$guardConfig ='},$true)
+    $node=$ast.Find({param($n)$n -is [Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -eq '$Guard -ne ''None''' -and $n.Extent.Text -match '\$guardConfig ='},$true)
     & ([scriptblock]::Create($node.Extent.Text))
     $cfg=Get-Content -LiteralPath (Join-Path $guardDir 'guard.json') -Raw | ConvertFrom-Json
     Assert ($cfg.Mode -eq 'Standard' -and $cfg.ViewerTask -and -not (Get-Member -InputObject $cfg -Name Language)) 'Guard targets are embedded with the chosen mode and no duplicate language setting'
@@ -71,7 +71,20 @@ try{
         Assert (-not @($kept.Apps | Where-Object {$name -match $_}).Count) "Keep WMP/Apps also protects $name from guard"
     }
     Assert (@($kept.Protected | Where-Object {'Language.Speech~~~en-US~0.0.1.0' -match $_}).Count -gt 0) 'Keep Speech is protected even from RemoveExtra'
-    $Keep=@(); $RemoveExtra=@()
+    $Keep=@('Family','ToDo');$RemoveExtra=@()
+    & ([scriptblock]::Create($node.Extent.Text))
+    $targeted=Get-Content -LiteralPath (Join-Path $guardDir 'guard.json') -Raw | ConvertFrom-Json
+    foreach($name in 'Microsoft.Todos','MicrosoftCorporationII.MicrosoftFamily'){
+        Assert (-not @($targeted.Apps | Where-Object {$name -match $_}).Count) "Targeted Keep excludes $name from guard"
+    }
+    foreach($name in 'Microsoft.ZuneMusic','Microsoft.XboxGamingOverlay','Microsoft.BingWeather'){
+        Assert (@($targeted.Apps | Where-Object {$name -match $_}).Count -gt 0) "Targeted Keep still lets guard remove $name"
+    }
+    $activeMount=$mountDir;$activeGuardDir=$guardDir
+    $mountDir=Join-Path $root 'disabled-image';$guardDir=Join-Path $mountDir 'Windows\Setup\Scripts\Win11Lite';$Guard='None'
+    & ([scriptblock]::Create($node.Extent.Text))
+    Assert (-not (Test-Path -LiteralPath (Join-Path $guardDir 'guard.json'))) 'None does not embed guard configuration'
+    $mountDir=$activeMount;$guardDir=$activeGuardDir;$Guard='Standard';$Keep=@();$RemoveExtra=@()
 
     & {
         $tasks=@{}
@@ -89,10 +102,14 @@ try{
         Assert ($viewer.Principal.GroupId -eq 'S-1-5-32-545' -and $viewer.Principal.RunLevel -eq 'Limited') 'Observer uses the interactive user group without elevation'
         Assert ($viewer.Action.Argument -match 'Win11Lite\.ps1" -Mode view -RunId' -and $viewer.Action.Execute -like '*\powershell.exe' -and -not $viewer.Trigger) 'Report task runs the viewer directly on demand without an intermediate logon process'
         Assert ($worker.Action.Argument -match 'Win11Lite\.ps1" -Mode guard$') 'Every scheduled task starts the same guest file by mode'
-        $buildInfo.GuardMode='Silent';Write-BuildInfo
+        $buildInfo.Guard='Silent';Write-BuildInfo
         & $guest -Mode prepare-register -Direct
         Assert ($tasks.ContainsKey('win-11-lite guard') -and -not $tasks.ContainsKey('win-11-lite guard report')) 'Silent mode removes only the observer'
-        $buildInfo.GuardMode='Standard';Write-BuildInfo
+        $buildInfo.Guard='Standard';Write-BuildInfo
+        $tasks=@{};$buildInfo.Guard='None';Write-BuildInfo
+        & $guest -Mode prepare-register -Direct
+        Assert ($tasks.ContainsKey('win-11-lite finalize') -and -not $tasks.ContainsKey('win-11-lite guard') -and -not $tasks.ContainsKey('win-11-lite guard report')) 'None registers only the one-time finalizer'
+        $buildInfo.Guard='Standard';Write-BuildInfo
     }
 
     & {

@@ -25,7 +25,7 @@ try{
         if(-not $node){throw "Missing standalone function: $name"}
         . ([scriptblock]::Create($node.Extent.Text))
     }
-    $script:ScriptRoot=$standalone;$script:Lang='en';$Guard=$true
+    $script:ScriptRoot=$standalone;$script:Lang='en';$Guard='Standard'
 
     # The guest runtime is one embedded file, readable and edited in place.
     $guestScript=Get-GuestScript
@@ -38,7 +38,7 @@ try{
         Assert (-not ($guestScript -match $retired)) "The guest script no longer expects a companion file: $retired"
     }
     $functions=@($guestAst.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst]},$false)|ForEach-Object{$_.Name})
-    foreach($required in 'Invoke-Prepare','Invoke-Finalize','Start-GuestChild','Show-GuardView','Register-GuardViewerTask','Save-GuardReport','Get-BuildSetting'){
+    foreach($required in 'Invoke-Prepare','Invoke-Finalize','Start-GuestChild','Show-GuardView','Register-GuardViewerTask','Save-GuardReport','Get-BuildSetting','Get-GuestGuardMode'){
         Assert ($required -in $functions) "The single guest file provides $required"
     }
     Assert (@($functions|Sort-Object -Unique).Count -eq $functions.Count) 'No guest function is defined twice after the merge'
@@ -46,7 +46,7 @@ try{
         Assert ($guestScript -match ("(?m)^\s*if \(\`$Mode -eq '$mode'|'$mode',|,'$mode'")) "The guest script handles the $mode entry point"
     }
     # Build choices travel in build-info.json, not in generated source text.
-    foreach($setting in 'OobeNetworkBlock','ManageOobe','RemoveEdge','Guard','GuardMode'){
+    foreach($setting in 'OobeNetworkBlock','ManageOobe','RemoveEdge','Guard'){
         Assert ($guestScript -match ("(Get-GuestFlag|Get-BuildSetting) '$setting'")) "The guest script reads $setting from build-info.json"
     }
 

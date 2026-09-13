@@ -19,6 +19,15 @@ function Assert-Throws([scriptblock]$Action, [string]$Message) {
     try { & $Action | Out-Null } catch { $thrown = $true }
     Assert $thrown $Message
 }
+$guardParameter=@($ast.ParamBlock.Parameters|Where-Object{$_.Name.VariablePath.UserPath -eq 'Guard'})
+Assert ($guardParameter.Count -eq 1 -and $guardParameter[0].StaticType -eq [string] -and $guardParameter[0].DefaultValue.Extent.Text -eq "'None'") 'Guard is one string parameter and defaults to None'
+Assert ($guardParameter[0].Extent.Text -match "ValidateSet\('None','Standard','Debug','Silent'\)") 'Guard accepts exactly None, Standard, Debug and Silent'
+Assert (-not @($ast.ParamBlock.Parameters|Where-Object{$_.Name.VariablePath.UserPath -in @('GuardMode','GuardDebug')}).Count) 'Separate GuardMode and GuardDebug parameters are removed'
+$wizardGuard=[regex]::Match($ast.Extent.Text,'(?ms)^    # 5\. Сторож.*?(?=^    # 6\.)').Value
+Assert ($wizardGuard.Contains("-Values @('None','Standard','Debug','Silent') -Default `$guardDefault") -and $wizardGuard -notmatch 'Read-YesNo') 'The wizard uses one four-value Guard menu instead of separate enable and mode questions'
+Assert ($wizardGuard -match "else\{2\}" -and $wizardGuard -match "'Standard —") 'The wizard defaults to Standard while the command-line parameter defaults to None'
+$buildInfoNode=$ast.Find({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$buildInfo'},$true)
+Assert ($buildInfoNode.Extent.Text -match '(?m)^\s*Guard = \$Guard\s*$' -and $buildInfoNode.Extent.Text -notmatch 'GuardMode|GuardDebug') 'Build metadata stores the single Guard value without legacy duplicates'
 # Load declarations and pure configuration only, never execute the build pipeline.
 foreach ($name in @('T','Get-GuestScript','Test-DismSuccess','ConvertFrom-DismList','Test-GroupActive','Test-Protected','Get-ProtectedPatterns','Get-WindowsRelease','Get-EditionConfig','Assert-ChildPath','Test-SafeToWipe','Get-FodSourceName','Get-UpdateTarget','Get-ElevationCommand','Invoke-RegCommand','Invoke-NativeQuiet','Set-Reg','Mount-Hive','Dismount-Hives','Remove-Reg','Save-ImageAudit','Write-ComponentStoreReport','Write-ServicingRemovalFailure','Get-PackageRemovalSkipReason','Get-RequestedRemovalItems','Remove-OfflineRecall','Write-RemainingRemovalReport','Get-WebViewRuntimeRoots','Assert-ImageFileState','Get-ProgressLine','Update-ProgressState','Invoke-ProgressProcess','Get-CopyPercent','Assert-ImageLanguages','Write-WindowsBatchFile','Write-DiagnosticLog','Invoke-Dism')) {
     $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
@@ -224,12 +233,11 @@ try {
     Assert ((Get-UpdateTarget $updateDir).Name -eq 'target.msu') 'Explicit target wins over larger checkpoint'
     Assert-Throws { Get-UpdateTarget $updateDir '..\outside.msu' } 'Update target traversal rejected'
     $receiver = Join-Path $testRoot "parameter receiver's.ps1"
-    [IO.File]::WriteAllText($receiver, 'param([string[]]$Keep,[bool]$IncludeDotNetUpdate,[switch]$Guard,[switch]$Elevated,[switch]$GuardDebug=$true) [pscustomobject]@{Keep=$Keep;DotNet=$IncludeDotNetUpdate;Guard=[bool]$Guard;Elevated=[bool]$Elevated;GuardDebug=[bool]$GuardDebug}')
-    $encoded = Get-ElevationCommand -ScriptPath $receiver -Parameters @{Keep=@('Edge','Fonts');IncludeDotNetUpdate=$false;Guard=[switch]$false;GuardDebug=[switch]$false}
+    [IO.File]::WriteAllText($receiver, 'param([string[]]$Keep,[bool]$IncludeDotNetUpdate,[string]$Guard,[switch]$Elevated) [pscustomobject]@{Keep=$Keep;DotNet=$IncludeDotNetUpdate;Guard=$Guard;Elevated=[bool]$Elevated}')
+    $encoded = Get-ElevationCommand -ScriptPath $receiver -Parameters @{Keep=@('Edge','Fonts');IncludeDotNetUpdate=$false;Guard='Silent'}
     $received = & ([scriptblock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded))))
     Assert ($received.Keep.Count -eq 2 -and $received.Keep[1] -eq 'Fonts') 'Elevation preserves array parameters and quoted paths'
-    Assert (-not $received.DotNet -and -not $received.Guard -and $received.Elevated) 'Elevation preserves false bool/switch values'
-    Assert (-not $received.GuardDebug) 'Elevation preserves an explicit GuardDebug false value'
+    Assert (-not $received.DotNet -and $received.Guard -eq 'Silent' -and $received.Elevated) 'Elevation preserves false booleans and the combined Guard mode'
 
     # Real native stderr/exit handling, read-only: PS 5.1 emits ErrorRecord objects.
     & {
@@ -550,7 +558,7 @@ try {
             Set-Content -LiteralPath (Join-Path $webview 'msedgewebview2.exe') -Value 'runtime'
             $guest=Join-Path $testRoot 'Win11Lite.ps1'
             [IO.File]::WriteAllText($guest,(Get-GuestScript),[Text.UTF8Encoding]::new($true))
-            $guestInfo=[ordered]@{BuildId='test';Language='en-US';Guard=$false;GuardMode='Silent';OobeNetworkBlock=$true;ManageOobe=$true;RemoveEdge=$true}
+            $guestInfo=[ordered]@{BuildId='test';Language='en-US';Guard='None';OobeNetworkBlock=$true;ManageOobe=$true;RemoveEdge=$true}
             function Write-GuestInfo {$guestInfo|ConvertTo-Json -Depth 4|Set-Content -LiteralPath (Join-Path $testRoot 'build-info.json') -Encoding UTF8}
             Write-GuestInfo
             & $guest -Mode prepare -Direct

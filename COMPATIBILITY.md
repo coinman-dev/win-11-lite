@@ -72,4 +72,4 @@ Microsoft описывает 26H1 как выпуск для определён�
     -Edition Professional -Preset balanced -DryRun
 ```
 
-Для Home заменить `Professional` на `Core`. Для первой сборки в VM убрать `-DryRun`, добавить `-Guard -Debug` и задать пользователя в появившемся диалоге. Для запуска без вопросов об аккаунте указать `-LocalUserName User`; необязательный пароль — `-LocalUserPassword (Read-Host -AsSecureString)`. Без пароля получится локальный аккаунт с пустым паролем. Язык и App Installer уже есть в исходном образе.
+Для Home заменить `Professional` на `Core`. Для первой сборки в VM убрать `-DryRun`, добавить `-Guard Debug` и задать пользователя в появившемся диалоге. Для запуска без вопросов об аккаунте указать `-LocalUserName User`; необязательный пароль — `-LocalUserPassword (Read-Host -AsSecureString)`. Без пароля получится локальный аккаунт с пустым паролем. Язык и App Installer уже есть в исходном образе.

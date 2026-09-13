@@ -94,6 +94,16 @@ foreach($Preset in 'safe','balanced','max'){
 $Preset='balanced';$Keep=@('WMP','Apps');$state.Removed.Clear()
 & ([scriptblock]::Create($stage))
 Assert ($state.Removed.Count -eq 0) 'Keep WMP and Apps preserve modern media players, Xbox, Family and To Do'
+foreach($Preset in 'balanced','max'){
+    foreach($selection in @(@('Family'),@('ToDo'),@('Family','ToDo'))){
+        $Keep=@($selection);$state.Removed.Clear()
+        & ([scriptblock]::Create($stage))
+        Assert (($state.Removed -contains 'MicrosoftCorporationII.MicrosoftFamily_fixture') -eq ($Keep -notcontains 'Family')) 'Keep Family selects only the Family app'
+        Assert (($state.Removed -contains 'Microsoft.Todos_fixture') -eq ($Keep -notcontains 'ToDo')) 'Keep ToDo selects only Microsoft To Do'
+        Assert ($state.Removed -contains 'Microsoft.ZuneMusic_fixture' -and $state.Removed -contains 'Microsoft.XboxGamingOverlay_fixture' -and $state.Removed -contains 'Microsoft.BingWeather_fixture') 'Targeted Keep choices preserve the rest of the preset removal rules'
+    }
+}
+$Preset='balanced'
 $Keep=@();$inventory=@($platform)+@('Microsoft.BingWeather','Microsoft.Paint','Microsoft.WindowsCalculator')
 
 # Regression: an accidentally broadened rule must not remove the platform.

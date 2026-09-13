@@ -82,7 +82,7 @@ try{
             $block=$case -notin @('network-opt-out','custom-oobe')
             $guest=Join-Path $dir 'Win11Lite.ps1'
             [IO.File]::WriteAllText($guest,(Get-GuestScript),[Text.UTF8Encoding]::new($true))
-            [ordered]@{BuildId='test';Language='en-US';Guard=$false;GuardMode='Silent';OobeNetworkBlock=$block;ManageOobe=($case -ne 'custom-oobe');RemoveEdge=($case -eq 'edge-failure')} |
+            [ordered]@{BuildId='test';Language='en-US';Guard='None';OobeNetworkBlock=$block;ManageOobe=($case -ne 'custom-oobe');RemoveEdge=($case -eq 'edge-failure')} |
                 ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $dir 'build-info.json') -Encoding UTF8
             if($case -eq 'late-adapter'){$state.EmptyCalls=20}
             if($case -eq 'enumeration-retry'){$state.QueryFailures=2}

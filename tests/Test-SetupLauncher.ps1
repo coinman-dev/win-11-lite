@@ -13,7 +13,7 @@ foreach($name in 'T','Get-GuestScript','Write-WindowsBatchFile'){
     if(-not $node){throw "Missing function: $name"}
     . ([scriptblock]::Create($node.Extent.Text))
 }
-$script:ScriptRoot=$repo;$script:Lang='en';$Guard=$true;$script:checks=0
+$script:ScriptRoot=$repo;$script:Lang='en';$Guard='Standard';$script:checks=0
 function Assert([bool]$Value,[string]$Message){if(-not $Value){throw "FAIL: $Message"};$script:checks++}
 $root=Join-Path $repo ('tmp\runner-tests-'+[guid]::NewGuid().ToString('N'))
 $null=New-Item -ItemType Directory -Path $root

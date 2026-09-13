@@ -114,7 +114,7 @@ param(
     [string]$Preset = 'balanced',
 
     # Что оставить вопреки пресету.
-    [ValidateSet('Defender', 'WinRE', 'Edge', 'Fonts', 'Speech', 'WMP', 'IE', 'Sandbox', 'AI', 'Apps', 'OneDrive', 'NativeImages')]
+    [ValidateSet('Defender', 'WinRE', 'Edge', 'Fonts', 'Speech', 'WMP', 'IE', 'Sandbox', 'AI', 'Apps', 'Family', 'ToDo', 'OneDrive', 'NativeImages')]
     [string[]]$Keep = @(),
 
     # Дополнительные regex для удаления пакетов и возможностей.
@@ -175,17 +175,11 @@ param(
     # ценой небольшой нагрузки на процессор при чтении системных файлов.
     [switch]$CompactOS,
 
-    # Встроить в образ сторожевой скрипт. При каждом входе пользователя он
-    # проверяет, не вернули ли обновления удалённые компоненты и не сброшены ли
-    # политики, и при необходимости убирает их снова.
+    # None: не встраивать guard; Standard: краткий итог; Debug: живой журнал;
+    # Silent: проверка без окна, отчёты сохраняются в папке guard.
     [Alias('Watchdog')]
-    [switch]$Guard,
-
-    # Standard: только итог; Debug: живой журнал; Silent: отчёты только в файлах.
-    [ValidateSet('Debug','Standard','Silent')]
-    [string]$GuardMode = 'Standard',
-    # Совместимость со старыми командами: true -> Debug, false -> Silent.
-    [switch]$GuardDebug,
+    [ValidateSet('None','Standard','Debug','Silent')]
+    [string]$Guard = 'None',
 
     # Языки, которые надо встроить в образ: ru-RU, de-DE, fr-FR и любые другие.
     # Первый в списке становится языком интерфейса по умолчанию.
@@ -328,11 +322,7 @@ $script:WizardMode = $Interactive -or ($PSBoundParameters.Count -eq 0) -or ($Ele
 
 # Паузу держим там, где окно закроется само: диалог или перезапуск от администратора
 $script:PauseOnExit = $script:WizardMode -or $Elevated
-if($PSBoundParameters.ContainsKey('GuardDebug')){
-    $legacyGuardMode=if($GuardDebug){'Debug'}else{'Silent'}
-    if($PSBoundParameters.ContainsKey('GuardMode') -and $GuardMode -ne $legacyGuardMode){throw (T 'GuardMode противоречит GuardDebug; укажите один режим guard.' 'GuardMode conflicts with GuardDebug; specify one guard mode.')}
-    $GuardMode=$legacyGuardMode
-}
+$Guard=switch($Guard.ToLowerInvariant()){'none'{'None'}'standard'{'Standard'}'debug'{'Debug'}'silent'{'Silent'}}
 
 function Test-CanPrompt {
     -not [Console]::IsInputRedirected -and [Environment]::UserInteractive
@@ -738,7 +728,8 @@ $script:AppPlatformProtected = @(
 
 # Provisioned Appx на удаление.
 $script:AppxRules = @(
-    @{ Preset = 'balanced'; Group = 'Apps'; Pattern = '^(Microsoft\.Todos|MicrosoftCorporationII\.MicrosoftFamily)$'; Desc = (T 'Family и Microsoft To Do' 'Family and Microsoft To Do') }
+    @{ Preset = 'balanced'; Group = 'Family'; Pattern = '^MicrosoftCorporationII\.MicrosoftFamily$'; Desc = 'Family' }
+    @{ Preset = 'balanced'; Group = 'ToDo'; Pattern = '^Microsoft\.Todos$'; Desc = 'Microsoft To Do' }
     @{ Preset = 'balanced'; Group = 'WMP'; Pattern = '^Microsoft\.(ZuneMusic|ZuneVideo)$'; Desc = (T 'Медиаплеер, Музыка Groove и Кино и ТВ' 'Media Player, Groove Music and Movies & TV') }
     @{ Preset = 'balanced'; Group = 'Apps'; Pattern = '^Microsoft\.(GamingApp|XboxApp|XboxGamingOverlay|XboxGameOverlay|XboxSpeechToTextOverlay)$'; Desc = (T 'Xbox и Game Bar' 'Xbox and Game Bar') }
     @{ Preset = 'balanced'; Group = 'Defender'; Pattern = '^Microsoft\.SecHealthUI'; Desc = (T 'Интерфейс «Безопасность Windows»' 'Windows Security app') }
@@ -1272,6 +1263,7 @@ function Get-ProductKeyUiMode {
 function Test-GroupActive {
     param([string]$RulePreset, [string]$Group)
     if ($Keep -contains $Group) { return $false }
+    if ($Group -in @('Family','ToDo') -and $Keep -contains 'Apps') { return $false }
     if ($Preset -ne 'max' -and $Group -eq 'Fonts' -and @($script:ImageLanguages + $AddLanguage + $DownloadLanguage | Where-Object { $_ -match '^(zh|ja|ko)(-|$)' }).Count) { return $false }
     $order = @{ 'safe' = 0; 'balanced' = 1; 'max' = 2 }
     $order[$Preset] -ge $order[$RulePreset]
@@ -2134,6 +2126,11 @@ function Get-BuildSetting {
     $script:BuildInfo.$Name
 }
 function Get-GuestFlag { param([Parameter(Mandatory)][string]$Name) [bool](Get-BuildSetting -Name $Name) }
+function Get-GuestGuardMode {
+    $value=[string](Get-BuildSetting 'Guard')
+    if($value -notin @('None','Standard','Debug','Silent')){throw (T "Недопустимый режим Guard в build-info.json: $value" "Invalid Guard mode in build-info.json: $value")}
+    $value
+}
 function Write-GuestLog {
     param([string]$File, [string]$Message)
     $path = Join-Path $script:Support $File
@@ -2279,10 +2276,11 @@ function Invoke-Prepare {
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 20)
     $finalizeSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 3)
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $finalizeSettings -Force | Out-Null
-    if ((Get-GuestFlag 'Guard')) {
+    $configuredGuardMode=Get-GuestGuardMode
+    if ($configuredGuardMode -ne 'None') {
         $guardAction = New-ScheduledTaskAction -Execute $exe -Argument ($runnerArguments + 'guard')
         Register-ScheduledTask -TaskName 'win-11-lite guard' -Action $guardAction -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-        $viewerMode=(Get-BuildSetting 'GuardMode')
+        $viewerMode=$configuredGuardMode
         $guardConfigPath=Join-Path $PSScriptRoot 'guard.json'
         if(Test-Path -LiteralPath $guardConfigPath){$viewerMode=Get-GuardMode (Get-Content -LiteralPath $guardConfigPath -Raw|ConvertFrom-Json)}
         Register-GuardViewerTask -SupportDirectory $PSScriptRoot -Mode $viewerMode
@@ -3761,14 +3759,13 @@ if ($script:WizardMode) {
     Write-Host (T '  Windows Update со временем возвращает часть удалённого — Edge, Defender,' '  Windows Update eventually restores some of what was removed - Edge, Defender,') -ForegroundColor DarkGray
     Write-Host (T '  AI-компоненты — и сбрасывает политики обратно. Сторож встраивается в образ' '  AI components - and resets the policies. The guard is embedded into the image') -ForegroundColor DarkGray
     Write-Host (T '  и при каждом входе в систему тихо удаляет их снова и возвращает настройки.' '  and at every logon quietly removes them again and restores the settings.') -ForegroundColor DarkGray
-    $Guard = Read-YesNo -Question (T 'Встроить сторож в образ?' 'Embed the guard into the image?') -Default $true
-    if($Guard){
-        $GuardMode=Read-Option -Question (T 'Режим работы guard' 'Guard mode') -Items @(
-            (T 'Стандарт — только итоговый отчёт и ошибки' 'Standard - summary and errors only'),
-            (T 'Debug — полный живой журнал' 'Debug - full live log'),
-            (T 'Тихий — без окна, отчёты в папке guard' 'Silent - no window, reports in the guard folder')
-        ) -Values @('Standard','Debug','Silent') -Default ([array]::IndexOf(@('standard','debug','silent'),$GuardMode.ToLowerInvariant())+1)
-    }
+    $guardDefault=if($PSBoundParameters.ContainsKey('Guard')){[array]::IndexOf(@('none','standard','debug','silent'),$Guard.ToLowerInvariant())+1}else{2}
+    $Guard=Read-Option -Question (T 'Режим работы guard' 'Guard mode') -Items @(
+        (T 'None — не встраивать guard' 'None - do not embed guard'),
+        (T 'Standard — только итоговый отчёт и ошибки' 'Standard - summary and errors only'),
+        (T 'Debug — полный живой журнал' 'Debug - full live log'),
+        (T 'Silent — без окна, отчёты в папке guard' 'Silent - no window, reports in the guard folder')
+    ) -Values @('None','Standard','Debug','Silent') -Default $guardDefault
 
     # 6. Язык — спрашиваем, только если образ англоязычный
     if ($wizardLang -like 'en-*') {
@@ -3853,6 +3850,7 @@ if ($script:WizardMode) {
     if ($LocalUserPassword -and $LocalUserPassword.Length) { $cmd += ' -LocalUserPassword (Read-Host -AsSecureString)' }
     if ($DismPath) { $cmd += " -DismPath '$($DismPath.Replace("'","''"))'" }
     if ($Preset -ne 'balanced') { $cmd += " -Preset $Preset" }
+    if ($Keep.Count) { $cmd += " -Keep $($Keep -join ',')" }
     if ($WorkDir -ne $defaultWork) { $cmd += " -WorkDir `"$WorkDir`"" }
     if ($DownloadLanguage)   { $cmd += " -DownloadLanguage $($DownloadLanguage -join ',')" }
     if ($SetupLanguage -ne 'auto') { $cmd += " -SetupLanguage $SetupLanguage" }
@@ -3864,8 +3862,7 @@ if ($script:WizardMode) {
     if ($TrimSources)        { $cmd += ' -TrimSources' }
     if ($RemoveWinRE)        { $cmd += ' -RemoveWinRE' }
     if ($SaveWinRE)          { $cmd += ' -SaveWinRE' }
-    if ($Guard)              { $cmd += ' -Guard' }
-    if ($Guard) { $cmd += " -GuardMode $GuardMode" }
+    $cmd += " -Guard $Guard"
     if ($script:DebugMode)   { $cmd += ' -Debug' }
 
     Write-Host ''
@@ -4452,11 +4449,15 @@ Write-Host (T "  WinRE          : $vWinRE" "  WinRE          : $vWinRE")
 Write-Host (T "  sources        : $vSources" "  sources        : $vSources")
 Write-Host (T "  Очистка склада : $vCleanup" "  Store cleanup  : $vCleanup")
 Write-Host (T "  Обход TPM/SB   : $vBypass" "  TPM/SB bypass  : $vBypass")
-$vGuard = if ($Guard) { T 'встроить (проверка при каждом входе)' 'embed (checks at every logon)' } else { T 'нет  (включить: -Guard)' 'no  (enable with -Guard)' }
+$vGuard = switch($Guard){
+    'None'{T 'None — нет' 'None - disabled'}
+    'Standard'{T 'Standard — краткий итог' 'Standard - concise summary'}
+    'Debug'{T 'Debug — живой полный журнал' 'Debug - live full log'}
+    'Silent'{T 'Silent — без окна' 'Silent - no window'}
+}
 Write-Host (T "  winget         : $vWinget" "  winget         : $vWinget")
 if ($Preset -ne 'max') { Write-Host (T '  Store / MSIX   : сохранить имеющиеся Store, App Installer и зависимости' '  Store / MSIX   : preserve existing Store, App Installer and dependencies') }
 Write-Host (T "  Сторож         : $vGuard" "  Guard          : $vGuard")
-if ($Guard) { Write-Host (T "  Режим guard    : $GuardMode" "  Guard mode     : $GuardMode") }
 Write-Host (T "  Обновления     : $vUpd" "  Updates        : $vUpd")
 if (-not $DryRun -and $dotNetPayload) { Write-Host (T "  .NET           : $DotNetUpdateFile" "  .NET           : $DotNetUpdateFile") }
 $vOobeNet = if ($NoOobeNetworkBlock) { T 'сеть включена  (OOBE скачает обновления)' 'network on  (OOBE will download updates)' }
@@ -5141,7 +5142,7 @@ $firefoxCmd = Get-FirefoxInstallerCommand -Language $imgLang -MozillaLanguage $m
 # Накопительные обновления умеют восстанавливать Defender, Edge и AI-компоненты
 # и сбрасывать политики. Скрипт запускается при каждом входе и правит это.
 $guardDir = Join-Path $mountDir 'Windows\Setup\Scripts\Win11Lite'
-if ($Guard) {
+if ($Guard -ne 'None') {
     $null = New-Item -ItemType Directory -Path $guardDir -Force
 
     # Списки собираем из той же конфигурации, по которой чистился образ,
@@ -5203,8 +5204,8 @@ if ($Guard) {
     }
 
     $guardConfig = [ordered]@{
-        Mode = $GuardMode
-        ViewerTask = $GuardMode -ne 'Silent'
+        Mode = $Guard
+        ViewerTask = $Guard -ne 'Silent'
         # The language lives in build-info.json only: one source for the guest.
         BuildId = $script:StartedAt.ToString('yyyyMMdd-HHmmss')
         RemoveEdge = (Test-GroupActive -RulePreset 'safe' -Group 'Edge')
@@ -5236,6 +5237,7 @@ $buildInfo = [ordered]@{
     SourceIso = $InputIso
     OutputIso = $OutputIso
     Preset = $Preset
+    Keep = @($Keep)
     Language = $imgLang
     SetupLanguage = $setupLang
     SetupLanguageUpdate = $(if ($setupRepair) { Split-Path $setupRepair -Leaf } else { $null })
@@ -5246,9 +5248,7 @@ $buildInfo = [ordered]@{
     LcuFile = $LcuFile
     DotNetUpdateFile = $(if ($dotNetPayload) { $DotNetUpdateFile } else { $null })
     SkippedDownloads = @($script:SkippedDownloads)
-    Guard = [bool]$Guard
-    GuardMode = $GuardMode
-    GuardDebug = [bool]($Guard -and $GuardMode -eq 'Debug')
+    Guard = $Guard
     OobeNetworkBlock = [bool]($script:ManageOobe -and -not $NoOobeNetworkBlock)
     ManageOobe = [bool]$script:ManageOobe
     RemoveEdge = [bool](Test-GroupActive -RulePreset 'safe' -Group 'Edge')
