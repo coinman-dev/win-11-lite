@@ -7,11 +7,14 @@ $repo=Split-Path $PSScriptRoot -Parent
 $t=$null;$e=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'win-11-lite.ps1'),[ref]$t,[ref]$e)
 if($e.Count){throw ($e|Out-String)}
-foreach($name in 'T','Get-BundledResource','Get-BundledResourceHash','Get-WimImageList','Get-NativeToolVersion','Save-DeploymentTools','Initialize-DeploymentTools','Ensure-WimMountDriver','Read-PreparedCache','Write-PreparedCache','Assert-ChildPath','Invoke-NativeQuiet','Test-DismSuccess','Resolve-AccountMode','Assert-LocalUserName','Test-SecureStringEqual','Read-ConfirmedLocalAccountPassword','Read-LocalAccountOptions','Get-LocalAccountXml','Get-ImageInstallXml','Get-ProductKeyUiMode','Get-ElevationCommand'){
+foreach($name in 'T','Get-AdkSourceHash','Confirm-MicrosoftSignature','Read-MsiTable','Get-MsiDirectoryPath','Get-MsiFileMap','Save-AdkInstallers','Get-AdkCatalog','Get-WimImageList','Get-NativeToolVersion','Save-DeploymentTools','Initialize-DeploymentTools','Ensure-WimMountDriver','Read-PreparedCache','Write-PreparedCache','Assert-ChildPath','Invoke-NativeQuiet','Test-DismSuccess','Resolve-AccountMode','Assert-LocalUserName','Test-SecureStringEqual','Read-ConfirmedLocalAccountPassword','Read-LocalAccountOptions','Get-LocalAccountXml','Get-ImageInstallXml','Get-ProductKeyUiMode','Get-ElevationCommand'){
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     if(-not $node){throw "Missing function: $name"}
     . ([scriptblock]::Create($node.Extent.Text))
 }
+$adkNode=$ast.Find({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$script:AdkSources'},$true)
+if(-not $adkNode){throw 'Missing pinned ADK source table'}
+. ([scriptblock]::Create($adkNode.Extent.Text))
 $script:Lang='en';$script:checks=0;$Unattend='';$SkipIso=$false
 function Assert([bool]$Value,[string]$Message){if(-not $Value){throw "FAIL: $Message"};$script:checks++}
 function Assert-Throws([scriptblock]$Action,[string]$Message){$failed=$false;try{& $Action|Out-Null}catch{$failed=$true};Assert $failed $Message}
@@ -71,12 +74,12 @@ try{
         $cab=Join-Path $root 'fixture.cab'
         & "$env:SystemRoot\System32\makecab.exe" $payload $cab | Out-Null
         if($LASTEXITCODE -ne 0){throw 'Fixture cabinet creation failed'}
-        $entry=[ordered]@{Source='payload.bin';Path='amd64\DISM\dism.exe';Size=(Get-Item $payload).Length;SHA256=(Get-FileHash $payload -Algorithm SHA256).Hash}
-        $second=[ordered]@{Source='payload.bin';Path='amd64\Oscdimg\oscdimg.exe';Size=$entry.Size;SHA256=$entry.SHA256}
-        $archive=[ordered]@{Name='fixture.cab';Url='https://fixture/fixture.cab';Size=(Get-Item $cab).Length;SHA256=(Get-FileHash $cab -Algorithm SHA256).Hash;Files=@($entry,$second)}
-        $catalog=[ordered]@{Schema=1;Build=28000;Architecture='amd64';Archives=@($archive)}
-        function Get-BundledResource {param($Name)if($Name -ne 'deployment-tools-28000.json'){throw 'Unexpected fixture resource'};$catalog|ConvertTo-Json -Depth 8}
-        $state=@{Copies=0;Corrupt=$false;SourceCab=$cab}
+        $entry=[pscustomobject]@{Member='payload.bin';Path='amd64\DISM\dism.exe';Size=(Get-Item $payload).Length}
+        $second=[pscustomobject]@{Member='payload.bin';Path='amd64\Oscdimg\oscdimg.exe';Size=$entry.Size}
+        $archive=[pscustomobject]@{Name='fixture.cab';Url='https://fixture/fixture.cab';Size=(Get-Item $cab).Length;SHA256=(Get-FileHash $cab -Algorithm SHA256).Hash;SHA1=$null;Files=@($entry,$second)}
+        $catalog=[pscustomobject]@{Build=28000;Architecture='amd64';Version='fixture';BaseUrl='https://fixture/';Archives=@($archive);Files=@($entry,$second)}
+        $state=@{Copies=0;Corrupt=$false;SourceCab=$cab;Catalogs=0}
+        function Get-AdkCatalog {param($Build,$Directory)$state.Catalogs++;if($Build -ne 28000){throw 'Unexpected fixture build'};$catalog}
         function Get-NativeToolVersion {param($Path)[version]'10.0.28000.1'}
         function Save-Url {param($Url,$Destination)$state.Copies++;if($state.Corrupt){[IO.File]::WriteAllText($Destination,'broken')}else{Copy-Item -LiteralPath $state.SourceCab -Destination $Destination -Force}}
         $cache=Join-Path $root 'cache'
@@ -84,6 +87,7 @@ try{
         Assert ((Get-Content -LiteralPath $tools.Dism -Raw) -eq 'inert tool fixture' -and (Test-Path $tools.Oscdimg)) 'Verified CAB files are restored to their proper tool paths'
         Save-DeploymentTools -Directory $cache|Out-Null
         Assert ($state.Copies -eq 1) 'Complete tool cache works without another download'
+        Assert ($state.Catalogs -eq 1) 'A valid tool cache does not read the ADK installers again'
         [IO.File]::WriteAllText($tools.Dism,'tampered')
         Save-DeploymentTools -Directory $cache|Out-Null
         Assert ((Get-Content -LiteralPath $tools.Dism -Raw) -eq 'inert tool fixture') 'Damaged extracted tools are rebuilt from verified archives'
@@ -92,6 +96,154 @@ try{
         Assert (-not(Test-Path (Join-Path $root 'bad-cache\deployment-tools-28000\tools.ready.json'))) 'A failed tool preparation leaves no ready manifest'
         $archive.Name='..\outside.cab'
         Assert-Throws {Save-DeploymentTools -Directory (Join-Path $root 'path-cache')} 'Archive paths cannot escape the tool cache'
+    }
+    # Pinned ADK sources and the installer-table reader that replaced the embedded catalogs.
+    & {
+        Assert (@($script:AdkSources.Keys|Sort-Object) -join ',' -eq '26100,28000') 'Pinned ADK sources cover the WinPE and 26H1 tool kits'
+        $tools=$script:AdkSources[28000];$winpe=$script:AdkSources[26100]
+        Assert ($tools.Installers.Count -eq 4 -and $tools.Archives.Count -eq 9) 'The 26H1 tool kit pins four installers and nine archives'
+        $totalBytes=0;foreach($archive in $tools.Archives){$totalBytes+=[int64]$archive.Size}
+        Assert ($totalBytes -eq 6641932) 'Pinned tool archives keep the verified total download size'
+        Assert ($winpe.Installers.Count -eq 1 -and $winpe.Archives.Count -eq 2) 'The WinPE kit pins one installer and two language archives'
+        foreach($source in @($tools,$winpe)){
+            Assert ($source.BaseUrl -match '^https://download\.microsoft\.com/') 'ADK files come directly from Microsoft'
+            foreach($installer in $source.Installers){
+                Assert ($installer.SHA256 -match '^[A-F0-9]{64}$' -and $installer.Size -gt 0 -and $installer.Name -match '\.msi$') 'Every pinned installer has a size and SHA256'
+            }
+            foreach($archive in $source.Archives){
+                Assert (($archive.SHA256 -match '^[A-F0-9]{64}$' -or $archive.SHA1 -match '^[A-F0-9]{40}$') -and $archive.Size -gt 0) 'Every pinned archive has a size and a signed-bootstrapper hash'
+            }
+        }
+        $hash=Get-AdkSourceHash -Build 28000
+        Assert ($hash -match '^[A-F0-9]{64}$' -and $hash -eq (Get-AdkSourceHash -Build 28000)) 'The source identity is a stable SHA256'
+        Assert ($hash -ne (Get-AdkSourceHash -Build 26100)) 'Each kit has its own cache identity'
+        $saved=$tools.Archives[0].SHA256;$tools.Archives[0].SHA256='0'*64
+        Assert ((Get-AdkSourceHash -Build 28000) -ne $hash) 'Changing any pinned value invalidates the prepared tool cache'
+        $tools.Archives[0].SHA256=$saved
+        Assert ((Get-AdkSourceHash -Build 28000) -eq $hash) 'Restoring the pinned value restores the cache identity'
+        Assert-Throws {Get-AdkSourceHash -Build 12345} 'An unknown ADK build is rejected instead of silently skipped'
+
+        $dirs=@{}
+        foreach($row in @(
+            [pscustomobject]@{Directory='TARGETDIR';Directory_Parent='';DefaultDir='SourceDir'}
+            [pscustomobject]@{Directory='TOOLS';Directory_Parent='TARGETDIR';DefaultDir='deplo~1|Deployment Tools'}
+            [pscustomobject]@{Directory='ARCH';Directory_Parent='TOOLS';DefaultDir='amd64:amd64src'}
+            [pscustomobject]@{Directory='SAME';Directory_Parent='ARCH';DefaultDir='.:.'}
+            [pscustomobject]@{Directory='LOOPA';Directory_Parent='LOOPB';DefaultDir='a'}
+            [pscustomobject]@{Directory='LOOPB';Directory_Parent='LOOPA';DefaultDir='b'}
+        )){$dirs[$row.Directory]=$row}
+        Assert ((Get-MsiDirectoryPath -Directories $dirs -Id 'ARCH') -eq '\SourceDir\Deployment Tools\amd64') 'Long directory names and target names build the real path'
+        Assert ((Get-MsiDirectoryPath -Directories $dirs -Id 'SAME') -eq (Get-MsiDirectoryPath -Directories $dirs -Id 'ARCH')) 'A dot directory stays in its parent'
+        Assert-Throws {Get-MsiDirectoryPath -Directories $dirs -Id 'LOOPA'} 'A directory cycle is reported instead of hanging'
+        Assert-Throws {Get-MsiDirectoryPath -Directories $dirs -Id 'MISSING'} 'A missing directory row stops the read'
+
+        # A fake Windows Installer object exercises the real reader without an MSI.
+        $script:MsiTables=@{}
+        $msiState=@{Path='';Mode=-1;Queries=[Collections.Generic.List[string]]::new()}
+        function New-Object {
+            param([string]$ComObject)
+            if($ComObject -ne 'WindowsInstaller.Installer'){throw "Unexpected COM object: $ComObject"}
+            $installer=[pscustomobject]@{}
+            $installer|Add-Member -MemberType ScriptMethod -Name OpenDatabase -Value {
+                param($path,$mode)
+                $msiState.Path=$path;$msiState.Mode=$mode
+                $database=[pscustomobject]@{}
+                $database|Add-Member -MemberType ScriptMethod -Name OpenView -Value {
+                    param($sql)
+                    $msiState.Queries.Add($sql)
+                    if($sql -notmatch '^SELECT `(.+)` FROM `([^`]+)`$'){throw "Unsupported query: $sql"}
+                    $view=[pscustomobject]@{Columns=@($matches[1] -split '`,`');Table=$matches[2];Index=0;Rows=@()}
+                    if(-not $script:MsiTables.ContainsKey($view.Table)){throw "Missing table $($view.Table)"}
+                    $view.Rows=@($script:MsiTables[$view.Table])
+                    $view|Add-Member -MemberType ScriptMethod -Name Execute -Value {}
+                    $view|Add-Member -MemberType ScriptMethod -Name Close -Value {}
+                    $view|Add-Member -MemberType ScriptMethod -Name Fetch -Value {
+                        if($this.Index -ge $this.Rows.Count){return $null}
+                        $record=[pscustomobject]@{Row=$this.Rows[$this.Index];Columns=$this.Columns}
+                        $this.Index++
+                        $record|Add-Member -MemberType ScriptMethod -Name StringData -Value {param([int]$i)[string]$this.Row.($this.Columns[$i-1])} -PassThru
+                    }
+                    $view
+                } -PassThru
+            } -PassThru
+        }
+        $script:MsiTables['Directory']=@($dirs.Values|Where-Object{$_.Directory -notlike 'LOOP*'})
+        $script:MsiTables['Component']=@([pscustomobject]@{Component='C_ARCH';Directory_='ARCH'})
+        $script:MsiTables['Media']=@(
+            [pscustomobject]@{DiskId='2';LastSequence='9';Cabinet='second.cab'}
+            [pscustomobject]@{DiskId='1';LastSequence='4';Cabinet='first.cab'}
+        )
+        $script:MsiTables['File']=@(
+            [pscustomobject]@{File='fil00000000000000000000000000000001';Component_='C_ARCH';FileName='dism~1.exe|dism.exe';FileSize='1234';Sequence='3'}
+            [pscustomobject]@{File='fil00000000000000000000000000000002';Component_='C_ARCH';FileName='later.dll';FileSize='77';Sequence='7'}
+        )
+        $mapped=@(Get-MsiFileMap -Path 'C:\fixture.msi' -Pattern '\\Deployment Tools\\(amd64\\.+)$')
+        Assert ($msiState.Mode -eq 0 -and $msiState.Path -eq 'C:\fixture.msi') 'The installer database is opened read-only'
+        Assert ($msiState.Queries.Count -eq 4 -and @($msiState.Queries|Where-Object{$_ -match 'DELETE|INSERT|UPDATE'}).Count -eq 0) 'Only the four content tables are read and nothing is written'
+        Assert ($mapped.Count -eq 2) 'Every matching installer file is mapped'
+        Assert ($mapped[0].Path -eq 'amd64\dism.exe' -and $mapped[0].Size -eq 1234) 'The long file name and declared size are used'
+        Assert ($mapped[0].Archive -eq 'first.cab' -and $mapped[1].Archive -eq 'second.cab') 'Each file maps to the cabinet that covers its sequence'
+        $script:MsiTables['File']=@([pscustomobject]@{File='fil00000000000000000000000000000003';Component_='MISSING';FileName='x.dll';FileSize='1';Sequence='1'})
+        Assert-Throws {Get-MsiFileMap -Path 'C:\fixture.msi' -Pattern '(.+)'} 'A file without a component directory stops the read'
+        $script:MsiTables['File']=@([pscustomobject]@{File='fil00000000000000000000000000000004';Component_='C_ARCH';FileName='x.dll';FileSize='1';Sequence='99'})
+        Assert-Throws {Get-MsiFileMap -Path 'C:\fixture.msi' -Pattern '(.+)'} 'A file outside every cabinet range is rejected'
+        $script:MsiTables['Media']=@([pscustomobject]@{DiskId='1';LastSequence='9';Cabinet='#embedded.cab'})
+        Assert-Throws {Get-MsiFileMap -Path 'C:\fixture.msi' -Pattern '(.+)'} 'A cabinet stored inside the installer is rejected'
+        $script:MsiTables['Media']=@()
+        Assert-Throws {Get-MsiFileMap -Path 'C:\fixture.msi' -Pattern '(.+)'} 'An installer without content tables is rejected'
+    }
+    # Pinned hashes gate the installers; the reader shapes the catalog.
+    & {
+        $fixtureDir=Join-Path $root 'installers';$null=New-Item -ItemType Directory -Path $fixtureDir
+        $body='inert installer fixture'
+        $script:AdkSources[99999]=@{
+            Kind='tools';Version='fixture';BaseUrl='https://fixture/base/'
+            Installers=@(@{Name='Fixture Tools (DesktopEditions)-x86_en-us.msi';Size=$body.Length;SHA256=(Get-FileHash -InputStream ([IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes($body))) -Algorithm SHA256).Hash})
+            Pattern='\\Fixture\\(amd64\\.+)$'
+            Archives=@(@{Name='fixture.cab';Size=1;SHA256='0'*64})
+        }
+        try{
+            $calls=[Collections.Generic.List[string]]::new()
+            function Save-Url {param($Url,$Destination)$calls.Add($Url);[IO.File]::WriteAllText($Destination,$body)}
+            function Get-AuthenticodeSignature {param($LiteralPath)[pscustomobject]@{Status='Valid';SignerCertificate=[pscustomobject]@{Subject='CN=Microsoft Corporation, O=Microsoft Corporation'}}}
+            $paths=@(Save-AdkInstallers -Build 99999 -Directory $fixtureDir)
+            Assert ($paths.Count -eq 1 -and (Test-Path -LiteralPath $paths[0])) 'A matching installer is accepted and reused'
+            Assert ($calls[0] -eq 'https://fixture/base/Fixture%20Tools%20(DesktopEditions)-x86_en-us.msi') 'Spaces in installer names are encoded for the download'
+            function Get-AuthenticodeSignature {param($LiteralPath)[pscustomobject]@{Status='NotSigned';SignerCertificate=$null}}
+            Assert (@(Save-AdkInstallers -Build 99999 -Directory $fixtureDir).Count -eq 1) 'An unconfirmed signature warns without stopping a build whose hashes match'
+            function Save-Url {param($Url,$Destination)$calls.Add($Url);[IO.File]::WriteAllText($Destination,'tampered installer')}
+            Assert-Throws {Save-AdkInstallers -Build 99999 -Directory (Join-Path $root 'installers-bad')} 'An installer that does not match its pinned SHA256 stops the build'
+            Assert (-not (Test-Path -LiteralPath (Join-Path $root 'installers-bad\adk-99999-installers\Fixture Tools (DesktopEditions)-x86_en-us.msi'))) 'A rejected installer is deleted instead of being cached'
+
+            $script:AdkCatalogs=@{}
+            function Save-AdkInstallers {param($Build,$Directory)@('C:\fixture.msi')}
+            $mapped=@(
+                [pscustomobject]@{Archive='fixture.cab';Member='fil00000000000000000000000000000001';Path='amd64\DISM\dism.exe';Size=5}
+                [pscustomobject]@{Archive='fixture.cab';Member='fil00000000000000000000000000000002';Path='amd64\Oscdimg\oscdimg.exe';Size=6}
+            )
+            $reads=@{Count=0}
+            function Get-MsiFileMap {param($Path,$Pattern)$reads.Count++;$mapped}
+            $catalog=Get-AdkCatalog -Build 99999 -Directory $fixtureDir
+            Assert ($catalog.Build -eq 99999 -and $catalog.Architecture -eq 'amd64' -and $catalog.Files.Count -eq 2) 'The catalog keeps the shape the builder already expects'
+            Assert ($catalog.Archives[0].Url -eq 'https://fixture/base/fixture.cab' -and $catalog.Archives[0].Files.Count -eq 2) 'Archive addresses and members come from the pinned list and the installer'
+            $null=Get-AdkCatalog -Build 99999 -Directory $fixtureDir
+            Assert ($reads.Count -eq 1) 'The installers are read once per build, not once per language'
+            $script:AdkCatalogs=@{};$mapped[0].Archive='unpinned.cab'
+            Assert-Throws {Get-AdkCatalog -Build 99999 -Directory $fixtureDir} 'A file in an unpinned archive stops the build'
+            $script:AdkCatalogs=@{};$mapped[0].Archive='fixture.cab';$mapped[0].Path='..\outside.exe'
+            Assert-Throws {Get-AdkCatalog -Build 99999 -Directory $fixtureDir} 'A relative escape in the installer tables is rejected'
+            $script:AdkCatalogs=@{};$mapped[0].Path='C:\absolute.exe'
+            Assert-Throws {Get-AdkCatalog -Build 99999 -Directory $fixtureDir} 'An absolute path in the installer tables is rejected'
+            $script:AdkCatalogs=@{};$mapped[0].Path='amd64\DISM\dism.exe';$mapped[0].Member='payload.bin'
+            Assert-Throws {Get-AdkCatalog -Build 99999 -Directory $fixtureDir} 'A member name that is not a cabinet identifier is rejected'
+            $script:AdkCatalogs=@{};$mapped[0].Member='fil00000000000000000000000000000001'
+            $script:AdkSources[99999].Kind='winpe'
+            $mapped[0].Path='ru-ru\lp.cab';$mapped[1].Path='WinPE-FontSupport-JA-JP.cab'
+            $extra=[pscustomobject]@{Archive='fixture.cab';Member='fil00000000000000000000000000000003';Path='sr-latn-rs\lp.cab';Size=7}
+            $mapped=@($mapped[0],$mapped[1],$extra)
+            $catalog=Get-AdkCatalog -Build 99999 -Directory $fixtureDir
+            Assert (@($catalog.Files.Path) -join ',' -eq 'ru-ru/lp.cab,WinPE-FontSupport-JA-JP.cab') 'WinPE keeps two-part language sets and font packages and drops the rest'
+        }finally{$script:AdkSources.Remove(99999);$script:AdkCatalogs=@{}}
     }
     & {
         function Test-CanPrompt {$false}

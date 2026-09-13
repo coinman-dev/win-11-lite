@@ -12,7 +12,7 @@ $start=$source.IndexOf($begin,[StringComparison]::Ordinal)
 $finish=$source.IndexOf($end,[StringComparison]::Ordinal)
 if($start -lt 0 -or $finish -lt $start -or $source.IndexOf($begin,$start+$begin.Length,[StringComparison]::Ordinal) -ge 0){throw 'Missing or duplicate bundled-resource markers'}
 $finish+=$end.Length
-$names=@('deployment-tools-28000.json','winpe-26100.json','guard.ps1','Guard.UI.ps1','Run-Setup.ps1')
+$names=@('guard.ps1','Guard.UI.ps1','Run-Setup.ps1')
 $lines=[Collections.Generic.List[string]]::new()
 $lines.Add($begin)
 $lines.Add('# Generated from data/ by tools/Update-BundledResources.ps1. No external files are read at runtime.')

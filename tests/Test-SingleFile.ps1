@@ -20,27 +20,30 @@ try{
     Assert (-not [IO.File]::ReadAllText($main).Contains("`r")) 'The standalone test uses GitHub-style LF source text'
     $t=$null;$e=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($main,[ref]$t,[ref]$e)
     Assert (-not $e.Count) 'The isolated script parses with all embedded scripts and JSON literals'
-    foreach($name in 'T','Get-BundledResource','Get-BundledResourceHash','Get-GuardScript','Get-SetupRunnerScript'){
+    foreach($name in 'T','Get-BundledResource','Get-AdkSourceHash','Get-GuardScript','Get-SetupRunnerScript'){
         $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
         if(-not $node){throw "Missing standalone function: $name"}
         . ([scriptblock]::Create($node.Extent.Text))
     }
     $script:ScriptRoot=$standalone;$script:Lang='en';$Guard=$true
-    $resourceNames=@('deployment-tools-28000.json','winpe-26100.json','guard.ps1','Guard.UI.ps1','Run-Setup.ps1')
+    $resourceNames=@('guard.ps1','Guard.UI.ps1','Run-Setup.ps1')
     foreach($name in $resourceNames){
         $actual=Get-BundledResource $name
         $expected=[IO.File]::ReadAllText((Join-Path $repo ('data\'+$name))) -replace '\r?\n',"`r`n"
         Assert ($actual -ceq $expected) "The isolated resource matches its maintained source: $name"
-        if($name.EndsWith('.ps1')){
-            $null=[Management.Automation.Language.Parser]::ParseInput($actual,[ref]$t,[ref]$e)
-            Assert (-not $e.Count -and $actual -match '#Requires -Version 5.1') "Embedded runtime script remains valid: $name"
-        }else{
-            $catalog=$actual|ConvertFrom-Json
-            Assert ($catalog.Architecture -eq 'amd64' -and $catalog.Build -in @(26100,28000)) "Embedded catalog remains valid: $name"
-        }
+        $null=[Management.Automation.Language.Parser]::ParseInput($actual,[ref]$t,[ref]$e)
+        Assert (-not $e.Count -and $actual -match '#Requires -Version 5.1') "Embedded runtime script remains valid: $name"
     }
-    Assert ((Get-BundledResourceHash 'deployment-tools-28000.json') -eq 'FE04FF652C269BDBAF414814BDE94F61330FE047A42AEC80B778F3D27B9D68FB') 'Existing verified DISM cache keeps its catalog identity'
     Assert-Throws {Get-BundledResource '..\outside.ps1'} 'Unknown resources do not read arbitrary local files'
+    # The package layout is read from Microsoft's installers, so no catalog is embedded.
+    $adkNode=$ast.Find({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$script:AdkSources'},$true)
+    if(-not $adkNode){throw 'Missing pinned ADK source table'}
+    . ([scriptblock]::Create($adkNode.Extent.Text))
+    $toolsIdentity=Get-AdkSourceHash -Build 28000
+    Assert ($toolsIdentity -match '^[A-F0-9]{64}$' -and (Get-AdkSourceHash -Build 26100) -match '^[A-F0-9]{64}$') 'The isolated script can derive both ADK cache identities offline'
+    Assert ($adkNode.Extent.Text.Length -lt 8000) 'The pinned ADK table stays a short list instead of a bundled catalog'
+    Assert-Throws {Get-BundledResource 'winpe-26100.json'} 'The WinPE catalog is no longer carried inside the script'
+    Assert-Throws {Get-BundledResource 'deployment-tools-28000.json'} 'The DISM tool catalog is no longer carried inside the script'
     $guardDir=Join-Path $testRoot 'image\Windows\Setup\Scripts\Win11Lite';$supportDir=$guardDir
     $null=New-Item -ItemType Directory -Path $guardDir
     $guardScript=Get-GuardScript;$setupRunner=Get-SetupRunnerScript
@@ -60,7 +63,7 @@ try{
     $neighbor=Join-Path $standalone 'data';$null=New-Item -ItemType Directory -Path $neighbor
     Set-Content -LiteralPath (Join-Path $neighbor 'guard.ps1') -Value 'throw "stale external guard must never run"'
     Set-Content -LiteralPath (Join-Path $neighbor 'deployment-tools-28000.json') -Value 'invalid stale catalog'
-    Assert ((Get-GuardScript) -ceq $guardScript -and (Get-BundledResourceHash 'deployment-tools-28000.json') -eq 'FE04FF652C269BDBAF414814BDE94F61330FE047A42AEC80B778F3D27B9D68FB') 'Stale neighboring files cannot override the bundled runtime or catalog'
+    Assert ((Get-GuardScript) -ceq $guardScript -and (Get-AdkSourceHash -Build 28000) -eq $toolsIdentity) 'Stale neighboring files cannot override the bundled runtime or the pinned ADK sources'
 
     $checkRoot=Join-Path $testRoot 'developer-copy';$checkTools=Join-Path $checkRoot 'tools';$checkData=Join-Path $checkRoot 'data'
     $null=New-Item -ItemType Directory -Path $checkTools,$checkData

@@ -10,17 +10,21 @@ if($e.Count){throw ($e|Out-String)}
 $script:checks=0
 function Assert([bool]$Value,[string]$Message){if(-not $Value){throw "FAIL: $Message"};$script:checks++}
 function Assert-Throws([scriptblock]$Action,[string]$Message){$failed=$false;try{& $Action|Out-Null}catch{$failed=$true};Assert $failed $Message}
-foreach($name in @('T','Get-BundledResource','Assert-ChildPath','Read-PreparedCache','Write-PreparedCache','Get-SetupFontPackage','Get-CabIdentity',
+foreach($name in @('T','Assert-ChildPath','Read-PreparedCache','Write-PreparedCache','Get-SetupFontPackage','Get-CabIdentity',
     'Save-SetupLanguagePayload','Add-SetupLanguage','ConvertFrom-DismList','Confirm-SkipDownload')){
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     if(-not $node){throw "Missing function $name"}
     . ([scriptblock]::Create($node.Extent.Text))
 }
+$adkNode=$ast.Find({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$script:AdkSources'},$true)
+if(-not $adkNode){throw 'Missing pinned ADK source table'}
+. ([scriptblock]::Create($adkNode.Extent.Text))
 $script:Lang='en';$script:ScriptRoot=$repo;$script:DownloadsClosed=$false
 function Write-Ok {param($Message)}
 function Write-Step {param($Message)}
 function Write-Stage {param($Message)}
 function Write-Note {param($Message)}
+function Format-Size {param($Size)"$Size bytes"}
 function Save-Url {throw 'NETWORK DISABLED BY TEST'}
 function Invoke-RestMethod {throw 'NETWORK DISABLED BY TEST'}
 function Invoke-WebRequest {throw 'NETWORK DISABLED BY TEST'}
@@ -31,13 +35,12 @@ function Initialize-DeploymentTools {param($Build,$Directory,$ExplicitDism,[swit
 $root=Join-Path $repo ('tmp\setup-tests-'+[guid]::NewGuid().ToString('N'))
 $null=New-Item -ItemType Directory -Path $root
 try{
-    $catalog=Get-BundledResource 'winpe-26100.json'|ConvertFrom-Json
-    Assert ($catalog.Build -eq 26100 -and $catalog.Architecture -eq 'amd64') 'Catalog matches target WinPE build and architecture'
-    Assert ($catalog.BaseUrl -match '^https://download\.microsoft\.com/') 'Packages come directly from Microsoft'
-    Assert ($catalog.Files.Count -eq 894) 'Authenticated ADK catalog includes 37 languages and 6 font packages'
-    Assert (@($catalog.Files.Path | Sort-Object -Unique).Count -eq $catalog.Files.Count) 'Catalog output paths are unique'
-    foreach($archive in $catalog.Archives){Assert ($archive.SHA1 -match '^[A-F0-9]{40}$' -and $archive.Size -gt 0) 'Download archives have signed-bootstrapper hashes and sizes'}
-    Assert (@($catalog.Files|Where-Object{$_.Archive -notin $catalog.Archives.Name -or $_.Member -notmatch '^fil[a-f0-9]{32}$' -or $_.Size -le 0}).Count -eq 0) 'Every package maps to a verified archive member'
+    $winpe=$script:AdkSources[26100]
+    Assert ($winpe.Kind -eq 'winpe' -and $winpe.Version -eq '10.1.26100.2454') 'The pinned WinPE kit matches the audited ADK add-on'
+    Assert ($winpe.BaseUrl -match '^https://download\.microsoft\.com/' -and $winpe.Bootstrapper -match '^https://go\.microsoft\.com/') 'Packages and their manifest come directly from Microsoft'
+    Assert ($winpe.Installers.Count -eq 1 -and $winpe.Installers[0].SHA256 -eq 'F286C52FDF694C85F08F6EC0BA7702DE84F891040064B81163C8DA59A5C4DB4C') 'The audited WinPE installer hash is still pinned'
+    Assert ($winpe.Pattern -eq '\\amd64\\WinPE_OCs\\(.+)$') 'Only amd64 WinPE packages are read from the installer that also carries arm64'
+    foreach($archive in $winpe.Archives){Assert ($archive.SHA1 -match '^[A-F0-9]{40}$' -and $archive.Size -gt 0) 'Download archives have signed-bootstrapper hashes and sizes'}
     Assert (-not (Get-SetupFontPackage ru-RU)) 'Russian setup needs no extra font component'
     Assert ((Get-SetupFontPackage ja-JP) -eq 'WinPE-FontSupport-JA-JP.cab') 'Japanese setup retains required fonts'
     Assert ((Get-SetupFontPackage th-TH) -eq 'WinPE-FontSupport-WinRE.cab') 'Thai setup uses WinRE font support'
@@ -76,6 +79,64 @@ try{
         $script:DownloadsClosed=$true
         Assert-Throws {Save-SetupLanguagePayload -Tag ru-RU -Build 26100 -Directory $root} 'Setup downloads cannot run in the offline build phase'
         $script:DownloadsClosed=$false
+    }
+    # The download branch now reads the package layout from the ADK installer.
+    & {
+        $paths=@('ru-ru/lp.cab','ru-ru/WinPE-Setup_ru-ru.cab','ru-ru/WinPE-Setup-Client_ru-ru.cab','ru-ru/WinPE-WMI_ru-ru.cab',
+                 'ja-jp/lp.cab','ja-jp/WinPE-Setup_ja-jp.cab','ja-jp/WinPE-Setup-Client_ja-jp.cab')
+        $archiveBody='inert winpe archive fixture'
+        $archiveFile=Join-Path $root 'winpe-fixture.cab';[IO.File]::WriteAllText($archiveFile,$archiveBody)
+        $files=@(foreach($path in $paths){
+            [pscustomobject]@{Archive='language.cab';Member=('fil'+([guid]::NewGuid().ToString('N')).Substring(0,32));Path=$path;Size=("body of "+$path).Length}
+        })
+        $files+=[pscustomobject]@{Archive='fonts.cab';Member=('fil'+([guid]::NewGuid().ToString('N')).Substring(0,32));Path='WinPE-FontSupport-JA-JP.cab';Size=12}
+        $catalog=[pscustomobject]@{
+            Build=26100;Architecture='amd64';Version='fixture';BaseUrl='https://fixture/winpe/'
+            Archives=@(
+                [pscustomobject]@{Name='language.cab';Url='https://fixture/winpe/language.cab';Size=(Get-Item $archiveFile).Length;SHA1=(Get-FileHash -LiteralPath $archiveFile -Algorithm SHA1).Hash;SHA256=$null;Files=@()}
+                [pscustomobject]@{Name='fonts.cab';Url='https://fixture/winpe/fonts.cab';Size=(Get-Item $archiveFile).Length;SHA1=(Get-FileHash -LiteralPath $archiveFile -Algorithm SHA1).Hash;SHA256=$null;Files=@()}
+            )
+            Files=$files
+        }
+        $state=@{Catalogs=0;Downloads=[Collections.Generic.List[string]]::new();Expansions=0}
+        function Get-AdkCatalog {param($Build,$Directory)$state.Catalogs++;if($Build -ne 26100){throw 'Unexpected fixture build'};$catalog}
+        function Save-Url {param($Url,$Destination)$state.Downloads.Add($Url);Copy-Item -LiteralPath $archiveFile -Destination $Destination -Force}
+        function Invoke-NativeQuiet {
+            param($FilePath,$Arguments)
+            $state.Expansions++
+            if($FilePath -ne 'expand.exe'){throw "Unexpected native command: $FilePath"}
+            $target=$Arguments[2]
+            foreach($entry in $catalog.Files){[IO.File]::WriteAllText((Join-Path $target $entry.Member),('x'*$entry.Size))}
+            0
+        }
+        $identities=@{Calls=0}
+        function Get-CabIdentity {
+            param($Path,$Scratch)
+            $identities.Calls++
+            $name=Split-Path $Path -Leaf
+            # The locale comes from the directory the package was restored into.
+            $parts=(Split-Path (Split-Path $Path -Parent) -Leaf) -split '-'
+            [pscustomobject]@{name=if($name -eq 'lp.cab'){'Microsoft-Windows-WinPE-LanguagePack-Package'}else{($name -split '_')[0]+'-Package'};version='10.0.26100.1';processorArchitecture='amd64';language="$($parts[0])-$($parts[1].ToUpperInvariant())";OuterXml='fixture'}
+        }
+        $cache=Join-Path $root 'download-cache'
+        $payload=Save-SetupLanguagePayload -Tag ru-RU -Build 26100 -Directory $cache
+        Assert ($state.Catalogs -eq 1 -and $state.Downloads.Count -eq 1) 'Only the archive that holds the chosen language is downloaded'
+        Assert ($state.Downloads[0] -eq 'https://fixture/winpe/language.cab') 'The archive address comes from the pinned list, not from the installer'
+        Assert ((@(Get-ChildItem -LiteralPath $payload.LocaleDirectory -File).Count) -eq 4) 'Every localized package named by the installer is restored under its real name'
+        Assert ((Get-Content -LiteralPath (Join-Path $payload.LocaleDirectory 'lp.cab') -Raw).Length -eq ('body of ru-ru/lp.cab').Length) 'Restored packages keep the size declared by the installer'
+        Assert ($identities.Calls -eq 3) 'LP, Setup and Setup Client identities are still verified after a download'
+        Assert (-not (Test-Path -LiteralPath (Join-Path $cache 'winpe-26100-archives\extract'))) 'The expanded archive is removed after the packages are copied'
+        $state.Downloads.Clear()
+        $reused=Save-SetupLanguagePayload -Tag ru-RU -Build 26100 -Directory $cache
+        Assert ([bool]$reused -and $state.Downloads.Count -eq 0) 'A prepared language set is reused without another download'
+        $fontPayload=Save-SetupLanguagePayload -Tag ja-JP -Build 26100 -Directory $cache
+        Assert ($fontPayload.Font -eq 'WinPE-FontSupport-JA-JP.cab' -and (Test-Path -LiteralPath (Join-Path $fontPayload.Directory 'WinPE-FontSupport-JA-JP.cab'))) 'A language that needs fonts downloads them from their own archive'
+        Assert (@($state.Downloads) -join ',' -eq 'https://fixture/winpe/fonts.cab') 'A second language reuses the verified shared archive and fetches only its fonts'
+        $catalog.Files=@($catalog.Files|Where-Object{$_.Path -ne 'ru-ru/WinPE-Setup-Client_ru-ru.cab'})
+        Assert-Throws {Save-SetupLanguagePayload -Tag ru-RU -Build 26100 -Directory (Join-Path $root 'download-missing')} 'A language missing a required Setup package stops the build'
+        $catalog.Files=$files
+        $catalog.Archives[0].SHA1='0'*40
+        Assert-Throws {Save-SetupLanguagePayload -Tag ru-RU -Build 26100 -Directory (Join-Path $root 'download-bad')} 'An archive that fails its pinned hash stops the build'
     }
 
     # Actual integration function, DISM mocked; real small file tree for resource copying.
