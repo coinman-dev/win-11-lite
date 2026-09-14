@@ -914,13 +914,12 @@ function Write-ProgressBar {
 function Set-ProgressValue {
     param([hashtable]$State, [double]$Value, [switch]$TrackPhase)
     $value = [Math]::Max([double]0, [Math]::Min([double]100, $Value))
-    # Повтор одного процента и обычные строки журнала не продлевают ожидание.
-    # Дробное продвижение учитывается, даже если видимый целый процент прежний.
-    if ($null -eq $State.ProgressValue -or $State.ProgressValue -ne $value) {
+    $percent = [int][Math]::Floor($value)
+    # Отсчёт идёт от изменения цифры на экране. Скрытые дробные изменения
+    # (например, 1.1 -> 1.9 при видимых 1%) не сбрасывают пять минут ожидания.
+    if ($State.Percent -ne $percent) {
         $State.LastProgressAt = Get-Date
     }
-    $State.ProgressValue = $value
-    $percent = [int][Math]::Floor($value)
     if ($TrackPhase -and $State.Percent -ge 0 -and $percent -lt $State.Percent) { $State.Phase++ }
     $State.Percent = $percent
 }

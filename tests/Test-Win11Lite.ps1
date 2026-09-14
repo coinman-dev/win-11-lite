@@ -159,10 +159,21 @@ try {
             Assert ($state.Phase -eq 2 -and $state.LastProgressAt -eq $clock.Now) 'A new phase resets inactivity even when its percentage decreases'
             $clock.Now=$clock.Now.AddMinutes(1)
             Update-ProgressState -State $state -Text '0,5%'
-            Assert ($state.Percent -eq 0 -and $state.LastProgressAt -eq $clock.Now) 'Fractional progress resets inactivity before the displayed integer changes'
+            Assert ($state.Percent -eq 0 -and $state.LastProgressAt -eq $clock.Now.AddMinutes(-1)) 'Fractional progress does not reset inactivity while the displayed integer stays unchanged'
             $clock.Now=$clock.Now.AddMinutes(1)
             Update-ProgressState -State $state -Text '0.5%'
-            Assert ($state.LastProgressAt -eq $clock.Now.AddMinutes(-1)) 'Equivalent dot and comma percentages do not count as new progress'
+            Assert ($state.LastProgressAt -eq $clock.Now.AddMinutes(-2)) 'Equivalent dot and comma percentages do not count as new progress'
+            Update-ProgressState -State $state -Text '1%'
+            $heldAt=$state.LastProgressAt
+            foreach($fraction in @('1.1%','1.2%','1.3%','1,8%','1.9%')){
+                $clock.Now=$clock.Now.AddMinutes(1)
+                Update-ProgressState -State $state -Text $fraction
+            }
+            $stalled=Get-ProgressLine -Activity 'KB5129195' -Percent $state.Percent -IdleFor ($clock.Now-$state.LastProgressAt) -Elapsed ($clock.Now-$heldAt) -Width 132
+            Assert ($state.LastProgressAt -eq $heldAt -and $stalled -match '\.\.\.' -and $stalled -notmatch '%') 'Five visible minutes at 1 percent animate despite regularly changing hidden fractions'
+            Update-ProgressState -State $state -Text '2%'
+            $resumed=Get-ProgressLine -Activity 'KB5129195' -Percent $state.Percent -IdleFor ($clock.Now-$state.LastProgressAt) -Elapsed ($clock.Now-$heldAt) -Width 132
+            Assert ($state.LastProgressAt -eq $clock.Now -and $resumed -match '\s2%' -and $resumed -notmatch '\.\.\.') 'Reaching the next visible percentage immediately restores the bar'
         }
         $frames = [Collections.Generic.List[object]]::new()
         function Write-ProgressBar {
@@ -234,12 +245,12 @@ try {
                 $fixture=Join-Path $testRoot "stalled-$source.ps1"
                 $writer=if($source -eq 'stderr'){'Error'}else{'Out'}
                 $text=if($source -eq 'counter'){'Start-Sleep -Milliseconds 3600'}else{
-                    '[Console]::'+$writer+'.Write("1%`r"); [Console]::'+$writer+'.Flush(); Start-Sleep -Milliseconds 1400; [Console]::'+$writer+'.Write("40%`r"); [Console]::'+$writer+'.Flush(); Start-Sleep -Milliseconds 1400; [Console]::'+$writer+'.Write("75%`r"); [Console]::'+$writer+'.Flush(); Start-Sleep -Milliseconds 400'
+                    'foreach($whole in 1,40){foreach($tenth in 0..7){[Console]::'+$writer+'.Write(([string]$whole+"."+$tenth+"%`r")); [Console]::'+$writer+'.Flush(); Start-Sleep -Milliseconds 175}}; [Console]::'+$writer+'.Write("75%`r"); [Console]::'+$writer+'.Flush(); Start-Sleep -Milliseconds 400'
                 }
                 [IO.File]::WriteAllText($fixture,$text,[Text.UTF8Encoding]::new($true))
                 $options=@{Exe=$psExe;Arguments=@('-NoProfile','-NonInteractive','-File',$fixture);Activity="Stalled $source";ProgressOnStdErr=($source -eq 'stderr')}
                 if($source -eq 'counter'){
-                    $options.GetPercent={if($clock.Elapsed.TotalSeconds -lt 1.4){1}elseif($clock.Elapsed.TotalSeconds -lt 2.8){40}else{75}}
+                    $options.GetPercent={if($clock.Elapsed.TotalSeconds -lt 1.4){1+($clock.Elapsed.TotalSeconds%1)*0.8}elseif($clock.Elapsed.TotalSeconds -lt 2.8){40+($clock.Elapsed.TotalSeconds%1)*0.8}else{75}}
                 }
                 $run=Invoke-ProgressProcess @options
                 foreach($pct in @(1,40)) {

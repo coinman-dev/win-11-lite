@@ -4,7 +4,7 @@
 
 [![Windows 11 x64](https://img.shields.io/badge/Windows%2011-x64-0078D4.svg)](#requirements-and-supported-images)
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20%7C%207-5391FE.svg)](#requirements-and-supported-images)
-[![Tests](https://img.shields.io/badge/tests-1181%20%C3%97%202-success.svg)](#validation-status)
+[![Tests](https://img.shields.io/badge/tests-1183%20%C3%97%202-success.svg)](#validation-status)
 
 **win-11-lite** builds a smaller, privacy-focused Windows 11 installation ISO from an original Microsoft x64 image. It removes selected inbox applications and components, applies privacy and OOBE settings, can integrate updates, languages and drivers, and exports one chosen Windows edition into a new bootable ISO.
 
@@ -389,7 +389,7 @@ The shortcut remains after download failure or installer cancellation so it can 
 
 Builder logging creates a main `.log`, a `.details.log` for commands/technical diagnostics, and a `.dism.log`. DISM can show more than one 0–100% internal phase; `100% — done` is displayed only after a successful process exit.
 
-Every builder progress bar switches to a moving `...` indicator after five minutes without a changed percentage, while the elapsed timer keeps running. A new value automatically restores the percentage bar; this can repeat during the same operation. The rule applies to DISM operations, file copying and ISO creation. A reported 100% while the process is still running continues to show the existing completion-wait indicator.
+Every builder progress bar switches to a moving `...` indicator after five minutes without a change in the displayed whole percentage, while the elapsed timer keeps running. Hidden changes such as 1.1% to 1.9%, both displayed as 1%, do not reset that interval. A new displayed value automatically restores the percentage bar; this can repeat during the same operation. The rule applies to DISM operations, file copying and ISO creation. A reported 100% while the process is still running continues to show the existing completion-wait indicator.
 
 Guest runtime files live under `C:\Windows\Setup\Scripts\Win11Lite`. For VM diagnostics, use the relevant daily files under `Logs` and the latest `guard-report.txt/json`. Entries identify `prepare`, `finalize`, `launcher`, `vbs-launcher` or a Guard run ID. Host build logs cannot show what happened after Windows booted.
 
@@ -397,7 +397,7 @@ Guest runtime files live under `C:\Windows\Setup\Scripts\Win11Lite`. For VM diag
 
 ## Validation status
 
-As of 2026-09-14, 13 suites contain **1,181 checks on Windows PowerShell 5.1 and another 1,181 on PowerShell 7**. They cover parsers, safe paths, work-drive capacity and retry prompts, downloads/cache, WIM metadata, ADK catalogs, languages, answer files, Appx/removal rules, Guard reports/history, daily log retention and midnight rollover, OOBE networking, real child processes, progress stalls and recovery, Windows batch files and the WScript launcher.
+As of 2026-09-15, 13 suites contain **1,183 checks on Windows PowerShell 5.1 and another 1,183 on PowerShell 7**. They cover parsers, safe paths, work-drive capacity and retry prompts, downloads/cache, WIM metadata, ADK catalogs, languages, answer files, Appx/removal rules, Guard reports/history, daily log retention and midnight rollover, OOBE networking, real child processes, progress stalls and recovery, Windows batch files and the WScript launcher.
 
 Tests that exercise Guard, OOBE, registry, services or servicing replace system APIs with controlled fixtures. They are not presented as a real VM result. Real builds and prior VM logs confirm substantial parts of the 24H2/26H1 flow; the newest VBS launcher, localized winget Firefox installation and current `max` exception still need a fresh VM installation.
 
