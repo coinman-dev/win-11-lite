@@ -1,203 +1,411 @@
+[English](/README.md) | [Русский](/README.ru_RU.md)
+
 # win-11-lite
 
-PowerShell-сборщик облегчённого установочного ISO Windows 11 из оригинального образа Microsoft. Поддерживает x64, сообщения RU/EN, профили очистки, дополнительные языки Windows и установщика, обновления и winget.
+[![Windows 11 x64](https://img.shields.io/badge/Windows%2011-x64-0078D4.svg)](#requirements-and-supported-images)
+[![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20%7C%207-5391FE.svg)](#requirements-and-supported-images)
+[![Tests](https://img.shields.io/badge/tests-1061%20%C3%97%202-success.svg)](#validation-status)
 
-Сначала скрипт читает сведения об ISO и готовит все выбранные загрузки. Копирование ISO и обслуживание WIM начинаются после подготовки; для дальнейшей сборки интернет не нужен. Если компонент не удалось подготовить, можно продолжить без него или отменить сборку.
+**win-11-lite** builds a smaller, privacy-focused Windows 11 installation ISO from an original Microsoft x64 image. It removes selected inbox applications and components, applies privacy and OOBE settings, can integrate updates, languages and drivers, and exports one chosen Windows edition into a new bootable ISO.
 
-## Требования
+The builder is a single PowerShell file. Download [`win-11-lite.ps1`](win-11-lite.ps1); no `data`, `tools`, generator, custom executable, Git, or GitHub CLI is required at runtime.
 
-- Windows с Windows PowerShell 5.1 или PowerShell 7.
-- Права администратора для сборки; скрипт запрашивает их сам.
-- Windows ADK с компонентом Deployment Tools. Параметр `-InstallAdk` позволяет установить отсутствующий ADK для прежних веток. Для 26H1 скрипт при необходимости заранее готовит отдельные x64 DISM 28000 и oscdimg в кэше (4 установщика ~2,3 МиБ и 9 архивов ~6,3 МиБ), сохраняя установленный ADK. Явный совместимый DISM можно выбрать через `-DismPath`.
-- Оригинальный ISO Windows 11 x64 и примерно 30 ГБ свободного места, с обновлениями — около 45 ГБ.
-- Интернет для отсутствующих в кэше загрузок. Готовые комплекты можно использовать повторно без сети.
+> [!WARNING]
+> This project deliberately removes Windows components. The default `balanced` preset removes Microsoft Defender, Windows Security, Recall and other AI components, speech/OCR features, Media Player, Xbox/Game Bar and selected consumer apps. Review the plan with `-DryRun` and test the resulting ISO in a VM before using it on a real machine.
 
-Для сборки скачайте только [`win-11-lite.ps1`](win-11-lite.ps1) и запустите его. В репозитории больше нет ни `data`, ни `tools`: весь гостевой сценарий встроен в этот файл, а состав загрузок WinPE и DISM читается при сборке из установщиков Microsoft. Папка `tests`, Git и `gh` для запуска сборщика не нужны. Необходимые служебные файлы внутри Windows-образа создаются автоматически.
+## Quick Start
 
-Исходный ISO, права администратора и системные инструменты из требований выше по-прежнему нужны. Обновления, языковые пакеты, winget и недостающие инструменты готовятся на прежнем этапе загрузок; полный проверенный кэш позволяет продолжить без сети. Бинарные пакеты Microsoft внутрь PS1 не включены.
-
-Основная логика устанавливаемой Windows находится в `C:\Windows\Setup\Scripts\Win11Lite\Win11Lite.ps1`. Режимы: `prepare`, `prepare-register`, `finalize`, `finalize-wait`, `guard` и `view`; настройки читаются из `build-info.json` рядом.
-
-Во всех пресетах, включая `max`, если в образе есть Windows Script Host и VBScript, сборщик создаёт рядом текстовый `Run-Setup.vbs`. Подготовка в specialize, SetupComplete и первый вход запускают его через штатный `wscript.exe`: `Run(command, 0, True)` создаёт первый PowerShell скрытым, ждёт завершения и передаёт код возврата. Вложенный рабочий процесс использует `CreateNoWindow`; вывод и ошибки остаются в `launcher.log`, а запуск VBS и его ошибки — в `vbs-launcher.log`. Все исходники встроены в скачиваемый `win-11-lite.ps1`; собственного EXE и компиляции запускателя нет.
-
-VBScript сохранён и защищён от удаления во всех пресетах как зависимость запускателя. Если в исходном образе нет `wscript.exe` или `vbscript.dll`, выбирается запуск PowerShell с сообщением сборщика; начальная консоль в этом случае может появляться. Окна отчёта guard Standard/Debug по-прежнему открываются после установки; Silent работает без окна. Скрытие при настоящей установке в VM и реакция антивируса требуют отдельной проверки.
-
-## Быстрый запуск
-
-Интерактивный режим предлагает выбрать ISO, редакцию и параметры:
+Download the one required file:
 
 ```powershell
+Invoke-WebRequest https://raw.githubusercontent.com/coinman-dev/win-11-lite/main/win-11-lite.ps1 -OutFile .\win-11-lite.ps1
 .\win-11-lite.ps1
 ```
 
-Посмотреть паспорт образа и план без сборки:
+Running without parameters opens the interactive wizard. It finds nearby ISO files, asks which edition and preset to use, and requests administrator rights when the build starts.
+
+Preview an image and the complete removal plan without elevation or modification:
 
 ```powershell
 .\win-11-lite.ps1 -InputIso .\iso\original.iso -Index 2 -DryRun
 ```
 
-Индекс зависит от ISO. При запуске без `-Index` скрипт показывает доступные редакции, если их несколько. Вместо индекса можно указать `-Edition`, например `IoTEnterpriseS`.
-
-Для обычных Home/Pro в `balanced` сохраняются имеющиеся Microsoft Store, App Installer (установка `.msix` двойным щелчком), библиотеки и службы приложений. `-WithWinget` добавляет пакет отдельно; его отсутствие не удаляет встроенный App Installer/winget. Проверенный исходный ISO 26H1 содержит эти компоненты в обеих редакциях. Ветка 28000 определяется как 26H1, но полная установка ещё не проверена: [подробный разбор совместимости](COMPATIBILITY.md).
-
-Для всех поддерживаемых версий и редакций Windows режим `auto` предлагает выбрать, где задать локального пользователя: **1. При установке Windows** (по умолчанию, Enter) или **2. Сейчас, до сборки ISO**. Без интерактивного ввода и в DryRun по умолчанию выбирается ввод при установке Windows. Явные `-AccountMode setup`, `-AccountMode image` или `-LocalUserName` задают способ без этого вопроса; свой `-Unattend` сохраняет управление пользователем.
-
-При выборе второго пункта непустой пароль требуется ввести дважды; при несовпадении оба значения вводятся заново. В командной строке: `-LocalUserName User` и, при необходимости, `-LocalUserPassword (Read-Host -AsSecureString)`. Без пароля создаётся аккаунт с пустым паролем; автоматический вход не включается. Пароль в answer-файле ISO восстановим: кодирование Windows не является шифрованием.
-
-Паспорт WIM/ESD читается напрямую, поэтому старый системный DISM и отсутствие 7-Zip не мешают выбору редакции или DryRun. Обслуживание WIM всё равно требует прав администратора.
-
-Сборка с русской Windows и русским установщиком:
+A compact Pro build with Guard enabled:
 
 ```powershell
-.\win-11-lite.ps1 -InputIso .\iso\original.iso -Index 2 -DownloadLanguage ru-RU
+.\win-11-lite.ps1 -InputIso .\iso\original.iso -Edition Professional -Preset balanced -Guard Standard -LegacySetup -TrimSources -RemoveWinRE -SaveWinRE
 ```
 
-Добавить последние обновления, winget и подробный журнал:
+Add current updates, winget, drivers and Russian Windows/Setup language:
 
 ```powershell
-.\win-11-lite.ps1 -InputIso .\iso\original.iso -Index 2 `
-    -DownloadLanguage ru-RU -WithUpdates -WithWinget -Debug
+.\win-11-lite.ps1 -InputIso .\iso\original.iso -Index 2 -WithUpdates -WithWinget -DriversDir .\drivers -DownloadLanguage ru-RU -Guard Standard -Debug
 ```
 
-Готовый ISO по умолчанию записывается в `out/`. Язык сообщений сборщика задаётся отдельно: `-UILang ru` или `-UILang en`.
+The output ISO is written to `out\<source-name>_lite.iso` by default. Use `-UILang ru` or `-UILang en` to select the builder UI independently of the Windows image language.
 
-`-Debug`, `-LogFile <путь>` и включение журнала в мастере сохраняют обычный вид консоли: этапы, прогресс, предупреждения и ошибки. Подробные команды не выводятся строками «ПОДРОБНО». Рядом записываются три файла: основной `.log`, технические сообщения и команды в `.details.log`, собственная диагностика DISM в `.dism.log`.
+---
 
-Процент DISM относится к текущему внутреннему этапу. Если утилита сообщила 100%, но ещё не завершилась, индикатор показывает движущуюся полосу и «ожидание завершения» с продолжающимся таймером. `100% — готово` появляется только после успешного выхода процесса; отказ помечается `ERR`.
+## Why Guard exists
 
-## Загрузки и работа без интернета
+Removing a component from an offline image is not always permanent. A cumulative or feature update can provision an inbox app again, restore Edge or Defender files, re-enable a service, or reset a policy. **Guard makes the selected build state persistent after Windows is installed.**
 
-До очистки рабочего каталога, копирования ISO и монтирования WIM подготавливаются:
+When enabled, the `win-11-lite guard` scheduled task runs as `SYSTEM` after user sign-in with a 30-second delay. It waits until Windows reports that OOBE is complete, then:
 
-- Windows LCU со всеми необходимыми checkpoint MSU и обновление .NET;
-- выбранные языковые пакеты Windows и нужный для них LCU;
-- winget: bundle, лицензия и зависимости;
-- языковые пакеты WinPE и LCU для установщика.
+- inventories the applications, provisioned packages, Windows capabilities, files and directories selected by the build;
+- removes targets that have returned and cleans Edge again when needed;
+- verifies and reapplies the selected machine policies;
+- disables or stops monitored services that have been restored;
+- checks the outcome of every operation instead of reporting an attempted action as success;
+- keeps history so the report can distinguish the first observation from a confirmed reappearance.
 
-При отказе скрипт показывает компонент и причину, затем спрашивает, продолжать ли без него. По умолчанию выбирается отмена. Без возможности интерактивного ввода сборка отменяется. Пропуск перевода установщика сохраняет выбранный язык Windows; отсутствие обязательного LCU для языков Windows требует пропустить их добавление целиком.
+Guard is not an antivirus, backup tool, or general Windows repair service. It enforces the specific removals and settings recorded when the ISO was built.
 
-Кэш находится вне рабочего каталога и переживает сборки. Его путь выводится при запуске; переопределить можно через `-UpdatesDir`. Незавершённые загрузки хранятся как `.part`, готовые комплекты проверяются по размерам и SHA256. Отмена на подготовке сохраняет рабочие файлы предыдущего прогона.
+### Guard modes
 
-`-WithUpdates` пытается получить последние обновления, а при недоступности сети может использовать полный проверенный предыдущий комплект с сообщением об этом. `-UpdateMode local` предназначен для локальных MSU. `-ClearCache` очищает принадлежащий сборщику кэш перед новой подготовкой.
+`-Guard` is one parameter with four values:
 
-Ошибки интеграции DISM остаются фатальными: успешно скачанный файл не считается успешно установленным компонентом.
-
-## Языки Windows и установщика
-
-| Параметр | Поведение |
+| Mode | Behavior |
 | --- | --- |
-| `-DownloadLanguage ru-RU` | Скачать и добавить русский в Windows. Первый добавленный язык становится основным. |
-| `-AddLanguage ru-RU -LanguageSource <путь>` | Использовать локальную папку языковых пакетов или ISO Languages and Optional Features. |
-| `-SetupLanguage auto` | Значение по умолчанию: установщик следует за первым подготовленным языком Windows. |
-| `-SetupLanguage original` | Сохранить исходный язык установщика. |
-| `-SetupLanguage de-DE` | Выбрать язык установщика отдельно от языка Windows. |
-| `-SetupLanguageSource <WinPE_OCs>` | Использовать локальные CAB WinPE соответствующей версии. |
-| `-LanguageUpdatePath <MSU>` | LCU для повторного обслуживания добавленных языков Windows. |
-| `-SetupLanguageUpdatePath <MSU>` | LCU для языка обновлённого `boot.wim`, если его нельзя подобрать автоматически. |
+| `None` | Do not embed Guard. This is the command-line default. |
+| `Standard` | Run in the background and open a concise result after the check. This is the wizard default. |
+| `Debug` | Open a live, detailed log window and show the full result. |
+| `Silent` | Run without a user window; write all reports to disk. |
 
-Автоматическая подготовка WinPE поддерживает **build 26100, amd64**; для других билдов нужен совместимый локальный источник. При первой загрузке языкового комплекта нужен общий архив примерно 305 МиБ, из которого извлекается выбранный язык. Для некоторых языков дополнительно нужны шрифты. Полный WinPE add-on на хост не устанавливается.
+```powershell
+-Guard None
+-Guard Standard
+-Guard Debug
+-Guard Silent
+```
 
-Состав пакетов внутри архивов Microsoft скрипт читает при сборке из установщика ADK (MSI около 1 МиБ) и не хранит собственного каталога. Установщик скачивается, сверяется с закреплённым SHA256, его таблицы читаются без запуска установки. Из 37 языков и 6 шрифтовых наборов берётся только выбранный.
+The old `-GuardMode` and `-GuardDebug` parameters no longer exist.
 
-Для исходного LTSC 26100.1742 добавление языков требует повторного LCU KB5043080. Загрузки выполняются заранее, совместимые готовые файлы используются повторно.
+### Guard reports
 
-Перевод поддерживает обычный и классический установщики. Обрабатываются ресурсы `boot.wim`, настройки языка, `lang.ini` и файлы Setup на носителе. `-TrimSources` сохраняет необходимые языковые файлы. Состав языковых пакетов читается при сборке из установщика ADK.
+Reports are stored in `C:\Windows\Setup\Scripts\Win11Lite\`:
 
-## Профили и дополнительные параметры
-
-| Параметр | Назначение |
+| File | Contents |
 | --- | --- |
-| `-Preset safe` | Минимальный профиль очистки. |
-| `-Preset balanced` | По умолчанию. Удаляет также современный Media Player, Кино и ТВ, Xbox, Game Bar, Family и Microsoft To Do. Сохраняет WebView2, Hyper-V/WSL и необходимые компоненты обычных приложений и обслуживания Windows. |
-| `-Preset max` | Сознательно агрессивная очистка: совместимость приложений и функций Windows может пострадать. |
-| `-Keep Edge,Fonts` | Сохранить выбранные группы вопреки пресету. |
-| `-Keep Family,ToDo` | Сохранить исходные Family и Microsoft To Do при сборке и исключить их из контроля guard. Можно указать каждое приложение отдельно. |
-| `-LegacySetup` | Использовать классический установщик. |
-| `-RemoveWinRE` | Удалить среду восстановления; требует `-LegacySetup`, если WinRE не защищён через `-Keep`. |
-| `-TrimSources` | Уменьшить установочный носитель; требует `-LegacySetup`. Установка — загрузкой с носителя. |
-| `-CompactOS` | Устанавливать систему в сжатом виде. |
-| `-Guard None/Standard/Debug/Silent` | Один параметр включает guard и выбирает режим. По умолчанию `None`: guard не встраивается. |
-| `-ResetBase` | Явно сделать уже установленные обновления неудаляемыми. По умолчанию выключен. |
+| `guard-summary.txt` | Concise counts, short names for found objects, outcomes, errors and Guard control commands. |
+| `guard-report.txt` | Full human-readable report with before/after state and technical details. |
+| `guard-report.json` | Structured report with run ID, completeness, inventory state and item-level outcomes. |
+| `guard-state.json` | History used to identify confirmed reappearances and repeated fixes. |
+| `guard.log` | Detailed execution log. |
+| `launcher.log` | PowerShell worker output and exit codes. |
 
-Без `-WithUpdates` и `-WithWinget` дополнительные обновления и пакет winget не загружаются. Имеющиеся в исходном ISO App Installer и winget сохраняются. Мастер проверяет файлы выбранной редакции через DISM `/List-Image`: при наличии winget пропускает вопрос о его добавлении, при отсутствии предлагает загрузку. Ошибка чтения явно отмечается и не считается отсутствием winget. Явный ключ `-WithWinget` по-прежнему запрашивает интеграцию пакета.
+Standard and Debug display the path to the full report before closing. Unknown inventory state, pending servicing and failed verification are never counted as successful removal.
 
-Ярлык `Install-Firefox` запускает установку браузера уже в установленной Windows; для этого ему потребуется интернет. Команда использует источник `winget` явно и выбирает пакет языка Windows: для ru-RU — `Mozilla.Firefox.ru`, для en-US — `Mozilla.Firefox`, для остальных языков — соответствующий локализованный идентификатор. Основной `Mozilla.Firefox` содержит английский установщик, поэтому один только язык русской Windows не гарантирует русский Firefox. Если локализованный пакет winget отсутствует или установка завершается ошибкой, используется прямая загрузка нужного языка с Mozilla. После успешной установки одноразовый ярлык удаляется; при ошибке или отмене остаётся для повторного запуска. Обычный ярлык Firefox сохраняется.
-
-Правила удаления современных медиаплееров и Xbox/Game Bar применяются в `balanced` и `max`, включая guard. `-Keep WMP` сохраняет классический и современные медиаплееры, `-Keep Apps` — Xbox/Game Bar и другие необязательные приложения. Xbox Identity Provider, Xbox TCUI и медиакодеки этими правилами не удаляются.
-
-Для сравнения размера сборок используйте `-Keep Family,ToDo` и отдельный `-OutputIso`: оба приложения сохранятся из исходного ISO, остальные удаления продолжатся. `-Keep Apps` также сохраняет Family/To Do вместе с остальными необязательными приложениями. Выбор `Keep` записывается в `win11-lite-build.json` на ISO и гостевой `build-info.json`.
-
-Параметр `-Guard` принимает четыре значения:
-
-| Режим | Что показывается |
-|---|---|
-| `None` (по умолчанию в командной строке) | Guard не встраивается. В мастере по умолчанию выбран `Standard`. |
-| `Standard` | После проверки открывается краткий итог: количество контролируемых программ, повторных появлений и успешных удалений, сбившихся и повторно восстановленных настроек/служб, ошибки. Под счётчиками найденных компонентов Windows и файлов/каталогов перечисляются короткие названия и результат для каждого. Перед закрытием окна указан полный путь к подробному отчёту. |
-| `Debug` | Одно окно с живым полным журналом текущей проверки и подробным итогом. |
-| `Silent` | Проверка выполняется без пользовательского окна; оба отчёта сохраняются в папке guard. |
-
-Примеры: `-Guard Standard`, `-Guard Debug`, `-Guard Silent` и `-Guard None`. Отдельных параметров `-GuardMode` и `-GuardDebug` больше нет. Реальный guard изменяет службы, политики и файлы целевой Windows; проверяйте его в тестовой ОС или VM.
-
-Фоновая задача `win-11-lite guard` выполняется от SYSTEM при входе пользователя. Она проверяет, не вернулись ли выбранные компоненты и настройки, и открывает задачу `win-11-lite guard report` в пользовательской сессии: в начале Debug или после проверки Standard, только после завершения OOBE. Задача отчёта не имеет собственного триггера входа и запускает `Win11Lite.ps1 -Mode view` напрямую, от имени вошедшего пользователя без повышения прав. В Silent задача окна не создаётся. Запуск worker и коды возврата сохраняются в `C:\Windows\Setup\Scripts\Win11Lite\launcher.log`.
-
-Запись в `guard.log` разрешает одновременное чтение живым наблюдателем. Если внешняя программа полностью заблокировала файл, guard продолжает проверки, а недоступные для записи строки передаёт в stderr; штатный запускатель сохраняет их в `launcher.log` с отметкой `LOG ERROR`. Ошибки журналирования учитываются отдельно от ошибок политик и служб и дают ненулевой результат задачи.
-
-В конце guard выводит подробный отчёт: названия настроек, служб, возможностей, приложений, файлов и каталогов; найденное, отсутствующее, успешно удалённое, уже отключённое, изменённое сейчас, ожидающее завершения и ошибки. Состояния «было/стало» и подтверждённые повторные отключения перечисляются по именам. При отказе инвентаризации отсутствие компонентов не предполагается; при прерывании отдельно отмечаются непроверенные пункты.
-
-Полный итог сохраняется рядом с `guard.log` в `guard-report.txt` и `guard-report.json`; краткий — в `guard-summary.txt`. Все файлы формируются в каждом режиме. В кратком итоге установленная и provisioned-копии одной программы считаются один раз; незавершённое удаление одной из копий не считается полным успехом. Возможности Windows и файлы не завышают число программ. `guard-state.json` хранит историю успешных проверок: обнаруженное повторное появление учитывается даже при ошибке удаления, а успешное повторное исправление — отдельно. При отсутствии истории повторность явно отмечается как неизвестная. ID запуска связывает окно с нужным отчётом, исключая показ устаревшего итога.
-
-Для найденных компонентов краткий итог убирает техническую версию из имени, сохраняя язык; для файлов показывает конкретное совпадение вместо маски. Одинаковые имена различаются по родительскому каталогу. Рядом с каждым объектом указан результат: удалено, ожидает завершения, ошибка, пропущено или сохранено по правилам защиты. Окна Standard и Debug выводят путь к `guard-report.txt` — обычно `C:\Windows\Setup\Scripts\Win11Lite\guard-report.txt`.
-
-При отказе файловой очистки отчёт указывает этап (проверка пути, выдача прав, удаление или проверка результата), код исключения и проблемный объект. Коды возврата `takeown`/`icacls` и последние 12 строк их вывода при ошибке сохраняются; стек вызовов записывается в `guard.log`. Ошибка проверки после удаления не считается подтверждением отсутствия файла. Отказ выдачи прав сам по себе не запрещает попытку удаления: имеющихся прав может быть достаточно.
-
-Обновление guard в уже установленной Windows выполняется пересборкой ISO: отдельного средства обновления больше нет. Режим окна выбирается при сборке единым параметром `-Guard Standard|Debug|Silent` и хранится в `guard.json`.
-
-Отключить guard в установленной Windows можно без пересборки. Откройте Терминал **от имени администратора** и выполните:
+Disable future Guard runs from an elevated Terminal:
 
 ```powershell
 schtasks.exe /Change /TN "\win-11-lite guard" /Disable
 ```
 
-Включить обратно:
+Enable Guard again:
 
 ```powershell
 schtasks.exe /Change /TN "\win-11-lite guard" /Enable
 ```
 
-Отключение запрещает следующие запуски; уже начатая проверка завершается. После включения guard запустится при следующем входе в Windows с прежним режимом отчёта. Команды меняют только состояние задачи guard; ранее удалённые приложения и применённые настройки не восстанавливаются. Подсказка с обеими командами есть в кратком и подробном отчётах, включая окна Standard/Debug; она сохраняется в файлах и доступна после отключения.
+Disabling the task does not stop a check already running and does not restore removed applications or policies. After re-enabling it, Guard runs at the next sign-in. Updating Guard itself requires rebuilding the ISO.
 
-На обслуженных файлах `Remove-Item -Force` может вернуть `RemoveFileSystemItemArgumentError` / `0x80070057` после успешных takeown/icacls. Для этого конкретного отказа guard пробует удалить один указанный файл без предварительного изменения атрибутов и продолжает выбранный каталог. Путь проверяется, переходы через ссылки каталогов запрещены, другие ошибки не обходятся. Результат повторно проверяется; подтверждение исправления пяти ошибок в VM ещё требуется.
+---
 
-Полный список параметров:
+## Why Recall is removed
 
-```powershell
-Get-Help .\win-11-lite.ps1 -Full
+Windows Recall is an optional Copilot+ PC feature. If the user opts in, Windows saves screenshots of the active screen every few seconds and when the active content changes, then indexes the images and recognized text for later search. Microsoft states that snapshots remain local, are encrypted, require Windows Hello to access, and are not uploaded to Microsoft by Recall. Sensitive-information filtering is enabled by default. [Microsoft Recall overview](https://support.microsoft.com/en-us/windows/ai/ai-features/retrace-your-steps-with-recall), [privacy architecture](https://support.microsoft.com/en-us/windows/privacy/privacy-and-control-over-your-recall-experience).
+
+That protection does not make screen history irrelevant. Anything visible in a terminal, browser, mail client, database tool, cloud control panel, password dialog or customer document can potentially appear in a retained screenshot. Microsoft notes that parts of filtered sites can still appear and that remote clients are captured unless they implement screen-capture protection. Its enterprise guidance explicitly calls allowing screenshots of content that must not be exfiltrated a general security risk. [Manage Recall for Windows clients](https://learn.microsoft.com/en-us/windows/client-management/manage-recall#bring-your-own-device-byod-considerations).
+
+This matters on personal workstations used to administer servers: SSH terminals, hosting dashboards, API tokens, internal hostnames, customer records and private messages may all be displayed during ordinary work. Recall does not itself leak this data to the cloud, but it creates an additional searchable store of sensitive screen history. A compromised Windows session, an unsafe export, or a remote client without capture protection can turn that history into another source of exposure.
+
+`balanced` and `max` therefore take a removal-oriented approach:
+
+- set `AllowRecallEnablement=0` and `DisableAIDataAnalysis=1` for machine/default-user policy;
+- disable Recall data providers and Recall export, and disable Click to Do and the Settings agent;
+- request supported removal of the `Recall` optional feature and payload in `balanced`;
+- remove matching Recall, Copilot, AI Fabric, AIX and AugLoop files/packages when present;
+- pass the core Recall/Copilot policies and selected AI paths to Guard so updates cannot silently undo them.
+
+Microsoft documents that disabling the Allow Recall policy disables the component, removes its bits, and deletes previously saved snapshots after restart; it also documents `Disable-WindowsOptionalFeature -Online -FeatureName "Recall" -Remove` for payload removal. [Microsoft policy reference](https://learn.microsoft.com/en-us/windows/client-management/manage-recall#allow-recall-and-snapshots-policies).
+
+Recall is opt-in in current consumer Windows and removed by default on managed commercial devices. The project removes it because its design goal is a lean system with no retained screen timeline, not because Recall secretly uploads every screenshot.
+
+---
+
+## Presets
+
+Presets are cumulative. `balanced` includes `safe`; `max` includes both and adds more destructive rules.
+
+| Preset | Intended use | Main actions |
+| --- | --- | --- |
+| `safe` | Small privacy cleanup while keeping Defender and normal app compatibility | Removes the Edge browser and shortcuts while keeping WebView2; disables telemetry services/policies, advertising, suggestions and widgets; applies setup/OOBE privacy settings. |
+| `balanced` | Default lite desktop | Adds Defender/Windows Security removal, speech/handwriting/OCR/Text-to-Speech, Recall/Copilot/AI components, classic and modern Media Player, IE stub, classic Paint, Steps Recorder, diagnostics, CJK fonts/IME where safe, OneDrive installers, NGEN cache, Xbox/Game Bar, Family, To Do and selected consumer apps. Keeps Store/MSIX, App Installer/winget, WebView2, servicing, Hyper-V and WSL. |
+| `max` | Deliberately aggressive image reduction | Adds WebView2/Edge Update, component backups, PowerShell ISE, WMIC, Hello Face, formula recognition, fax/scan and extra FoD removal. Application compatibility and future servicing may break. VBScript remains as an explicit dependency of the hidden setup launcher. |
+
+Selected consumer Appx targets include Clipchamp, Bing News/Weather, Get Help/Get Started, Office Hub, Solitaire, Feedback Hub, Phone Link, new Outlook, Teams, Xbox/Game Bar, Family and Microsoft To Do. Exact matches depend on what the source image contains.
+
+### What `balanced` explicitly preserves
+
+- Microsoft Store, Store Purchase App and Desktop App Installer;
+- an existing winget installation and Store/MSIX licensing/deployment services;
+- VCLibs, UI.Xaml, .NET Native and Windows App Runtime frameworks;
+- WebView2 and Edge Update components required by ordinary applications;
+- Hyper-V, WSL, containers, networking and Windows Update servicing;
+- Notepad, the basic photo viewer, language-basic resources and required network capabilities;
+- Windows Script Host/VBScript for the hidden setup launcher.
+
+`-Keep` overrides a preset for a named group:
+
+```text
+Defender, WinRE, Edge, Fonts, Speech, WMP, IE, Sandbox, AI,
+Apps, Family, ToDo, OneDrive, NativeImages
 ```
 
-## Обновления во время первоначальной настройки
+Examples: `-Keep Edge,Defender`, `-Keep Family,ToDo`, or `-Keep Apps`. `Apps` also protects Family and To Do. `Sandbox` is accepted as a compatibility selector; the current removal tables do not target Windows Sandbox.
 
-На время OOBE сборщик отключает доступные адаптеры и добавляет временное правило, блокирующее исходящую сеть, в том числе через интерфейсы, которые появятся позже. SetupComplete повторяет проверку. `-NoOobeNetworkBlock` отключает эту защиту.
+> [!CAUTION]
+> `balanced` removes Microsoft Defender, SmartScreen policy protection and the Windows Security application. Use `safe` or `-Keep Defender` if this machine should retain the built-in antivirus.
 
-Первый вход сам по себе не разрешает возврат сети: финализатор ждёт системного подтверждения `OOBEComplete`. Затем восстанавливаются сохранённые адаптеры и удаляется собственное правило брандмауэра. Ошибка очистки Edge не должна препятствовать возврату сети.
+---
 
-При повторении проблемы нужны журналы **из тестовой Windows**: `C:\Windows\Setup\Scripts\Win11Lite\prepare.log`, `finalize.log`, `launcher.log`, `vbs-launcher.log` (при запуске через VBS) и `guard.log`. Журналы сборщика в `log/` не показывают выполнение скриптов внутри VM.
+## OOBE, updates and the hidden launcher
 
-## Проверки
+By default, the builder prevents Windows Setup from downloading updates during OOBE:
 
-На 14.09.2026 проект содержит **1061 проверку на каждую версию PowerShell**: 5.1 и 7. Все 12 наборов имеют успешный результат; после сохранения VBScript в max повторены Compatibility, Guard и SetupLauncher. Настоящий WScript запускает безопасную копию гостевого сценария, проверяются скрытое окно и коды возврата; системные API guard/OOBE/обслуживания подменены. Реальный DryRun ISO 28000.2704 Pro ранее прошёл с `-Guard None`, `Standard`, `Debug` и `Silent`; новая полная сборка с VBS и реальная установка локализованного Firefox ещё не проверены.
+1. During the `specialize` pass it creates a temporary outbound firewall block, records enabled adapters and disables only those adapters.
+2. `SetupComplete` repeats detection for adapters that appeared late.
+3. At first sign-in a finalizer waits for the native `OOBEComplete` signal.
+4. It restores only the adapters changed by the builder, removes its own firewall rule and temporary Windows Update/OOBE policies, then performs the final Edge cleanup.
+
+Use `-NoOobeNetworkBlock` to leave networking available during OOBE.
+
+To avoid the brief black PowerShell window that Windows Setup can show, every preset preserves VBScript and uses a generated text file, `Run-Setup.vbs`, when `wscript.exe` and `vbscript.dll` exist in the image. WScript creates the first PowerShell process hidden, waits for its result and propagates the exit code. No custom EXE is compiled or embedded. If the source image lacks the host or engine, the builder reports the fallback to direct PowerShell, where an initial console may appear.
+
+VBS/PowerShell launcher logs are written to `vbs-launcher.log` and `launcher.log`. The new launcher has passed real WScript fixture tests; appearance and antivirus behavior during a complete VM installation still require verification.
+
+---
+
+## Updates, winget and offline preparation
+
+All selected downloads are prepared before the working directory is wiped, the ISO is copied, or a WIM is mounted:
+
+- Windows LCU and required checkpoint packages;
+- the .NET Framework cumulative update;
+- Windows language packs and any LCU required to repair their resources;
+- WinPE/Setup language packages and a compatible boot-image LCU;
+- winget bundle, license and dependencies;
+- DISM/oscdimg tools required for newer image branches.
+
+After this preparation succeeds, the remainder of the build requires no network access. Incomplete `.part` files are not accepted. Cached sets are checked by size and SHA-256 and survive build cancellation. If an optional download fails, the interactive builder identifies the component and lets the user skip it or cancel; non-interactive builds cancel rather than silently producing a different image.
+
+`-WithUpdates` selects online discovery/download. `-UpdateMode local` consumes MSU files already placed in `-UpdatesDir`; use `-LcuFile` and `-DotNetUpdateFile` when the directory contains multiple candidates. `-ResetBase` is opt-in because it makes installed updates permanently non-removable.
+
+If App Installer/winget already exists in the selected edition, the wizard keeps it and skips the download question. `-WithWinget` integrates a newer package; it is not required to preserve the source version.
+
+---
+
+## Windows and Setup languages
+
+The Windows display language and the Setup/WinPE language are separate choices.
+
+| Command | Result |
+| --- | --- |
+| `-DownloadLanguage ru-RU` | Download and add Russian; the first requested language becomes the Windows default. |
+| `-AddLanguage ru-RU -LanguageSource <path>` | Add packages from a local Languages and Optional Features source. |
+| `-SetupLanguage auto` | Make Setup follow the first prepared Windows language; this is the default. |
+| `-SetupLanguage original` | Keep the source Setup language. |
+| `-SetupLanguage de-DE` | Select Setup language independently. |
+| `-SetupLanguageSource <WinPE_OCs>` | Use local WinPE language CABs. |
+| `-LanguageUpdatePath <LCU.msu>` | Reapply a compatible LCU after adding Windows languages. |
+| `-SetupLanguageUpdatePath <LCU.msu>` | Repair an updated `boot.wim` after adding its language. |
+
+Automatic WinPE language preparation currently supports build 26100 amd64. Other builds need a compatible local source unless the source `boot.wim` already has the desired language. For 26100.1742 media, automatic language addition also prepares the original KB5043080 LCU.
+
+The script reads the package layout from pinned Microsoft ADK installers instead of carrying a generated package catalog. It extracts only the requested language and font packages.
+
+---
+
+## Accounts and answer files
+
+For every supported Windows edition, `-AccountMode auto` offers:
+
+1. create/configure the user during Windows Setup — the default;
+2. enter a local account now and place it in the generated answer file.
+
+For non-interactive builds use `-AccountMode setup`, or supply `-LocalUserName` (and optionally a SecureString `-LocalUserPassword`) to select image-time account creation. No automatic logon is configured. A password embedded in an answer file is recoverable; Windows answer-file encoding is not encryption.
+
+`-Unattend <file>` gives control to a custom answer file. `-Unattend none` prevents the builder from adding one. With a custom/disabled answer file, the user is responsible for OOBE, account and first-logon behavior.
+
+Hardware requirement bypasses for TPM, Secure Boot, CPU, RAM and storage are included by default. Use `-NoBypass` to omit them. The builder also prevents automatic device encryption and disables reserved storage for new installations.
+
+---
+
+## Image size options
+
+| Option | Effect |
+| --- | --- |
+| `-Compression recovery` | Export `install.esd` with solid LZMS compression; smallest default output. |
+| `-Compression max` | Export `install.wim` with maximum WIM compression; generally faster to install but larger. |
+| `-CompactOS` | Request CompactOS/LZX for the installed system; saves installed disk space at a CPU cost. |
+| `-LegacySetup` | Boot the classic Setup path through `winpeshl.ini`. |
+| `-TrimSources` | Keep only files needed for boot installation; running `setup.exe` from an existing Windows installation is no longer supported. Requires classic Setup. |
+| `-RemoveWinRE` | Remove `Windows\System32\Recovery\Winre.wim`; requires classic Setup unless protected with `-Keep WinRE`. |
+| `-SaveWinRE` | Copy the removed recovery image beside the output ISO as `*_winre.wim`. It is not stored inside the ISO. |
+
+WinRE is the installed Windows Recovery Environment. It is different from WinPE in `boot.wim`, which continues to boot and run Windows Setup.
+
+---
+
+## Requirements and supported images
+
+- Windows host with Windows PowerShell 5.1 or PowerShell 7;
+- administrator rights for a real build (requested automatically);
+- an original Windows 11 x64 ISO;
+- about 30 GB free space, or about 45 GB with current updates;
+- Windows ADK Deployment Tools, or network/cache access that lets the script prepare compatible tools;
+- internet only for selected items that are not already cached.
+
+Recognized Windows 11 branches:
+
+| Build | Release label |
+| ---: | --- |
+| 22000 | 21H2 |
+| 22621 | 22H2 |
+| 22631 | 23H2 |
+| 26100 | 24H2 |
+| 26200 | 25H2 |
+| 28000 | 26H1 |
+
+Unknown branches stop instead of borrowing updates or servicing tools from another release. For build 28000, the builder can prepare pinned x64 DISM 10.0.28000.1 and oscdimg files from Microsoft ADK packages without replacing the installed ADK. See the [26H1 Home/Pro and Store/MSIX compatibility audit](COMPATIBILITY.md).
+
+---
+
+## Command-line reference
+
+The table covers every user-facing parameter. Run `Get-Help .\win-11-lite.ps1 -Full` for the embedded help.
+
+### Source, output and removal selection
+
+| Parameter | Purpose |
+| --- | --- |
+| `-InputIso <file>` | Source Windows ISO. The wizard can discover nearby ISO files. |
+| `-OutputIso <file>` | Output ISO path. Defaults to `out\<source>_lite.iso`. |
+| `-Index <n>` | Source WIM/ESD index. Required when the source contains multiple editions unless `-Edition` is used. |
+| `-Edition <EditionID>` | Select by EditionID, for example `Professional` or `IoTEnterpriseS`. |
+| `-Preset safe|balanced|max` | Removal depth; default `balanced`. |
+| `-Keep <groups[]>` | Preserve selected groups against the preset. |
+| `-RemoveExtra <regex[]>` | Additional capability/package identity regular expressions. Advanced and potentially destructive. |
+| `-WorkDir <directory>` | Working directory. The builder only wipes a directory bearing its ownership marker. |
+| `-UpdatesDir <directory>` | Persistent download/update cache. |
+
+### Updates, languages and packages
+
+| Parameter | Purpose |
+| --- | --- |
+| `-WithUpdates` | Discover and integrate current Windows/.NET updates. |
+| `-UpdateMode none|download|local` | Update source; `WithUpdates` changes `none` to `download`. |
+| `-IncludeDotNetUpdate <bool>` | Include the .NET cumulative update; default `true` when updates are selected. |
+| `-LcuFile <name>` | Explicit target LCU filename in a local cache. |
+| `-DotNetUpdateFile <name>` | Explicit target .NET update filename. |
+| `-WithWinget` | Download and integrate a winget/App Installer package. Existing source winget is preserved without it. |
+| `-AddLanguage <tags[]>` | Languages to add from `LanguageSource`. |
+| `-LanguageSource <path>` | Local LoF/CAB directory or image. |
+| `-DownloadLanguage <tags[]>` | Download Windows language packages. |
+| `-SetupLanguage <tag|auto|original>` | Select the Setup language independently. |
+| `-SetupLanguageSource <path>` | Local WinPE language source. |
+| `-LanguageUpdatePath <MSU>` | Compatible LCU to reapply after Windows language addition. |
+| `-SetupLanguageUpdatePath <MSU>` | Compatible LCU for localized `boot.wim`. |
+| `-DriversDir <directory>` | Recursively integrate drivers with DISM. |
+| `-ClearCache` | Clear only a cache marked as owned by this builder before preparation. |
+
+### Setup, accounts and behavior
+
+| Parameter | Purpose |
+| --- | --- |
+| `-Guard None|Standard|Debug|Silent` | Disable Guard or select its report mode. CLI default `None`; wizard default `Standard`. |
+| `-NoBypass` | Do not add TPM/Secure Boot/CPU/RAM/storage bypasses. |
+| `-NoOobeNetworkBlock` | Keep networking available during OOBE. |
+| `-LegacySetup` | Use classic Windows Setup. |
+| `-RemoveWinRE` | Remove the installed recovery image. |
+| `-SaveWinRE` | Save a copy of the removed `winre.wim` beside the ISO. |
+| `-TrimSources` | Remove setup files not required for boot installation. |
+| `-CompactOS` | Install Windows in CompactOS mode. |
+| `-Compression recovery|max` | Choose `install.esd` or `install.wim`; default `recovery`. |
+| `-ResetBase` | Make integrated updates non-removable. |
+| `-ProductKey <key>` | Product key for the generated answer file. |
+| `-AccountMode auto|image|setup` | Choose where the local user is configured. |
+| `-LocalUserName <name>` | Local administrator name for answer-file creation. |
+| `-LocalUserPassword <SecureString>` | Optional local-user password. |
+| `-Unattend <file|none>` | Supply a custom answer file or disable generated `autounattend.xml`. |
+
+### Tools, diagnostics and automation
+
+| Parameter | Purpose |
+| --- | --- |
+| `-InstallAdk` | Install ADK Deployment Tools when a compatible installation is missing. |
+| `-DismPath <file>` | Use an explicit compatible `dism.exe`. |
+| `-SkipIso` | Stop with the prepared distribution instead of running oscdimg; preserves the working directory. |
+| `-KeepWorkDir` | Keep build files after completion or failure. |
+| `-LogFile <file>` | Explicit main transcript path; also enables details and DISM logs. |
+| `-Debug` | Enable the three builder log files without filling the console with verbose command lines. |
+| `-DryRun` | Read metadata and print the plan without modification or elevation. |
+| `-Interactive` | Force the wizard (`-Wizard` alias). |
+| `-UILang auto|ru|en` | Builder message language, independent of image language. |
+| `-NoPause` | Do not wait for a key before an interactive/elevated process exits. |
+
+`-Elevated` is an internal forwarding flag set by the builder when it restarts itself as administrator; do not pass it manually.
+
+---
+
+## Firefox shortcut
+
+The finished Windows image contains `Install-Firefox.cmd` on the Public Desktop. At run time it:
+
+1. tries winget from the `winget` source only, avoiding a broken `msstore` source;
+2. selects a package matching the Windows image language (`Mozilla.Firefox.ru` for ru-RU, the base `Mozilla.Firefox` for en-US, and localized IDs for other mapped languages);
+3. falls back to Mozilla's direct `firefox-latest` URL with the same language;
+4. deletes the one-time installer shortcut only after success.
+
+The shortcut remains after download failure or installer cancellation so it can be retried.
+
+---
+
+## Output, logs and audit data
+
+| File | Purpose |
+| --- | --- |
+| `*_lite.iso` | Bootable result. |
+| `*_lite.sha256` | SHA-256 checksum. |
+| `*_lite.image-audit.json` | Component-store measurements, removal failures and targets still reported by DISM. |
+| `*_lite_winre.wim` | Optional saved WinRE copy. |
+| `win11-lite-build.json` in the ISO root | Build ID, source/output, preset, Keep list, language, update and Guard choices. |
+
+Builder logging creates a main `.log`, a `.details.log` for commands/technical diagnostics, and a `.dism.log`. DISM can show more than one 0–100% internal phase; `100% — done` is displayed only after a successful process exit.
+
+Guest runtime files live under `C:\Windows\Setup\Scripts\Win11Lite`. `prepare.log`, `finalize.log`, `launcher.log`, `vbs-launcher.log` and `guard.log` are the useful files when diagnosing behavior inside a VM; host build logs cannot show what happened after Windows booted.
+
+---
+
+## Validation status
+
+As of 2026-09-14, 12 suites contain **1,061 checks on Windows PowerShell 5.1 and another 1,061 on PowerShell 7**. They cover parsers, safe paths, downloads/cache, WIM metadata, ADK catalogs, languages, answer files, Appx/removal rules, Guard reports/history, OOBE networking, real child processes, Windows batch files and the WScript launcher.
+
+Tests that exercise Guard, OOBE, registry, services or servicing replace system APIs with controlled fixtures. They are not presented as a real VM result. Real builds and prior VM logs confirm substantial parts of the 24H2/26H1 flow; the newest VBS launcher, localized winget Firefox installation and current `max` exception still need a fresh VM installation.
+
+Run the complete test set sequentially:
 
 ```powershell
 $suites = 'Test-SingleFile', 'Test-Win11Lite', 'Test-WindowsBatch', 'Test-WingetDetection', 'Test-Guard', 'Test-GuardModes', 'Test-Downloads', 'Test-SetupLanguage', 'Test-OobeNetwork', 'Test-SetupLauncher', 'Test-Compatibility', 'Test-Servicing'
 foreach ($suite in $suites) {
     powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ".\tests\$suite.ps1"
-    if ($LASTEXITCODE -ne 0) { throw "Не прошёл $suite" }
+    if ($LASTEXITCODE -ne 0) { throw "Failed: $suite" }
 }
 ```
 
-Для проверки на PowerShell 7 замените `powershell.exe` на `pwsh.exe`. Прогоны guard на разных версиях выполняйте последовательно.
+Replace `powershell.exe` with `pwsh.exe` for PowerShell 7. Run Guard suites sequentially.
 
-Реальные русские WinPE CAB проверены, DryRun исходного ISO прошёл. Журналы VM сборок `20260912-203504` и `20260912-225013` подтверждают ожидание OOBEComplete и возврат сети. Новые журналы `20260913-125855` подтверждают уже установленную 26H1 из ISO 28000.2704: локальная учётная запись, успешные Prepare/Finalize, штатный PowerShell-запускатель, возврат сети после OOBEComplete. Обновление guard применилось, ошибок записи нет; пять файловых удалений завершились с `0x80070057`. Наличие значка Store не подтверждает установку MSIX; отдельной проверки Store/MSIX и новых режимов пока нет. Изменения: [`CHANGELOG.md`](CHANGELOG.md).
+See [CHANGELOG.md](CHANGELOG.md) for implementation history and [COMPATIBILITY.md](COMPATIBILITY.md) for the detailed 26H1 Home/Pro, Store/MSIX and servicing audit.
 
-ISO, скачанные бинарные пакеты, результаты сборки, временные файлы и журналы исключены из Git.
-
-Для разработчиков: гостевой сценарий правится прямо в `win-11-lite.ps1`, в области `#region Guest script`. Отдельных папок с исходниками и генераторов нет; тесты извлекают этот текст из основного файла и проверяют его синтаксис, режимы и запись в образ.
+ISO files, downloaded Microsoft packages, build output, logs and local research material are excluded from Git.
