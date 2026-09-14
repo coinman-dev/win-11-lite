@@ -16,6 +16,8 @@ $adkNode=$ast.Find({param($n)$n -is [Management.Automation.Language.AssignmentSt
 if(-not $adkNode){throw 'Missing pinned ADK source table'}
 . ([scriptblock]::Create($adkNode.Extent.Text))
 $script:Lang='en';$script:checks=0;$Unattend='';$SkipIso=$false
+$launchHelper=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-SetupEntryCommand'},$false)
+. ([scriptblock]::Create($launchHelper.Extent.Text))
 function Assert([bool]$Value,[string]$Message){if(-not $Value){throw "FAIL: $Message"};$script:checks++}
 function Assert-Throws([scriptblock]$Action,[string]$Message){$failed=$false;try{& $Action|Out-Null}catch{$failed=$true};Assert $failed $Message}
 function Write-Ok {param($Message)}
@@ -333,13 +335,15 @@ try{
         Assert ($state.Calls -eq 1 -and $state.Registered) 'Missing WIMMount is registered through the selected tool set'
     }
     foreach($edition in 'Core','Professional','IoTEnterpriseS'){
+        $useVbsLauncher=$edition -ne 'IoTEnterpriseS'
         $selected=[pscustomobject]@{EditionId=$edition};$LocalUserName='Тест & User';$LocalUserPassword=$password
         $CompactOS=$true;$imgLang='ru-RU';$setupLang='ru-RU';$ProductKey=''
-        foreach($name in 'setupInputLocale','compactBlock','localAccountXml','productKeyUi','escapedProductKey','productKeyValue','oobeNetBlock','unattendXml'){
+        foreach($name in 'prepareCommand','registerCommand','finalizeCommand','setupInputLocale','compactBlock','localAccountXml','productKeyUi','escapedProductKey','productKeyValue','oobeNetBlock','unattendXml'){
             $node=$ast.Find({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq ('$'+$name)},$true)
             . ([scriptblock]::Create($node.Extent.Text))
         }
         [xml]$xml=$unattendXml;$ns=[Xml.XmlNamespaceManager]::new($xml.NameTable);$ns.AddNamespace('u','urn:schemas-microsoft-com:unattend')
+        Assert ($xml.SelectSingleNode('//u:RunSynchronousCommand/u:Path',$ns).InnerText -eq $prepareCommand -and $xml.SelectSingleNode('//u:FirstLogonCommands/u:SynchronousCommand/u:CommandLine',$ns).InnerText -eq $finalizeCommand) 'The actual answer file retains the selected VBS or PowerShell launcher commands'
         Assert ($xml.SelectSingleNode('//u:LocalAccount/u:Name',$ns).InnerText -eq $LocalUserName) "Actual answer file safely carries the local account name ($edition)"
         $encoded=$xml.SelectSingleNode('//u:LocalAccount/u:Password/u:Value',$ns).InnerText
         Assert ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($encoded)) -eq 'Fixture password & 7Password' -and $unattendXml -notmatch 'Fixture password') 'Password uses the documented Windows answer-file encoding'

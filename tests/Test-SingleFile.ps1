@@ -20,7 +20,7 @@ try{
     Assert (-not [IO.File]::ReadAllText($main).Contains("`r")) 'The standalone test uses GitHub-style LF source text'
     $t=$null;$e=$null;$ast=[Management.Automation.Language.Parser]::ParseFile($main,[ref]$t,[ref]$e)
     Assert (-not $e.Count) 'The isolated script parses with the embedded guest script'
-    foreach($name in 'T','Get-AdkSourceHash','Get-GuestScript'){
+    foreach($name in 'T','Get-AdkSourceHash','Get-GuestScript','Get-SetupVbsScript'){
         $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
         if(-not $node){throw "Missing standalone function: $name"}
         . ([scriptblock]::Create($node.Extent.Text))
@@ -72,7 +72,16 @@ try{
     $written=Join-Path $supportDir 'Win11Lite.ps1';$bytes=[IO.File]::ReadAllBytes($written)
     Assert (($bytes[0..2] -join ',') -eq '239,187,191') 'The guest file is written with the UTF-8 BOM that Windows PowerShell 5.1 needs'
     Assert ([IO.File]::ReadAllText($written) -ceq $guestScript) 'The written guest file matches the embedded copy exactly'
-    Assert (@(Get-ChildItem -LiteralPath $supportDir -File).Count -eq 1) 'The image needs no companion runtime files'
+    $vbsWriters=@($ast.FindAll({param($n)
+        $n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and
+        $n.Extent.Text -match "^\[IO.File\]::WriteAllText\(\(Join-Path \`$supportDir 'Run-Setup\.vbs'\)"
+    },$true))
+    Assert ($vbsWriters.Count -eq 1) 'The optional VBS bootstrap has one writer in the single builder file'
+    & ([scriptblock]::Create($vbsWriters[0].Extent.Text))
+    $vbsPath=Join-Path $supportDir 'Run-Setup.vbs'
+    Assert ([IO.File]::ReadAllText($vbsPath) -ceq (Get-SetupVbsScript)) 'The VBS file comes directly from the embedded text'
+    Assert (-not @([IO.File]::ReadAllBytes($vbsPath)|Where-Object{$_ -gt 127}).Count) 'The VBS bootstrap uses portable ASCII source and needs no extra encoding support'
+    Assert (@(Get-ChildItem -LiteralPath $supportDir -File).Count -eq 2) 'The guest uses one PowerShell file and the optional text VBS bootstrap'
     Assert (@(Get-ChildItem -LiteralPath $standalone -Force).Count -eq 1) 'Writing the guest runtime creates nothing beside the downloaded script'
 
     # A stale neighbouring data folder must not change anything.

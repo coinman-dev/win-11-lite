@@ -2092,6 +2092,83 @@ timeout /t 3 >nul 2>&1
 }
 
 #region Guest script
+function Get-SetupVbsScript {
+    # Plain-text bootstrap. Run(..., 0, True) hides PowerShell at creation and
+    # waits for its exit code; it never executes a command supplied by the user.
+    $text = @'
+Option Explicit
+Dim files, shell, support, mode, guest, powershell, command, result, failure, reason
+Set files = CreateObject("Scripting.FileSystemObject")
+Set shell = CreateObject("WScript.Shell")
+support = files.GetParentFolderName(WScript.ScriptFullName)
+If WScript.Arguments.Count <> 1 Then Fail 87, "Expected exactly one background mode"
+mode = LCase(WScript.Arguments(0))
+Select Case mode
+    Case "prepare", "prepare-register", "finalize", "finalize-wait", "guard"
+    Case Else
+        Fail 87, "Unsupported background mode"
+End Select
+guest = files.BuildPath(support, "Win11Lite.ps1")
+powershell = shell.ExpandEnvironmentStrings("%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe")
+If Not files.FileExists(guest) Then Fail 2, "Win11Lite.ps1 is missing"
+If Not files.FileExists(powershell) Then Fail 2, "Windows PowerShell is missing"
+command = Quote(powershell) & " -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File " & Quote(guest) & " -Mode " & mode
+On Error Resume Next
+shell.CurrentDirectory = support
+If Err.Number <> 0 Then
+    failure = Err.Number
+    reason = Err.Description
+    Fail failure, reason
+End If
+WriteLog "START mode=" & mode
+Err.Clear
+result = shell.Run(command, 0, True)
+failure = Err.Number
+reason = Err.Description
+On Error GoTo 0
+If failure <> 0 Then Fail failure, reason
+WriteLog "END mode=" & mode & " ExitCode=" & result
+WScript.Quit result
+
+Function Quote(value)
+    Quote = Chr(34) & value & Chr(34)
+End Function
+
+Sub WriteLog(message)
+    On Error Resume Next
+    Dim log
+    Set log = files.OpenTextFile(files.BuildPath(support, "vbs-launcher.log"), 8, True, -1)
+    If Err.Number = 0 Then
+        log.WriteLine CStr(Now) & " " & message
+        log.Close
+    End If
+    Err.Clear
+End Sub
+
+Sub Fail(code, message)
+    WriteLog "ERROR " & CStr(code) & ": " & message
+    WScript.Quit code
+End Sub
+'@
+    ($text -replace '\r?\n', "`r`n").TrimEnd("`r", "`n") + "`r`n"
+}
+
+function Get-SetupEntryCommand {
+    param([ValidateSet('prepare','prepare-register','finalize')][string]$Mode, [bool]$UseVbs)
+    if ($UseVbs) {
+        return '"%SystemRoot%\System32\wscript.exe" //B //NoLogo "%SystemRoot%\Setup\Scripts\Win11Lite\Run-Setup.vbs" ' + $Mode
+    }
+    '"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "%SystemRoot%\Setup\Scripts\Win11Lite\Win11Lite.ps1" -Mode ' + $Mode
+}
+
+function Test-ImageVbsLauncher {
+    param([string]$Image, [string]$Profile)
+    # Max deliberately removes the VBScript FoD, including pending removals.
+    if ($Profile -eq 'max') { return $false }
+    (Test-Path -LiteralPath (Join-Path $Image 'Windows\System32\wscript.exe') -PathType Leaf) -and
+    (Test-Path -LiteralPath (Join-Path $Image 'Windows\System32\vbscript.dll') -PathType Leaf)
+}
+
 # The single guest runtime, written into the image as
 # %SystemRoot%\Setup\Scripts\Win11Lite\Win11Lite.ps1. This literal is the only
 # copy: edit it here. No separate file, archive or download is involved.
@@ -2177,8 +2254,8 @@ function Test-OobeComplete {
     }
 }
 # Runs the requested mode as a hidden child of this same file, keeping its
-# output and exit code in launcher.log. Windows Setup entry points may still
-# flash the first console; no launcher executable is involved.
+# output and exit code in launcher.log. Run-Setup.vbs hides the initial process
+# too when VBScript is available; the PowerShell fallback can briefly flash.
 function Start-GuestChild {
     param([Parameter(Mandatory)][string]$ChildMode)
     $psi = [Diagnostics.ProcessStartInfo]::new()
@@ -5145,6 +5222,12 @@ $firefoxCmd = Get-FirefoxInstallerCommand -Language $imgLang -MozillaLanguage $m
 # Накопительные обновления умеют восстанавливать Defender, Edge и AI-компоненты
 # и сбрасывать политики. Скрипт запускается при каждом входе и правит это.
 $guardDir = Join-Path $mountDir 'Windows\Setup\Scripts\Win11Lite'
+$useVbsLauncher = Test-ImageVbsLauncher -Image $mountDir -Profile $Preset
+if ($useVbsLauncher) {
+    Write-Ok (T 'Запуск при установке: VBS без окна PowerShell' 'Setup launcher: VBS with hidden PowerShell')
+} else {
+    Write-Note (T 'Запуск при установке: PowerShell; VBScript отсутствует или удаляется в max, начальная консоль может появиться' 'Setup launcher: PowerShell; VBScript is unavailable or removed by max, so the initial console may appear')
+}
 if ($Guard -ne 'None') {
     $null = New-Item -ItemType Directory -Path $guardDir -Force
 
@@ -5234,6 +5317,14 @@ $supportDir = Join-Path $scriptsDir 'Win11Lite'
 $null = New-Item -ItemType Directory -Path $supportDir -Force
 # One guest file serves every entry point; build-info.json carries the choices.
 [IO.File]::WriteAllText((Join-Path $supportDir 'Win11Lite.ps1'), $guestScript, [Text.UTF8Encoding]::new($true))
+if ($useVbsLauncher) {
+    [IO.File]::WriteAllText((Join-Path $supportDir 'Run-Setup.vbs'), (Get-SetupVbsScript), [Text.Encoding]::ASCII)
+} elseif (Test-Path -LiteralPath (Join-Path $supportDir 'Run-Setup.vbs')) {
+    Remove-Item -LiteralPath (Join-Path $supportDir 'Run-Setup.vbs') -Force
+}
+$prepareCommand = Get-SetupEntryCommand -Mode prepare -UseVbs $useVbsLauncher
+$registerCommand = Get-SetupEntryCommand -Mode prepare-register -UseVbs $useVbsLauncher
+$finalizeCommand = Get-SetupEntryCommand -Mode finalize -UseVbs $useVbsLauncher
 $buildInfo = [ordered]@{
     BuildId = $script:StartedAt.ToString('yyyyMMdd-HHmmss')
     StartedAt = $script:StartedAt.ToString('o')
@@ -5256,7 +5347,7 @@ $buildInfo = [ordered]@{
     ManageOobe = [bool]$script:ManageOobe
     RemoveEdge = [bool](Test-GroupActive -RulePreset 'safe' -Group 'Edge')
     OobeCompletionCheck = 'OOBEComplete'
-    SetupScriptLauncher = 'PowerShell / Win11Lite.ps1'
+    SetupScriptLauncher = $(if ($useVbsLauncher) { 'VBScript / Run-Setup.vbs -> Win11Lite.ps1' } else { 'PowerShell / Win11Lite.ps1' })
     ServicingDismVersion = [string](Get-NativeToolVersion $script:Dism)
     AccountMode = $AccountMode
 } | ConvertTo-Json -Depth 4
@@ -5265,7 +5356,7 @@ $buildInfo = [ordered]@{
 Write-Ok (T "ID сборки: $($script:StartedAt.ToString('yyyyMMdd-HHmmss')) — записан в ISO и установленную Windows" "Build ID: $($script:StartedAt.ToString('yyyyMMdd-HHmmss')) - recorded in the ISO and installed Windows")
 $setupComplete = @"
 @echo off
-"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "%SystemRoot%\Setup\Scripts\Win11Lite\Win11Lite.ps1" -Mode prepare-register >> "%SystemRoot%\Setup\Scripts\Win11Lite\setupcomplete.log" 2>&1
+$registerCommand >> "%SystemRoot%\Setup\Scripts\Win11Lite\setupcomplete.log" 2>&1
 exit /b %errorlevel%
 "@
 Write-WindowsBatchFile -Path (Join-Path $scriptsDir 'SetupComplete.cmd') -Content $setupComplete
@@ -5317,6 +5408,9 @@ if ($Preset -eq 'balanced') {
 
 # В balanced проверяем файлы после всех действий DISM, которые могли их восстановить.
 if ($Preset -eq 'balanced') { Assert-ImageFileState -Image $mountDir }
+if ($useVbsLauncher -and -not (Test-ImageVbsLauncher -Image $mountDir -Profile $Preset)) {
+    throw (T 'Средства VBScript исчезли после обслуживания образа; запуск установки не будет работать' 'VBScript host or engine disappeared after servicing; the setup launcher would not work')
+}
 
 # --- boot.wim: обход требований и выбор установщика ---
 if (-not $NoBypass -or $LegacySetup -or $setupPayload) {
@@ -5463,7 +5557,7 @@ if ($Unattend -eq 'none') {
                 <RunSynchronousCommand wcm:action="add">
                     <Order>1</Order>
                     <Description>Prepare first logon and OOBE</Description>
-                    <Path>"%WINDIR%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "%WINDIR%\Setup\Scripts\Win11Lite\Win11Lite.ps1" -Mode prepare</Path>
+                    <Path>$prepareCommand</Path>
                 </RunSynchronousCommand>
             </RunSynchronous>
         </component>
@@ -5512,7 +5606,7 @@ if ($Unattend -eq 'none') {
                 <SynchronousCommand wcm:action="add">
                     <Order>1</Order>
                     <Description>Finish installation</Description>
-                    <CommandLine>"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "%SystemRoot%\Setup\Scripts\Win11Lite\Win11Lite.ps1" -Mode finalize</CommandLine>
+                    <CommandLine>$finalizeCommand</CommandLine>
                 </SynchronousCommand>
             </FirstLogonCommands>$localAccountXml
         </component>

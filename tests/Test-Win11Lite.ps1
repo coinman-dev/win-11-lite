@@ -35,7 +35,7 @@ foreach ($name in @('T','Get-GuestScript','Test-DismSuccess','ConvertFrom-DismLi
     . ([scriptblock]::Create($node.Extent.Text))
 }
 $script:Lang = 'en'
-foreach ($name in @('Get-ImageInstallXml','Get-ProductKeyUiMode','Get-LocalAccountXml','Assert-LocalUserName')) {
+foreach ($name in @('Get-ImageInstallXml','Get-ProductKeyUiMode','Get-LocalAccountXml','Assert-LocalUserName','Get-SetupEntryCommand')) {
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     . ([scriptblock]::Create($node.Extent.Text))
 }
@@ -478,7 +478,8 @@ try {
     # Evaluate the actual answer-file expressions, then parse the resulting XML.
     $imgLang = 'ru-RU'; $setupLang = 'en-US'; $ProductKey = ''; $CompactOS = $false; $NoOobeNetworkBlock = $false
     $selected=[pscustomobject]@{EditionId='IoTEnterpriseS'}; $LocalUserName=''; $LocalUserPassword=$null
-    foreach ($name in @('setupInputLocale','compactBlock','localAccountXml','productKeyUi','escapedProductKey','productKeyValue','oobeNetBlock','unattendXml')) {
+    $useVbsLauncher=$true
+    foreach ($name in @('prepareCommand','registerCommand','finalizeCommand','setupInputLocale','compactBlock','localAccountXml','productKeyUi','escapedProductKey','productKeyValue','oobeNetBlock','unattendXml')) {
         $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq ('$' + $name) }, $true)
         . ([scriptblock]::Create($node.Extent.Text))
     }
@@ -488,13 +489,13 @@ try {
     Assert (@($xml.SelectNodes('//u:InputLocale',$ns) | Where-Object { $_.InnerText -ne '0419:00000419;0409:00000409' }).Count -eq 0) 'Windows Setup configures both Russian and English keyboards without a logon language script'
     Assert ($xml.SelectSingleNode('//u:settings[@pass="windowsPE"]/u:component[@name="Microsoft-Windows-International-Core-WinPE"]/u:UILanguage',$ns).InnerText -eq 'ru-RU') 'Windows default language is not overwritten by English Setup UI'
     $firstCommand = $xml.SelectSingleNode('//u:FirstLogonCommands/u:SynchronousCommand/u:CommandLine',$ns).InnerText
-    Assert ($firstCommand -match 'Win11Lite\.ps1" -Mode finalize$' -and $firstCommand -match 'powershell\.exe') 'Answer file starts finalization through standard PowerShell'
-    Assert ($xml.SelectSingleNode('//u:RunSynchronousCommand/u:Path',$ns).InnerText -match 'Win11Lite\.ps1" -Mode prepare$') 'Specialize uses the hidden PowerShell runner'
+    Assert ($firstCommand -match 'Run-Setup\.vbs" finalize$' -and $firstCommand -match 'wscript\.exe') 'Answer file starts finalization through the windowless VBS launcher'
+    Assert ($xml.SelectSingleNode('//u:RunSynchronousCommand/u:Path',$ns).InnerText -match 'Run-Setup\.vbs" prepare$') 'Specialize uses the windowless VBS launcher'
     $node = $ast.Find({param($n) $n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$setupComplete'}, $true)
     . ([scriptblock]::Create($node.Extent.Text))
-    Assert ($setupComplete -match 'powershell\.exe".*Win11Lite\.ps1" -Mode prepare-register' -and $setupComplete -match 'setupcomplete.log' -and $setupComplete -notmatch '>>[^\r\n]*prepare.log') 'SetupComplete waits for PowerShell without locking the preparation log'
+    Assert ($setupComplete -match 'wscript\.exe".*Run-Setup\.vbs" prepare-register' -and $setupComplete -match 'setupcomplete.log' -and $setupComplete -notmatch '>>[^\r\n]*prepare.log') 'SetupComplete waits for the hidden launcher without locking the preparation log'
     Assert ($xml.SelectSingleNode('//u:settings[@pass="specialize"]/u:component[@name="Microsoft-Windows-International-Core"]/u:UILanguage',$ns).InnerText -eq 'ru-RU') 'System language applied before OOBE'
-    Assert ($xml.SelectSingleNode('//u:RunSynchronousCommand/u:Path',$ns).InnerText -match 'Win11Lite\.ps1" -Mode prepare$') 'Specialize registers finalization through the preparation mode'
+    Assert ($xml.SelectSingleNode('//u:RunSynchronousCommand/u:Path',$ns).InnerText -match 'Run-Setup\.vbs" prepare$') 'Specialize registers finalization through the preparation mode'
     & {
         function Invoke-Dism { param($Arguments,[switch]$Quiet) [pscustomobject]@{ExitCode=0;Output=@('State : Installed')} }
         $image = Join-Path $testRoot 'language-image'
