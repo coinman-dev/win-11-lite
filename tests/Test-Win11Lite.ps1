@@ -35,6 +35,10 @@ foreach ($name in @('T','Get-GuestScript','Test-DismSuccess','ConvertFrom-DismLi
     . ([scriptblock]::Create($node.Extent.Text))
 }
 $script:Lang = 'en'
+foreach ($name in @('Get-FreeGB','Resolve-WorkDirectory')) {
+    $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
+    . ([scriptblock]::Create($node.Extent.Text))
+}
 foreach ($name in @('Get-ImageInstallXml','Get-ProductKeyUiMode','Get-LocalAccountXml','Assert-LocalUserName','Get-SetupEntryCommand')) {
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     . ([scriptblock]::Create($node.Extent.Text))
@@ -225,6 +229,110 @@ try {
     $InputIso = Join-Path $work 'iso\source.iso'
     Assert (-not (Test-SafeToWipe $work)) 'Work containing input ISO is protected'
     $InputIso = Join-Path $testRoot 'source.iso'
+    & {
+        # Read-only disk probe keeps full precision: 44.99 GB must not pass 45 GB.
+        $probe=@{Free=44.99GB}
+        function Get-PSDrive { param($Name,$ErrorAction) [pscustomobject]@{Free=$probe.Free} }
+        Assert ((Get-FreeGB 'C:\fixture') -lt 45) 'Free-space comparison does not round a shortage up to the minimum'
+        $probe.Free=$null
+        Assert ($null -eq (Get-FreeGB 'C:\fixture')) 'Unavailable free-space measurement remains unknown'
+    }
+    & {
+        $selection=[regex]::Match($ast.Extent.Text,'(?ms)^\$workFreeGB = Get-FreeGB.*?(?=^# Перед каждым прогоном)').Value
+        if(-not $selection){throw 'Missing automatic disk selection'}
+        $disk=@{Free=44.2GB;Calls=0}
+        function Get-FreeGB {param($Path) 43.3}
+        function Get-CimInstance {param($ClassName,$Filter,$ErrorAction) $disk.Calls++;[pscustomobject]@{DeviceID='C:';FreeSpace=$disk.Free}}
+        $defaultWork=Join-Path $testRoot 'default-work';$WorkDir=$defaultWork;$requiredGB=45
+        $script:WorkDirExplicit=$false;$script:WorkDirMoved=$false
+        . ([scriptblock]::Create($selection))
+        Assert ($WorkDir -eq $defaultWork -and -not $script:WorkDirMoved) 'Automatic selection does not choose a larger disk that is still too small'
+        $disk.Free=45GB
+        . ([scriptblock]::Create($selection))
+        Assert ($WorkDir -eq 'C:\win-11-lite-work' -and $script:WorkDirMoved) 'Automatic selection accepts a disk meeting the full requirement'
+        $script:WorkDirExplicit=$true;$WorkDir=$defaultWork;$disk.Calls=0
+        . ([scriptblock]::Create($selection))
+        Assert ($WorkDir -eq $defaultWork -and $disk.Calls -eq 0) 'An explicit low-space path reaches the dialog instead of being silently replaced'
+        $script:WorkDirExplicit=$false;$script:WorkDirMoved=$false
+    }
+    & {
+        $low=Join-Path $testRoot 'low'
+        $enough=Join-Path $testRoot 'enough space'
+        $selected=Join-Path $enough 'win-11-lite-work'
+        $file=Join-Path $testRoot 'not-a-directory.txt'
+        [IO.File]::WriteAllText($file,'keep this file')
+        $dialog=@{Can=$true;Free=43.3;Prompts=[Collections.Generic.List[string]]::new();Notes=[Collections.Generic.List[string]]::new();Answers=[Collections.Generic.Queue[string]]::new()}
+        function Get-FreeGB {
+            param($Path)
+            if($Path -eq $selected){60}else{$dialog.Free}
+        }
+        function Test-CanPrompt {$dialog.Can}
+        function Read-Host {
+            param($Prompt)
+            $dialog.Prompts.Add($Prompt)
+            if(-not $dialog.Answers.Count){throw 'Unexpected prompt'}
+            $dialog.Answers.Dequeue()
+        }
+        function Write-Note {param($Message) $dialog.Notes.Add($Message)}
+        function Write-Ok {param($Message)}
+        foreach($lang in @('ru','en')) {
+            $script:Lang=$lang
+            $dialog.Prompts.Clear();$dialog.Notes.Clear()
+            # Blank, malformed, protected, file and still-low paths must all retry.
+            foreach($answer in @(' ',('bad'+[char]0+'path'),$env:ProgramFiles,$file,$low,('"'+$enough+'"'))){$dialog.Answers.Enqueue($answer)}
+            $result=Resolve-WorkDirectory -Path $low -RequiredGB 45
+            Assert ($result -eq $selected -and $dialog.Prompts.Count -eq 6) "Space gate keeps asking until a safe directory has enough room ($lang)"
+            Assert ($dialog.Notes[0] -match '43[.,]3' -and $dialog.Notes[0] -match '45') "Space gate explains actual and required capacity ($lang)"
+            Assert ($dialog.Prompts[0] -match $(if($lang -eq 'ru'){'Введите другой рабочий каталог'}else{'Enter another work directory'})) "Replacement prompt follows the builder language ($lang)"
+        }
+        $script:Lang='en';$dialog.Prompts.Clear()
+        $result=Resolve-WorkDirectory -Path ($selected+'\') -RequiredGB 45
+        Assert ($result -eq $selected -and $dialog.Prompts.Count -eq 0) 'Valid existing work suffix is preserved without asking again'
+        Push-Location $testRoot
+        try {
+            Assert ((Resolve-WorkDirectory -Path '.\enough space' -RequiredGB 45) -eq $selected) 'Relative replacement follows the PowerShell working directory'
+        } finally {Pop-Location}
+        $dialog.Free=30
+        Assert ((Resolve-WorkDirectory -Path $low -RequiredGB 30) -eq (Join-Path $low 'win-11-lite-work')) 'The exact 30 GB threshold passes for a build without updates'
+        $dialog.Free=45
+        Assert ((Resolve-WorkDirectory -Path $low -RequiredGB 45) -eq (Join-Path $low 'win-11-lite-work')) 'The exact 45 GB threshold passes with updates'
+        $dialog.Free=43.3;$dialog.Can=$false
+        $failure=''
+        try {Resolve-WorkDirectory -Path $low -RequiredGB 45 | Out-Null} catch {$failure=$_.Exception.Message}
+        Assert ($failure -match 'Build stopped' -and $failure -match '-WorkDir') 'Non-interactive shortage is fatal and names the replacement parameter'
+        $dialog.Free=44.99
+        $failure=''
+        try {Resolve-WorkDirectory -Path $low -RequiredGB 45 | Out-Null} catch {$failure=$_.Exception.Message}
+        Assert ($failure -match '44[.,]9 GB' -and $failure -match 'Build stopped') 'A fractional shortage stops the build without rounding the display up to 45 GB'
+        $dialog.Free=29.9
+        Assert-Throws {Resolve-WorkDirectory -Path $low -RequiredGB 30} 'A build without updates also stops below its minimum'
+        $dialog.Free=$null
+        Assert-Throws {Resolve-WorkDirectory -Path $low -RequiredGB 45} 'An unmeasurable disk cannot silently start a real build'
+        foreach($free in @(43.3,$null)) {
+            $dialog.Free=$free
+            Assert ((Resolve-WorkDirectory -Path $low -RequiredGB 45 -Preview) -eq (Join-Path $low 'win-11-lite-work')) 'DryRun can show a plan without sufficient or measurable space'
+        }
+        Assert ($dialog.Prompts.Count -eq 0) 'Non-interactive failures and DryRun never ask for input'
+        $dialog.Can=$true;$dialog.Answers.Enqueue($enough)
+        Assert ((Resolve-WorkDirectory -Path $low -RequiredGB 45) -eq $selected) 'Unknown capacity can be corrected through the same dialog'
+        Assert ((Get-Content -LiteralPath $file -Raw) -eq 'keep this file' -and -not (Test-Path -LiteralPath $selected)) 'Validation does not create or remove work directories or input files'
+
+        # Exercise actual path initialization, not a copy, so cache/mount paths follow the answer.
+        $initialization=[regex]::Match($ast.Extent.Text,'(?ms)^\$WorkDir = Resolve-WorkDirectory.*?(?=^#region[^\r\n]*Журналы сборки)').Value
+        if(-not $initialization){throw 'Missing work path initialization'}
+        $DryRun=$false;$requiredGB=45;$UpdatesDir='';$WorkDir=$low
+        $dialog.Free=43.3;$dialog.Answers.Enqueue($enough)
+        . ([scriptblock]::Create($initialization))
+        Assert ($WorkDir -eq $selected -and $mountDir -eq (Join-Path $selected 'mount') -and $isoDir -eq (Join-Path $selected 'iso') -and $bootMountDir -eq (Join-Path $selected 'bootmount') -and $wimPath -eq (Join-Path $selected 'install.wim')) 'All actual work paths use the accepted replacement'
+        Assert ($UpdatesDir -eq (Join-Path $enough 'win-11-lite-updates')) 'Default cache moves beside the replacement work directory'
+        $explicitCache=Join-Path $testRoot 'explicit-cache';$UpdatesDir=$explicitCache;$WorkDir=$low
+        $dialog.Answers.Enqueue($enough)
+        . ([scriptblock]::Create($initialization))
+        Assert ($UpdatesDir -eq $explicitCache) 'An explicitly selected update cache is preserved'
+        $dialog.Can=$false;$WorkDir=$low;$continued=$false
+        try {. ([scriptblock]::Create($initialization));$continued=$true} catch {}
+        Assert (-not $continued) 'Actual initialization cannot proceed after an uncorrected shortage'
+    }
     $updateDir = Join-Path $testRoot 'updates'; $null = New-Item -ItemType Directory -Path $updateDir
     Set-Content -LiteralPath (Join-Path $updateDir 'checkpoint.msu') -Value ('x' * 100)
     Set-Content -LiteralPath (Join-Path $updateDir 'target.msu') -Value 'x'

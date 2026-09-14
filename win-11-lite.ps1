@@ -92,8 +92,8 @@ param(
     [string]$OutputIso,
 
     # Рабочий каталог. Удаляется после сборки (если не задан -KeepWorkDir).
-    # По умолчанию — временная папка Windows; если на её диске меньше 40 ГБ,
-    # скрипт сам перенесёт работу на локальный диск с наибольшим свободным местом.
+    # По умолчанию — временная папка Windows; нужно 30 ГБ, с обновлениями 45 ГБ.
+    # При нехватке места выбирается подходящий диск или запрашивается новый путь.
     [Alias('TmpDir', 'Temp', 'Work')]
     [string]$WorkDir,
 
@@ -3822,7 +3822,7 @@ if ($script:WizardMode) {
     # 3. Рабочая папка
     Write-Host ''
     $defaultWork = $WorkDir
-    $WorkDir = Read-PathOrDefault -Question (T 'Рабочая папка для сборки (нужно ~30 ГБ)' 'Work folder for the build (about 30 GB needed)') -Default $defaultWork
+    $WorkDir = Read-PathOrDefault -Question (T 'Рабочая папка для сборки (30 ГБ, с обновлениями 45 ГБ)' 'Work folder for the build (30 GB, 45 GB with updates)') -Default $defaultWork
     $script:WorkDirExplicit = $true
 
     # 4. Глубина чистки
@@ -3989,11 +3989,6 @@ if (-not $LogFile -and $script:DebugMode) {
     $LogFile = Join-Path $script:ScriptRoot ("log\{0}_{1:yyyyMMdd-HHmmss}.log" -f $isoName, (Get-Date))
 }
 if ($LogFile) { $LogFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogFile) }
-if (-not $DryRun) {
-    $null = New-Item -ItemType Directory -Path (Split-Path $OutputIso -Parent) -Force
-    $script:ImageAuditPath = [IO.Path]::ChangeExtension($OutputIso, '.image-audit.json')
-}
-
 # --- выбор рабочего каталога ---
 # Пиковое потребление: распакованный ISO + растущий install.wim + scratch.
 # С интеграцией обновлений добавляются ещё и сами .msu.
@@ -4004,7 +3999,7 @@ function Get-FreeGB {
     $qualifier = Split-Path $Path -Qualifier
     if (-not $qualifier) { return $null }   # UNC-путь — измерить не можем
     $drive = Get-PSDrive -Name $qualifier.TrimEnd(':') -ErrorAction SilentlyContinue
-    if ($drive) { [math]::Round($drive.Free / 1GB, 1) } else { $null }
+    if ($drive -and $null -ne $drive.Free) { $drive.Free / 1GB } else { $null }
 }
 
 $workFreeGB = Get-FreeGB $WorkDir
@@ -4013,7 +4008,7 @@ if ($null -ne $workFreeGB -and $workFreeGB -lt $requiredGB -and -not $script:Wor
     # диск с наибольшим свободным местом
     $best = Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' -ErrorAction SilentlyContinue |
             Sort-Object FreeSpace -Descending | Select-Object -First 1
-    if ($best -and ($best.FreeSpace / 1GB) -gt $workFreeGB) {
+    if ($best -and ($best.FreeSpace / 1GB) -ge $requiredGB) {
         $WorkDir = Join-Path "$($best.DeviceID)\" 'win-11-lite-work'
         $script:WorkDirMoved = $true
     }
@@ -4064,10 +4059,52 @@ function Test-SafeToWipe {
     $true
 }
 
-if ((Split-Path $WorkDir -Leaf) -ne $script:WorkDirLeaf) {
-    $WorkDir = Join-Path $WorkDir $script:WorkDirLeaf
+function Resolve-WorkDirectory {
+    param([string]$Path, [int]$RequiredGB, [switch]$Preview)
+
+    while ($true) {
+        try {
+            if ([string]::IsNullOrWhiteSpace($Path)) { throw (T 'Путь не может быть пустым.' 'The path cannot be empty.') }
+            $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path.Trim().Trim('"'))
+            $full = [IO.Path]::GetFullPath($full).TrimEnd('\', '/')
+            if ($full -match '^[A-Za-z]:$') { $full += '\' }
+            if ((Split-Path $full -Leaf) -ne $script:WorkDirLeaf) {
+                $full = Join-Path $full $script:WorkDirLeaf
+            }
+            if (-not (Test-SafeToWipe $full)) { throw (T "Небезопасный рабочий каталог: $full" "Unsafe work directory: $full") }
+            $cursor = $full
+            while ($cursor) {
+                if (Test-Path -LiteralPath $cursor -PathType Leaf) { throw (T "Вместо папки указан файл: $cursor" "A file was specified instead of a directory: $cursor") }
+                $cursor = Split-Path $cursor -Parent
+            }
+            $free = Get-FreeGB $full
+            if ($null -ne $free -and $free -ge $RequiredGB) {
+                $displayFree = [math]::Round($free, 1)
+                Write-Ok (T "Для $full свободно $displayFree ГБ (нужно не менее $RequiredGB ГБ)" "$displayFree GB free for $full (at least $RequiredGB GB required)")
+                return $full
+            }
+            $problem = if ($null -eq $free) {
+                T "Не удалось определить свободное место для $full — нужно не менее $RequiredGB ГБ." "Could not determine free space for $full - at least $RequiredGB GB required."
+            } else {
+                # Не показывать «45 ГБ, нужно 45 ГБ» при фактических 44.99 ГБ.
+                $displayFree = [math]::Floor($free * 10) / 10
+                T "Для $full свободно $displayFree ГБ, нужно не менее $RequiredGB ГБ." "Only $displayFree GB free for $full, at least $RequiredGB GB required."
+            }
+            if ($Preview) { Write-Note $problem; return $full }
+        } catch {
+            if ($Preview) { throw }
+            $problem = $_.Exception.Message
+        }
+        if (-not (Test-CanPrompt)) {
+            throw (T "$problem Сборка остановлена. Укажите другой путь через -WorkDir." "$problem Build stopped. Specify another path with -WorkDir.")
+        }
+        Write-Note $problem
+        $Path = Read-Host (T '  Введите другой рабочий каталог (сборка ждёт подходящий путь)' '  Enter another work directory (build waits for a suitable path)')
+    }
 }
 
+# Сначала принимаем подходящий путь, затем вычисляем кэш и все рабочие файлы.
+$WorkDir = Resolve-WorkDirectory -Path $WorkDir -RequiredGB $requiredGB -Preview:$DryRun
 if (-not $UpdatesDir) { $UpdatesDir = Join-Path (Split-Path $WorkDir -Parent) 'win-11-lite-updates' }
 $UpdatesDir = [IO.Path]::GetFullPath($UpdatesDir)
 if ($UpdatesDir -eq $WorkDir -or $UpdatesDir.StartsWith("$WorkDir\", [StringComparison]::OrdinalIgnoreCase)) {
@@ -4079,6 +4116,11 @@ $mountDir = Join-Path $WorkDir 'mount'
 $isoDir = Join-Path $WorkDir 'iso'
 $bootMountDir = Join-Path $WorkDir 'bootmount'
 $wimPath = Join-Path $WorkDir 'install.wim'
+
+if (-not $DryRun) {
+    $null = New-Item -ItemType Directory -Path (Split-Path $OutputIso -Parent) -Force
+    $script:ImageAuditPath = [IO.Path]::ChangeExtension($OutputIso, '.image-audit.json')
+}
 
 #region ── Журналы сборки ────────────────────────────────────────────────────
 $script:Transcribing = $false
@@ -4133,15 +4175,6 @@ $script:Oscdimg = $null
 # --- место на диске ---
 if ($script:WorkDirMoved) {
     Write-Note (T "Во временной папке Windows меньше $requiredGB ГБ — работаю в $WorkDir" "Less than $requiredGB GB in the Windows temp folder - working in $WorkDir")
-}
-$workDrive = Split-Path $WorkDir -Qualifier
-$freeGB = Get-FreeGB $WorkDir
-if ($null -eq $freeGB) {
-    Write-Note (T "Не удалось определить свободное место для $WorkDir — нужно не менее $requiredGB ГБ" "Could not determine free space for $WorkDir - at least $requiredGB GB required")
-} elseif ($freeGB -lt $requiredGB) {
-    Write-Note (T "На $workDrive свободно $freeGB ГБ, нужно не менее $requiredGB ГБ. Укажите другой путь через -WorkDir" "Only $freeGB GB free on $workDrive, at least $requiredGB GB required. Use -WorkDir to pick another location")
-} else {
-    Write-Ok (T "Свободно на $workDrive : $freeGB ГБ (нужно ~$requiredGB ГБ)" "Free on $workDrive : $freeGB GB (about $requiredGB GB needed)")
 }
 
 # --- источник языков ---
