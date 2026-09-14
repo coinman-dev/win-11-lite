@@ -363,6 +363,8 @@ The table covers every user-facing parameter. Run `Get-Help .\win-11-lite.ps1 -F
 
 ## Firefox shortcut
 
+The builder reports the Firefox download language when generating the shortcut, after Windows language integration is complete.
+
 The finished Windows image contains `Install-Firefox.cmd` on the Public Desktop. At run time it:
 
 1. tries winget from the `winget` source only, avoiding a broken `msstore` source;

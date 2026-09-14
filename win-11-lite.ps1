@@ -4320,7 +4320,6 @@ $AccountMode=$account.Mode; $LocalUserName=$account.Name; $LocalUserPassword=$ac
 
 $mozLang = $script:MozillaLang[$imgLang]
 if (-not $mozLang) { $mozLang = ($imgLang -split '-')[0] }
-Write-Ok (T "Язык для загрузки Firefox: $mozLang" "Firefox download language: $mozLang")
 
 #endregion
 
@@ -4763,7 +4762,6 @@ if ($AddLanguage) {
         $imgLang = $primary
         $mozLang = $script:MozillaLang[$primary]
         if (-not $mozLang) { $mozLang = ($primary -split '-')[0] }
-        Write-Ok (T "Язык для загрузки Firefox: $mozLang" "Firefox download language: $mozLang")
         Write-Ok (T "Язык установщика: $setupLang" "Setup language: $setupLang")
     } else {
         throw (T 'Ни один запрошенный язык не установлен' 'No requested language was installed')
@@ -5251,6 +5249,7 @@ if ($WithWinget) {
 # --- ярлык Install-Firefox ---
 # Тексты внутри ярлыка — на языке, который получит установленная система
 $firefoxCmd = Get-FirefoxInstallerCommand -Language $imgLang -MozillaLanguage $mozLang
+Write-Ok (T "Язык для загрузки Firefox: $mozLang" "Firefox download language: $mozLang")
 # --- сторож: возвращает систему в нужное состояние после обновлений ---
 # Накопительные обновления умеют восстанавливать Defender, Edge и AI-компоненты
 # и сбрасывать политики. Скрипт запускается при каждом входе и правит это.
