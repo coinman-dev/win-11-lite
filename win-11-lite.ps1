@@ -856,10 +856,11 @@ try { $script:CanDrawProgress = -not [Console]::IsOutputRedirected } catch { }
 # убирается совсем, чтобы строка никогда не доходила до столбца переноса.
 function Get-ProgressLine {
     param([string]$Activity, [int]$Percent, [int]$Phase = 1, [TimeSpan]$Elapsed,
-          [int]$Width = 80, [switch]$Done, [switch]$Failed)
+          [int]$Width = 80, [switch]$Done, [switch]$Failed, [TimeSpan]$IdleFor = [TimeSpan]::Zero)
     $limit = [Math]::Max(1, $Width - 1) # Последний столбец вызывает перенос строки.
     $percent = [Math]::Max(0, [Math]::Min(100, $Percent))
     $waiting = -not $Done -and $percent -eq 100
+    $indeterminate = -not $Done -and ($waiting -or $IdleFor.TotalMinutes -ge 5)
     if ($Done -and -not $Failed) { $percent = 100 }
     $time = '{0:00}:{1:00}' -f [Math]::Floor($Elapsed.TotalMinutes), $Elapsed.Seconds
     $activityText = ($Activity -replace '[\r\n\t]', ' ')
@@ -870,13 +871,14 @@ function Get-ProgressLine {
     if ($Done) { $activityText += if ($Failed) { T ' — ОШИБКА' ' - FAILED' } else { T ' — готово' ' - done' } }
     elseif ($Phase -gt 1) { $activityText += (T ' (этап ' ' (phase ') + "$Phase)" }
     if ($waiting) { $activityText = (T 'ожидание завершения — ' 'waiting for completion - ') + $activityText }
-    $percentText = if ($Done -and $Failed) { ' ERR' } elseif ($waiting) { ' ...' } else { '{0,3}%' -f $percent }
+    $percentText = if ($Done -and $Failed) { ' ERR' } elseif ($indeterminate) { ' ...' } else { '{0,3}%' -f $percent }
     $tail = ' {0}  {1}  {2}' -f $percentText, $time, $activityText
     $barWidth = [Math]::Min(40, $limit - 2 - 2 - $tail.Length)
     $line = if ($barWidth -ge 8) {
-        if ($waiting) {
+        if ($indeterminate) {
             # 100% от утилиты не означает, что процесс уже завершён. Не рисуем
             # выдуманные 99%: пока ждём выхода/нового этапа, показываем движение.
+            # Тот же индикатор используется после пяти минут без нового процента.
             $position = [int]([Math]::Max(0, [Math]::Floor($Elapsed.TotalMilliseconds / 500)) % ($barWidth - 2))
             '  [' + ('·' * $position) + '███' + ('·' * ($barWidth - $position - 3)) + ']' + $tail
         } else {
@@ -889,7 +891,8 @@ function Get-ProgressLine {
 }
 
 function Write-ProgressBar {
-    param([string]$Activity, [int]$Percent, [int]$Phase = 1, [switch]$Done, [switch]$Failed)
+    param([string]$Activity, [int]$Percent, [int]$Phase = 1, [switch]$Done, [switch]$Failed,
+          [TimeSpan]$IdleFor = [TimeSpan]::Zero)
     if (-not $script:CanDrawProgress) { return }
     $width = 80
     try {
@@ -897,7 +900,7 @@ function Write-ProgressBar {
         if ($width -lt 2) { return }
     } catch { return }
     $elapsed = if ($script:ProgressStarted) { (Get-Date) - $script:ProgressStarted } else { [TimeSpan]::Zero }
-    $line = Get-ProgressLine -Activity $Activity -Percent $Percent -Phase $Phase -Elapsed $elapsed -Width $width -Done:$Done -Failed:$Failed
+    $line = Get-ProgressLine -Activity $Activity -Percent $Percent -Phase $Phase -Elapsed $elapsed -Width $width -Done:$Done -Failed:$Failed -IdleFor $IdleFor
     # Прямая запись в консоль не засоряет transcript каждым кадром.
     # Цвет ставим на уровне консоли, а не Write-Host, по той же причине.
     $previous = [Console]::ForegroundColor
@@ -908,16 +911,29 @@ function Write-ProgressBar {
     if ($Done) { [Console]::WriteLine() }
 }
 
+function Set-ProgressValue {
+    param([hashtable]$State, [double]$Value, [switch]$TrackPhase)
+    $value = [Math]::Max([double]0, [Math]::Min([double]100, $Value))
+    # Повтор одного процента и обычные строки журнала не продлевают ожидание.
+    # Дробное продвижение учитывается, даже если видимый целый процент прежний.
+    if ($null -eq $State.ProgressValue -or $State.ProgressValue -ne $value) {
+        $State.LastProgressAt = Get-Date
+    }
+    $State.ProgressValue = $value
+    $percent = [int][Math]::Floor($value)
+    if ($TrackPhase -and $State.Percent -ge 0 -and $percent -lt $State.Percent) { $State.Phase++ }
+    $State.Percent = $percent
+}
+
 function Update-ProgressState {
     param([hashtable]$State, [string]$Text)
     $text = $Text.Trim()
     if (-not $text) { return }
-    if ($text -match '(\d{1,3})(?:[.,]\d+)?%') {
-        $percent = [Math]::Min(100, [int]$matches[1])
+    if ($text -match '(\d{1,3}(?:[.,]\d+)?)%') {
+        $value = [double]::Parse($matches[1].Replace(',', '.'), [Globalization.CultureInfo]::InvariantCulture)
         # Один Add-Package может обслуживать checkpoint и целевой пакет.
         # DISM не сообщает общий процент: показываем отдельные этапы честно.
-        if ($State.Percent -ge 0 -and $percent -lt $State.Percent) { $State.Phase++ }
-        $State.Percent = $percent
+        Set-ProgressValue -State $State -Value $value -TrackPhase
     } else { $State.Lines.Add($text) }
 }
 
@@ -1006,7 +1022,7 @@ function Invoke-ProgressProcess {
     $script:ProgressStarted = Get-Date
     $lines = [System.Collections.Generic.List[string]]::new()
     $buffer = New-Object System.Text.StringBuilder
-    $state = @{ Percent = -1; Phase = 1; Lines = $lines }
+    $state = @{ Percent = -1; Phase = 1; Lines = $lines; LastProgressAt = $script:ProgressStarted }
     $exitCode = -1
     try {
         $null = $proc.Start()
@@ -1037,8 +1053,14 @@ function Invoke-ProgressProcess {
             }
             if (((Get-Date) - $lastDraw).TotalMilliseconds -ge 500) {
                 # Отказ внешнего счётчика гасим: индикация не должна ломать сборку.
-                if ($GetPercent) { try { $state.Percent = [int](& $GetPercent) } catch { } }
-                Write-ProgressBar -Activity $Activity -Percent ([Math]::Max(0, $state.Percent)) -Phase $state.Phase
+                if ($GetPercent) {
+                    try {
+                        $sample = & $GetPercent
+                        if ($null -ne $sample) { Set-ProgressValue -State $state -Value ([double]$sample) }
+                    } catch { }
+                }
+                $idleFor = (Get-Date) - $state.LastProgressAt
+                Write-ProgressBar -Activity $Activity -Percent ([Math]::Max(0, $state.Percent)) -Phase $state.Phase -IdleFor $idleFor
                 $lastDraw = Get-Date
             }
             # Даже после закрытия stdout/stderr процесс может ещё работать.

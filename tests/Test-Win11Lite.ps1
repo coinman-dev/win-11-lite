@@ -35,7 +35,7 @@ foreach ($name in @('T','Get-GuestScript','Test-DismSuccess','ConvertFrom-DismLi
     . ([scriptblock]::Create($node.Extent.Text))
 }
 $script:Lang = 'en'
-foreach ($name in @('Get-FreeGB','Resolve-WorkDirectory')) {
+foreach ($name in @('Get-FreeGB','Resolve-WorkDirectory','Set-ProgressValue')) {
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     . ([scriptblock]::Create($node.Extent.Text))
 }
@@ -119,12 +119,57 @@ try {
             }
         }
         $script:Lang='en'
+        & {
+            $clock=@{Now=[datetime]'2026-09-14T12:00:00'}
+            function Get-Date {$clock.Now}
+            $state=@{Percent=-1;Phase=1;Lines=[Collections.Generic.List[string]]::new();LastProgressAt=$clock.Now}
+            Update-ProgressState -State $state -Text '1%'
+            $first=$state.LastProgressAt
+            $clock.Now=$clock.Now.AddSeconds(299)
+            Update-ProgressState -State $state -Text '1%'
+            Update-ProgressState -State $state -Text 'Still servicing packages'
+            Assert ($state.LastProgressAt -eq $first) 'Repeated percentage and ordinary output do not reset the inactivity timer'
+            $clock.Now=$clock.Now.AddSeconds(1)
+            $idle=$clock.Now-$state.LastProgressAt
+            Assert ($idle.TotalSeconds -eq 300) 'Five-minute interval is measured from the last changed percentage'
+            foreach($lang in @('ru','en')) {
+                $script:Lang=$lang
+                foreach($pct in @(0,1,50,99)) {
+                    $active=Get-ProgressLine -Activity 'KB5129195' -Percent $pct -Phase 2 -Elapsed ([TimeSpan]::FromSeconds(1107)) -IdleFor ([TimeSpan]::FromMilliseconds(299999)) -Width 132
+                    $idleLine=Get-ProgressLine -Activity 'KB5129195' -Percent $pct -Phase 2 -Elapsed ([TimeSpan]::FromSeconds(1107)) -IdleFor $idle -Width 132
+                    $nextLine=Get-ProgressLine -Activity 'KB5129195' -Percent $pct -Phase 2 -Elapsed ([TimeSpan]::FromSeconds(1107.5)) -IdleFor ($idle+[TimeSpan]::FromMilliseconds(500)) -Width 132
+                    Assert ($active -match ('\s'+$pct+'%') -and $active -notmatch '\.\.\.') "Percentage stays visible before five minutes ($lang/$pct)"
+                    Assert ($idleLine -notmatch '%' -and $idleLine -match '\.\.\.\s+18:27' -and $idleLine -match '███' -and $idleLine -match 'KB5129195') "Five minutes changes any incomplete percentage into animation with the operation timer ($lang/$pct)"
+                    Assert ($idleLine -ne $nextLine) "Stalled animation moves while keeping the same last percentage ($lang/$pct)"
+                }
+                $done=Get-ProgressLine -Activity 'KB5129195' -Percent 1 -Elapsed $idle -IdleFor $idle -Done -Width 132
+                $failed=Get-ProgressLine -Activity 'KB5129195' -Percent 1 -Elapsed $idle -IdleFor $idle -Done -Failed -Width 132
+                Assert ($done -match '100%' -and $done -notmatch '\.\.\.') "Success replaces stalled animation with completion ($lang)"
+                Assert ($failed -match 'ERR' -and $failed -notmatch '100%|\.\.\.') "Failure replaces stalled animation with an error ($lang)"
+                foreach($width in @(20,80,120)) {
+                    Assert ((Get-ProgressLine -Activity ('Long activity '+('x'*100)) -Percent 1 -Elapsed $idle -IdleFor $idle -Width $width).Length -lt $width) "Stalled animation fits narrow consoles ($lang/$width)"
+                }
+            }
+            $script:Lang='en'
+            Update-ProgressState -State $state -Text '20%'
+            Assert ($state.Percent -eq 20 -and $state.LastProgressAt -eq $clock.Now) 'New progress immediately ends the stalled interval'
+            $clock.Now=$clock.Now.AddMinutes(5)
+            Assert (($clock.Now-$state.LastProgressAt).TotalMinutes -eq 5) 'A second pause gets its own full five-minute interval'
+            Update-ProgressState -State $state -Text '0%'
+            Assert ($state.Phase -eq 2 -and $state.LastProgressAt -eq $clock.Now) 'A new phase resets inactivity even when its percentage decreases'
+            $clock.Now=$clock.Now.AddMinutes(1)
+            Update-ProgressState -State $state -Text '0,5%'
+            Assert ($state.Percent -eq 0 -and $state.LastProgressAt -eq $clock.Now) 'Fractional progress resets inactivity before the displayed integer changes'
+            $clock.Now=$clock.Now.AddMinutes(1)
+            Update-ProgressState -State $state -Text '0.5%'
+            Assert ($state.LastProgressAt -eq $clock.Now.AddMinutes(-1)) 'Equivalent dot and comma percentages do not count as new progress'
+        }
         $frames = [Collections.Generic.List[object]]::new()
         function Write-ProgressBar {
-            param($Activity,$Percent,$Phase=1,[switch]$Done,[switch]$Failed)
+            param($Activity,$Percent,$Phase=1,[switch]$Done,[switch]$Failed,[TimeSpan]$IdleFor=[TimeSpan]::Zero)
             $elapsed=(Get-Date)-$script:ProgressStarted
-            $rendered=Get-ProgressLine -Activity $Activity -Percent $Percent -Phase $Phase -Elapsed $elapsed -Width 132 -Done:$Done -Failed:$Failed
-            $frames.Add([pscustomobject]@{Percent=$Percent;Phase=$Phase;Done=[bool]$Done;Failed=[bool]$Failed;Elapsed=$elapsed;Line=$rendered})
+            $rendered=Get-ProgressLine -Activity $Activity -Percent $Percent -Phase $Phase -Elapsed $elapsed -Width 132 -Done:$Done -Failed:$Failed -IdleFor $IdleFor
+            $frames.Add([pscustomobject]@{Percent=$Percent;Phase=$Phase;Done=[bool]$Done;Failed=[bool]$Failed;Elapsed=$elapsed;IdleFor=$IdleFor;Line=$rendered})
         }
         $payload = '[Console]::Write("36%`r"); [Console]::Out.Flush(); Start-Sleep -Milliseconds 650; [Console]::Write("100%`r1%`r100%`r"); [Console]::Error.WriteLine("Simulated failure after progress reached 100%."); exit 5'
         $progressFixture = Join-Path $testRoot 'progress-simulation.ps1'
@@ -177,6 +222,35 @@ try {
             $run=Invoke-ProgressProcess -Exe 'never-executed.exe' -Activity 'Closed output streams'
             Assert (-not $fakeProcess.EarlyWait -and $fakeProcess.Disposed -and $run.ExitCode -eq 0) 'EOF does not cause a blocking wait before the process exits'
             Assert (@($frames | Where-Object {$_.Percent -eq 100 -and -not $_.Done}).Count -ge 2) 'Waiting indicator keeps refreshing after stdout/stderr close'
+        }
+        foreach($source in @('stdout','stderr','counter')) {
+            & {
+                # Real child processes with an accelerated parent clock exercise
+                # repeated stalls and recovery without a five-minute test delay.
+                $frames.Clear()
+                $clock=[Diagnostics.Stopwatch]::StartNew()
+                $epoch=[datetime]'2026-09-14T12:00:00'
+                function Get-Date {$epoch.AddSeconds($clock.Elapsed.TotalSeconds*600)}
+                $fixture=Join-Path $testRoot "stalled-$source.ps1"
+                $writer=if($source -eq 'stderr'){'Error'}else{'Out'}
+                $text=if($source -eq 'counter'){'Start-Sleep -Milliseconds 3600'}else{
+                    '[Console]::'+$writer+'.Write("1%`r"); [Console]::'+$writer+'.Flush(); Start-Sleep -Milliseconds 1400; [Console]::'+$writer+'.Write("40%`r"); [Console]::'+$writer+'.Flush(); Start-Sleep -Milliseconds 1400; [Console]::'+$writer+'.Write("75%`r"); [Console]::'+$writer+'.Flush(); Start-Sleep -Milliseconds 400'
+                }
+                [IO.File]::WriteAllText($fixture,$text,[Text.UTF8Encoding]::new($true))
+                $options=@{Exe=$psExe;Arguments=@('-NoProfile','-NonInteractive','-File',$fixture);Activity="Stalled $source";ProgressOnStdErr=($source -eq 'stderr')}
+                if($source -eq 'counter'){
+                    $options.GetPercent={if($clock.Elapsed.TotalSeconds -lt 1.4){1}elseif($clock.Elapsed.TotalSeconds -lt 2.8){40}else{75}}
+                }
+                $run=Invoke-ProgressProcess @options
+                foreach($pct in @(1,40)) {
+                    Assert (@($frames | Where-Object {$_.Percent -eq $pct -and -not $_.Done -and $_.Line -match '\.\.\.' -and $_.IdleFor.TotalMinutes -ge 5}).Count -gt 0) "Real runner animates a five-minute pause ($source/$pct)"
+                }
+                foreach($pct in @(40,75)) {
+                    Assert (@($frames | Where-Object {$_.Percent -eq $pct -and -not $_.Done -and $_.Line -match ('\s'+$pct+'%') -and $_.IdleFor.TotalMinutes -lt 5}).Count -gt 0) "Real runner resumes percentages after new data ($source/$pct)"
+                }
+                Assert ($run.ExitCode -eq 0 -and $frames[-1].Done -and $frames[-1].Line -match '100%') "Real runner still reports actual completion ($source)"
+                Assert ($frames[0].Line -notmatch '\.\.\.') "Every new operation starts with a fresh inactivity timer ($source)"
+            }
         }
         $copyRoot = Join-Path $testRoot 'copy-progress'
         $null = New-Item -ItemType Directory -Path $copyRoot
