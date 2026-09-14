@@ -196,14 +196,15 @@ try {
     }
 
     & {
-        $prompt = @{ Can = $true; Answer = $true; Calls = 0 }
+        $prompt = @{ Can = $true; Answer = $true; Calls = 0; Question = '' }
         function Test-CanPrompt { $prompt.Can }
-        function Read-YesNo { param($Question,$Default) $prompt.Calls++; Assert (-not $Default) 'Cancellation is default'; $prompt.Answer }
+        function Read-YesNo { param($Question,$Default) $prompt.Calls++; $prompt.Question=$Question; Assert (-not $Default) 'Cancellation is default'; $prompt.Answer }
         foreach ($lang in @('ru','en')) {
             $script:Lang = $lang; $notes.Clear(); $script:SkippedDownloads = @()
             Confirm-SkipDownload -Component 'winget' -Reason 'api.github.com DNS failure'
             Assert ($script:SkippedDownloads -contains 'winget' -and $notes[0] -match 'api.github.com') "Accepted skip keeps component and cause ($lang)"
             Assert ($notes[0] -match $(if ($lang -eq 'ru') { 'Не удалось подготовить' } else { 'Could not prepare' })) "Failure warning is localized ($lang)"
+            Assert ($prompt.Question -match $(if ($lang -eq 'ru') {'Продолжить без «winget»\? Введите Да чтобы продолжить сборку'} else {"Continue without 'winget'\? Enter Yes to continue the build"})) "Skip prompt explicitly says that Yes continues the build ($lang)"
         }
         $script:SkippedDownloads = @(); $prompt.Answer = $false
         Assert-Throws { Confirm-SkipDownload -Component 'winget' -Reason 'DNS' } 'User cancellation stops preparation'

@@ -1660,7 +1660,7 @@ function Confirm-SkipDownload {
     if (-not (Test-CanPrompt)) {
         throw (T "Сборка отменена: нельзя спросить, продолжать ли без $Component. Повторите запуск в интерактивной консоли или уберите этот компонент из параметров." "Build cancelled: cannot ask whether to continue without $Component. Run in an interactive console or remove this component from the options.")
     }
-    if (-not (Read-YesNo -Question (T "Продолжить без «$Component»? Нет — отменить сборку" "Continue without '$Component'? No cancels the build") -Default $false)) {
+    if (-not (Read-YesNo -Question (T "Продолжить без «$Component»? Введите Да чтобы продолжить сборку" "Continue without '$Component'? Enter Yes to continue the build") -Default $false)) {
         throw (T 'Сборка отменена до обработки образа' 'Build cancelled before image processing')
     }
     $script:SkippedDownloads += $Component
