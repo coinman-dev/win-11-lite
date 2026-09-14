@@ -11,7 +11,7 @@ if(-not $accessor){throw 'Missing Get-GuestScript'}
 . ([scriptblock]::Create($accessor.Extent.Text))
 $guestAst=[Management.Automation.Language.Parser]::ParseInput((Get-GuestScript),[ref]$t,[ref]$e)
 if($e.Count){throw ($e|Out-String)}
-foreach($name in 'Get-GuardMode','Get-GuardExpectedApps','Get-GuardControlText','Get-GuardBriefReport','Start-GuardViewer','Show-GuardView','New-GuardViewerAction','Register-GuardViewerTask','Remove-GuardSelectedPath'){
+foreach($name in 'Get-GuardMode','Get-GuardExpectedApps','Get-GuardControlText','Get-GuardBriefReport','Start-GuardViewer','Show-GuardView','Read-GuardLiveLog','Assert-GuestLogPath','New-GuardViewerAction','Register-GuardViewerTask','Remove-GuardSelectedPath'){
     $node=$guestAst.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     if(-not $node){throw "Missing guest function: $name"}
     . ([scriptblock]::Create($node.Extent.Text))

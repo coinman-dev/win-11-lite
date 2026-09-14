@@ -130,7 +130,7 @@ try{
             $env:PUBLIC=Join-Path $env:SystemDrive 'Users\Public'; $env:ProgramData=Join-Path $env:SystemDrive 'ProgramData'
             $browser=Join-Path $env:ProgramFiles 'Microsoft\Edge'; $webview=Join-Path $env:ProgramFiles 'Microsoft\EdgeWebView'; $remove=Join-Path $env:SystemDrive 'remove-me'
             $null=New-Item -ItemType Directory -Path $browser,$webview,$remove,$env:PUBLIC,$env:ProgramData -Force
-            $configFile=Join-Path $root 'guard.json'; $log=Join-Path $root 'guard.log'
+            $configFile=Join-Path $root 'guard.json'; $log=Join-Path $root ('Logs\'+(Get-Date -Format 'yyyy-MM-dd')+'.log')
             $testConfig=@{BuildId='test';RemoveEdge=$true;Policies=@('HKLM:\SOFTWARE\TestGuard|AllowTelemetry|0');Services=@('TestSvc');Capabilities=@('^TestCapability$','^Language\.', '');Apps=@('^Microsoft\.BingWeather$');Protected=@('^Language\.Basic~');Paths=@('remove-me')}
             $testConfig | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $configFile -Encoding UTF8
             function Get-ItemProperty {
@@ -191,7 +191,7 @@ try{
             function Import-Clixml {throw 'Edge-only cleanup must not restore adapters'}
             function Remove-ItemProperty {throw 'Edge-only cleanup must not re-enable updates'}
             & $guest -Mode guard -Direct
-            if($LASTEXITCODE -ne 0){throw (((Get-Content -LiteralPath $log -Tail 90)-join "`n")+"`n--- finalize.log ---`n"+((Get-Content -LiteralPath (Join-Path $root 'finalize.log') -ErrorAction SilentlyContinue)-join "`n"))}
+            if($LASTEXITCODE -ne 0){throw ((Get-Content -LiteralPath $log -Tail 90)-join "`n")}
             Assert ($LASTEXITCODE -eq 0 -and $fixture.Policy -eq 0) 'Guard checks run even while the finalization task still exists'
             Assert ($calls -contains 'stop-service') 'A running service is stopped even when Start is already 4'
             Assert ($calls -contains 'cap:TestCapability' -and $calls -notcontains 'cap:UnselectedCapability') 'Selected capability removed; empty regex never matches everything'
@@ -330,7 +330,7 @@ try{
             $fallback=$captured.ToString();$captured.Dispose()
             Assert ($lockedExit -eq 1 -and $fixture.Policy -eq 0 -and $calls -contains 'app' -and $calls -contains 'provisioned') 'Exclusive log failure is reported without aborting independent checks'
             Assert ($fallback -match '\[END\].*errors 0' -and $fallback -notmatch '\[ERROR\]') 'Logging failure is not counted as a failed policy or service'
-            Assert ($fallback -match '\[LOG ERROR\]' -and $fallback -match '\[START\]' -and $fallback -match 'Lines not written') 'Failed log records and a logging-specific summary are preserved on stderr'
+            Assert ($fallback -match '\[LOG ERROR\]' -and $fallback -match '\[START\]' -and $fallback -match 'Log/report write errors') 'Failed log records and a logging-specific summary are preserved on stderr'
             $lockProbe=[IO.File]::Open((Join-Path $root 'guard.lock'),[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
             $lockProbe.Dispose()
             Assert $true 'Run lock is released after logging failures'

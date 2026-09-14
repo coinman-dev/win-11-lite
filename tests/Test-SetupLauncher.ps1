@@ -18,6 +18,7 @@ function Assert([bool]$Value,[string]$Message){if(-not $Value){throw "FAIL: $Mes
 $root=Join-Path $repo ('tmp\runner-tests-'+[guid]::NewGuid().ToString('N'))
 $null=New-Item -ItemType Directory -Path $root
 $powershell=Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+function Get-FixtureLogPath([string]$Directory){Join-Path $Directory ('Logs\'+(Get-Date -Format 'yyyy-MM-dd')+'.log')}
 function New-GuestProcess([string]$Guest,[string]$Arguments,[string]$Directory){
     $psi=[Diagnostics.ProcessStartInfo]::new();$psi.FileName=$powershell
     $psi.Arguments='-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "'+$Guest+'" '+$Arguments
@@ -85,12 +86,12 @@ exit ([int]$env:RUNNER_TEST_EXIT)
             Assert ($actual.ConsoleWindow -eq 0) 'Runner child has no console window'
             Assert ($actual.Mode -eq $case.Mode -and $actual.Direct) 'The child runs the same file with the requested mode and does its work in process'
             Assert ($actual.Directory -eq $directory -and $actual.WorkingDirectory -eq $directory) 'Quoted paths and the working directory reach the child'
-            $vbsLog=Get-Content -LiteralPath (Join-Path $directory 'vbs-launcher.log') -Raw
+            $vbsLog=Get-Content -LiteralPath (Get-FixtureLogPath $directory) -Raw
             Assert ($vbsLog -match ('END mode='+$case.Mode+' ExitCode='+$case.Exit)) 'VBS records and returns the PowerShell exit code'
-            $log=Get-Content -LiteralPath (Join-Path $directory 'launcher.log') -Raw
+            $log=Get-Content -LiteralPath (Get-FixtureLogPath $directory) -Raw
             Assert ($log.Contains('Вывод для журнала') -and $log -match 'fixture stdout' -and $log -match 'fixture stderr') 'Russian output and stderr remain readable'
             Assert ($log -match "\[$($case.Mode)\] END ExitCode=$($case.Exit)") 'Completion status is logged against its mode'
-            Assert (-not (Test-Path -LiteralPath (Join-Path $directory 'prepare.log'))) 'The runner keeps its own log separate from the work logs'
+            Assert ($log -match '\[vbs-launcher\]' -and $log -match '\[launcher\]' -and -not (Test-Path -LiteralPath (Join-Path $directory 'prepare.log'))) 'VBS and PowerShell use one daily file with identifiable sources'
         }finally{$process.Dispose()}
     }
 
@@ -143,7 +144,7 @@ exit ([int]$env:RUNNER_TEST_EXIT)
             Assert ($process.ExitCode -eq $case.Exit) "A rejected request fails: '$($case.Arguments)'"
         }finally{$process.Dispose()}
     }
-    $rejected=Get-Content -LiteralPath (Join-Path $empty 'launcher.log') -Raw
+    $rejected=Get-Content -LiteralPath (Get-FixtureLogPath $empty) -Raw
     Assert ($rejected -match "Unsupported request: Mode=''; extra=''" -and $rejected -match "extra='extra'") 'Both a missing mode and an unexpected argument are recorded before exiting'
     $launcher=Join-Path $empty 'Run-Setup.vbs';[IO.File]::WriteAllText($launcher,(Get-SetupVbsScript),[Text.Encoding]::ASCII)
     foreach($arguments in '', 'unknown', 'prepare extra', 'view'){
@@ -155,11 +156,18 @@ exit ([int]$env:RUNNER_TEST_EXIT)
     }
     Assert (-not (Test-Path -LiteralPath (Join-Path $empty 'result.json'))) 'Rejected VBS requests never execute the guest worker'
     $missing=Join-Path $root 'missing-guest';$null=New-Item -ItemType Directory -Path $missing
+    $logFolder=Join-Path $missing 'Logs';$null=New-Item -ItemType Directory -Path $logFolder
+    $expiredLog=Join-Path $logFolder ((Get-Date).Date.AddDays(-30).ToString('yyyy-MM-dd')+'.log')
+    $retainedLog=Join-Path $logFolder ((Get-Date).Date.AddDays(-29).ToString('yyyy-MM-dd')+'.log')
+    $otherFile=Join-Path $logFolder '2000-01-01.txt'
+    foreach($file in @($expiredLog,$retainedLog,$otherFile)){[IO.File]::WriteAllText($file,'fixture',[Text.Encoding]::Unicode)}
     $launcher=Join-Path $missing 'Run-Setup.vbs';[IO.File]::WriteAllText($launcher,(Get-SetupVbsScript),[Text.Encoding]::ASCII)
     $process=[Diagnostics.Process]::Start((New-VbsProcess $launcher 'prepare' $missing))
     try{
         if(-not $process.WaitForExit(20000)){$process.Kill();throw 'Missing guest fixture timed out'}
-        Assert ($process.ExitCode -eq 2 -and (Get-Content -LiteralPath (Join-Path $missing 'vbs-launcher.log') -Raw) -match 'Win11Lite.ps1 is missing') 'Missing PowerShell payload produces a logged error and nonzero exit'
+        Assert ($process.ExitCode -eq 2 -and (Get-Content -LiteralPath (Get-FixtureLogPath $missing)) -match 'Win11Lite.ps1 is missing') 'Missing PowerShell payload produces a logged error and nonzero exit'
+        Assert (-not (Test-Path -LiteralPath $expiredLog) -and (Test-Path -LiteralPath $retainedLog)) 'Standalone VBS applies the same today-plus-29-days retention without the PS payload'
+        Assert ([IO.File]::ReadAllText($otherFile) -eq 'fixture') 'Standalone VBS retention does not delete unrelated files'
     }finally{$process.Dispose()}
     Write-Host "PASS: $script:checks runner checks; PowerShell $($PSVersionTable.PSVersion)"
 }finally{

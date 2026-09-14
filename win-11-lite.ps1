@@ -2160,12 +2160,45 @@ End Function
 
 Sub WriteLog(message)
     On Error Resume Next
-    Dim log
-    Set log = files.OpenTextFile(files.BuildPath(support, "vbs-launcher.log"), 8, True, -1)
-    If Err.Number = 0 Then
-        log.WriteLine CStr(Now) & " " & message
-        log.Close
+    Dim log, folder, stamp, today, entry, matcher, entryDate, attempt, logPath, parent
+    today = Date
+    stamp = Year(today) & "-" & Right("0" & Month(today), 2) & "-" & Right("0" & Day(today), 2)
+    folder = files.BuildPath(support, "Logs")
+    parent = support
+    Do While Len(parent) > 0
+        If (files.GetFolder(parent).Attributes And 1024) <> 0 Then Exit Sub
+        parent = files.GetParentFolderName(parent)
+    Loop
+    If Not files.FolderExists(folder) Then files.CreateFolder folder
+    If Err.Number <> 0 Then Err.Clear: Exit Sub
+    If (files.GetFolder(folder).Attributes And 1024) <> 0 Then Exit Sub
+    Set matcher = New RegExp
+    matcher.Pattern = "^\d{4}-\d{2}-\d{2}\.log$"
+    For Each entry In files.GetFolder(folder).Files
+        If matcher.Test(entry.Name) And (entry.Attributes And 1024) = 0 Then
+            Err.Clear
+            entryDate = DateSerial(CInt(Left(entry.Name, 4)), CInt(Mid(entry.Name, 6, 2)), CInt(Mid(entry.Name, 9, 2)))
+            If Err.Number = 0 Then
+                If Year(entryDate) = CInt(Left(entry.Name, 4)) And Month(entryDate) = CInt(Mid(entry.Name, 6, 2)) And Day(entryDate) = CInt(Mid(entry.Name, 9, 2)) Then
+                    If entryDate < DateAdd("d", -29, today) Then entry.Delete True
+                End If
+            End If
+        End If
+    Next
+    logPath = files.BuildPath(folder, stamp & ".log")
+    If files.FileExists(logPath) Then
+        If (files.GetFile(logPath).Attributes And 1024) <> 0 Then Exit Sub
     End If
+    For attempt = 1 To 5
+        Err.Clear
+        Set log = files.OpenTextFile(logPath, 8, True, -1)
+        If Err.Number = 0 Then
+            log.WriteLine stamp & "T" & Right("0" & Hour(Now), 2) & ":" & Right("0" & Minute(Now), 2) & ":" & Right("0" & Second(Now), 2) & " [vbs-launcher] " & message
+            log.Close
+            Exit For
+        End If
+        WScript.Sleep 100
+    Next
     Err.Clear
 End Sub
 
@@ -2206,7 +2239,7 @@ param(
     # unexpected value into another parameter.
     [Parameter(Position=0)][ValidateSet('prepare','prepare-register','finalize','finalize-wait','guard','view')][string]$Mode,
     # Without -Direct the mode runs in a child process without a window, so its
-    # output and exit code are kept in launcher.log.
+    # output and exit code are kept in the daily log under Logs.
     [switch]$Direct,
     [string]$RunId,
     [ValidateRange(0,86400)][int]$WaitSeconds = 0,
@@ -2217,7 +2250,8 @@ $ProgressPreference = 'SilentlyContinue'
 $script:Support = $PSScriptRoot
 $script:BuildInfo = $null
 try { $script:BuildInfo = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'build-info.json') -Raw -Encoding UTF8 | ConvertFrom-Json } catch { }
-$logFile = Join-Path $PSScriptRoot 'guard.log'
+$script:GuardLogFile = $null
+$script:LogCleanupDay = ''
 function T { param([string]$Ru, [string]$En) if ([string]$script:BuildInfo.Language -like 'ru*') { $Ru } else { $En } }
 # Build choices are required, never guessed: a missing value is a broken image.
 function Get-BuildSetting {
@@ -2233,14 +2267,85 @@ function Get-GuestGuardMode {
     if($value -notin @('None','Standard','Debug','Silent')){throw (T "Недопустимый режим Guard в build-info.json: $value" "Invalid Guard mode in build-info.json: $value")}
     $value
 }
+function Assert-GuestLogPath {
+    param([string]$SupportDirectory, [string]$Path)
+    $base=[IO.Path]::GetFullPath($SupportDirectory).TrimEnd('\')
+    $full=[IO.Path]::GetFullPath($Path)
+    if(-not $full.StartsWith($base+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Log path is outside the support directory'}
+    $cursor=$full
+    while($cursor){
+        $item=Get-Item -LiteralPath $cursor -Force -ErrorAction SilentlyContinue
+        if($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'Refusing a log path through a reparse point'}
+        $cursor=Split-Path $cursor -Parent
+    }
+    $full
+}
+function Remove-ExpiredGuestLogs {
+    param([string]$SupportDirectory, [datetime]$Today=(Get-Date).Date)
+    $folder=Assert-GuestLogPath $SupportDirectory (Join-Path $SupportDirectory 'Logs')
+    $cutoff=$Today.Date.AddDays(-29)
+    if([IO.Directory]::Exists($folder)){
+        foreach($file in @(Get-ChildItem -LiteralPath $folder -File -Force -ErrorAction Stop)){
+            if($file.Name -notmatch '^\d{4}-\d{2}-\d{2}\.log$'){continue}
+            $date=[datetime]::MinValue
+            if(-not [datetime]::TryParseExact($file.BaseName,'yyyy-MM-dd',[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::None,[ref]$date) -or $date -ge $cutoff){continue}
+            $path=Assert-GuestLogPath $SupportDirectory $file.FullName
+            Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+        }
+    }
+    # Old installations may still contain the former append-only logs. They
+    # stop growing and age out by their last write date, without changing state.
+    foreach($name in 'guard.log','launcher.log','prepare.log','finalize.log','vbs-launcher.log'){
+        $path=Assert-GuestLogPath $SupportDirectory (Join-Path $SupportDirectory $name)
+        $file=Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        if($file -and -not $file.PSIsContainer -and $file.LastWriteTime.Date -lt $cutoff){Remove-Item -LiteralPath $path -Force -ErrorAction Stop}
+    }
+}
+function Get-GuestLogPath {
+    param([string]$SupportDirectory=$script:Support, [datetime]$At=(Get-Date), [switch]$Create)
+    $folder=Assert-GuestLogPath $SupportDirectory (Join-Path $SupportDirectory 'Logs')
+    $stamp=$At.ToString('yyyy-MM-dd',[Globalization.CultureInfo]::InvariantCulture)
+    $path=Assert-GuestLogPath $SupportDirectory (Join-Path $folder ($stamp+'.log'))
+    if($Create){
+        $null=[IO.Directory]::CreateDirectory($folder)
+        $cleanupKey=$folder+'|'+$stamp
+        if($script:LogCleanupDay -ne $cleanupKey){
+            $script:LogCleanupDay=$cleanupKey
+            try{Remove-ExpiredGuestLogs -SupportDirectory $SupportDirectory -Today $At.Date}
+            catch{try{[Console]::Error.WriteLine('[LOG CLEANUP] '+$_.Exception.Message)}catch{}}
+        }
+    }
+    $path
+}
+function Write-GuestLogRecord {
+    param([string]$Path, [string]$Text, [int]$Attempts=5)
+    # UTF-16 LE is shared with the text-only VBScript launcher. An exclusive
+    # writer with shared readers prevents records from overwriting each other.
+    $encoding=[Text.Encoding]::Unicode
+    [byte[]]$data=$encoding.GetBytes($Text+"`r`n")
+    for($attempt=0;$attempt -lt $Attempts;$attempt++){
+        try{
+            $stream=[IO.File]::Open($Path,[IO.FileMode]::Append,[IO.FileAccess]::Write,[IO.FileShare]::Read)
+            try{
+                [byte[]]$record=if($stream.Length -eq 0){$encoding.GetPreamble()+$data}else{$data}
+                $stream.Write($record,0,$record.Length)
+            }finally{$stream.Dispose()}
+            return
+        }catch{
+            $code=$_.Exception.GetBaseException().HResult -band 0xFFFF
+            if($code -in @(32,33) -and $attempt+1 -lt $Attempts){Start-Sleep -Milliseconds 100;continue}
+            throw
+        }
+    }
+}
 function Write-GuestLog {
     param([string]$File, [string]$Message)
-    $path = Join-Path $script:Support $File
-    for ($attempt = 0; $attempt -lt 5; $attempt++) {
-        try { [IO.File]::AppendAllText($path, "$(Get-Date -Format s) [$Mode] $Message`r`n", [Text.UTF8Encoding]::new($true)); return }
-        catch [IO.IOException] { Start-Sleep -Milliseconds 50 }
-        catch [UnauthorizedAccessException] { return } # A limited report process can read this folder.
-    }
+    try{
+        $now=Get-Date
+        $path=Get-GuestLogPath -At $now -Create
+        $source=[IO.Path]::GetFileNameWithoutExtension($File)
+        Write-GuestLogRecord -Path $path -Text ($now.ToString('s')+" [$source] [$Mode] $Message")
+    }catch{try{[Console]::Error.WriteLine('[LOG ERROR] '+$_.Exception.Message)}catch{}}
 }
 function Write-RunnerLog   { param([string]$Message) Write-GuestLog 'launcher.log' $Message }
 function Write-PrepareLog  { param([string]$Message) Write-GuestLog 'prepare.log' $Message }
@@ -2276,7 +2381,7 @@ function Test-OobeComplete {
     }
 }
 # Runs the requested mode as a hidden child of this same file, keeping its
-# output and exit code in launcher.log. Run-Setup.vbs hides the initial process
+# output and exit code in the daily log. Run-Setup.vbs hides the initial process
 # too when VBScript is available; the PowerShell fallback can briefly flash.
 function Start-GuestChild {
     param([Parameter(Mandatory)][string]$ChildMode)
@@ -2702,6 +2807,61 @@ function Get-GuardBriefReport {
     }
 }
 
+function Set-GuardLogPosition {
+    param([string]$Path)
+    if($script:GuardLogFile -eq $Path){return}
+    $offset=if([IO.File]::Exists($Path)){(Get-Item -LiteralPath $Path).Length}else{0}
+    $marker=@{RunId=$guardRunId;BuildId=$config.BuildId;Started=$guardStartedAt.ToString('o');LogOffset=$offset;LogFile=('Logs\'+[IO.Path]::GetFileName($Path))}|ConvertTo-Json
+    $target=Join-Path $script:Support 'guard-run.json'
+    $temporary=$target+'.'+$PID+'.tmp'
+    try{
+        [IO.File]::WriteAllText($temporary,$marker,[Text.UTF8Encoding]::new($true))
+        for($attempt=0;$attempt -lt 5;$attempt++){
+            try{Move-Item -LiteralPath $temporary -Destination $target -Force -ErrorAction Stop;break}
+            catch{if($attempt -eq 4){throw};Start-Sleep -Milliseconds 100}
+        }
+        $script:GuardLogFile=$Path
+    }finally{if([IO.File]::Exists($temporary)){Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue}}
+}
+function Read-GuardLiveLog {
+    param([string]$SupportDirectory, [string]$RunId)
+    $deadline=(Get-Date).AddMinutes(25)
+    $reader=$null;$stream=$null;$currentPath='';$done=$false
+    try{
+        while(-not $done){
+            $marker=$null
+            try{$marker=Get-Content -LiteralPath (Join-Path $SupportDirectory 'guard-run.json') -Raw -Encoding UTF8|ConvertFrom-Json}catch{}
+            if($marker){
+                if(-not $RunId){$RunId=[string]$marker.RunId}
+                if($marker.RunId -ne $RunId){throw (T 'Этот запуск уже завершён; откройте последний отчёт из папки guard.' 'This run has been superseded; open the latest report from the guard folder.')}
+                $daily=[bool]$marker.LogFile
+                if($daily -and $marker.LogFile -notmatch '^Logs[\\/]\d{4}-\d{2}-\d{2}\.log$'){throw 'Invalid guard log filename'}
+                $log=Assert-GuestLogPath $SupportDirectory (Join-Path $SupportDirectory $(if($daily){$marker.LogFile}else{'guard.log'}))
+                if($log -ne $currentPath -and [IO.File]::Exists($log)){
+                    # Drain the previous day before switching to the file named
+                    # by the worker. The marker changes before its first write.
+                    if($reader){while($null -ne ($line=$reader.ReadLine())){Write-Host $line -ForegroundColor Gray};$reader.Dispose();$reader=$null}
+                    if($stream){$stream.Dispose()}
+                    $stream=[IO.File]::Open($log,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+                    $null=$stream.Seek([Math]::Max(0,[long]$marker.LogOffset),[IO.SeekOrigin]::Begin)
+                    $encoding=if($daily){[Text.Encoding]::Unicode}else{[Text.Encoding]::UTF8}
+                    $reader=[IO.StreamReader]::new($stream,$encoding,$true)
+                    $currentPath=$log
+                }
+                if($reader){
+                    while($null -ne ($line=$reader.ReadLine())){
+                        $color=if($line -match '\[ERROR\]'){'Red'}elseif($line -match '\[CHANGED\]|\[END\]'){'Green'}else{'Gray'}
+                        Write-Host $line -ForegroundColor $color
+                        $endPattern=if($daily){'\[guard:'+ [regex]::Escape($RunId)+'\] \[END\]'}else{'\[END\]'}
+                        if($line -match $endPattern){$done=$true;break}
+                    }
+                }
+            }
+            if(-not $done){if((Get-Date) -ge $deadline){throw (T 'Истекло время ожидания guard.' 'Timed out waiting for guard.')};Start-Sleep -Milliseconds 200}
+        }
+    }finally{if($reader){$reader.Dispose()};if($stream){$stream.Dispose()}}
+}
+
 function Show-GuardView {
     param([string]$SupportDirectory,[ValidateSet('Debug','Standard','Silent')][string]$Mode,[string]$RunId,[int]$WaitSeconds=120)
     if($Mode -eq 'Silent' -or -not (Test-GuardOobeComplete)){return}
@@ -2710,25 +2870,7 @@ function Show-GuardView {
     $deadline=(Get-Date).AddSeconds($WaitSeconds)
     $reportPath=Join-Path $SupportDirectory 'guard-report.json'
     if($Mode -eq 'Debug'){
-        $marker=Get-Content -LiteralPath (Join-Path $SupportDirectory 'guard-run.json') -Raw -Encoding UTF8|ConvertFrom-Json
-        if($RunId -and $marker.RunId -ne $RunId){throw (T 'Этот запуск уже завершён; откройте последний отчёт из папки guard.' 'This run has been superseded; open the latest report from the guard folder.')}
-        $log=Join-Path $SupportDirectory 'guard.log'
-        $stream=[IO.File]::Open($log,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
-        try{
-            $null=$stream.Seek([long]$marker.LogOffset,[IO.SeekOrigin]::Begin)
-            $reader=[IO.StreamReader]::new($stream,[Text.Encoding]::UTF8,$true)
-            try{
-                $done=$false;$deadline=(Get-Date).AddMinutes(25)
-                while(-not $done){
-                    while($null -ne ($line=$reader.ReadLine())){
-                        $color=if($line -match '\[ERROR\]'){'Red'}elseif($line -match '\[CHANGED\]|\[END\]'){'Green'}else{'Gray'}
-                        Write-Host $line -ForegroundColor $color
-                        if($line -match '\[END\]'){$done=$true;break}
-                    }
-                    if(-not $done){if((Get-Date) -ge $deadline){throw (T 'Истекло время ожидания guard.' 'Timed out waiting for guard.')} ;Start-Sleep -Milliseconds 200}
-                }
-            }finally{$reader.Dispose()}
-        }finally{$stream.Dispose()}
+        Read-GuardLiveLog -SupportDirectory $SupportDirectory -RunId $RunId
     }else{
         while($true){
             $report=$null
@@ -2738,7 +2880,7 @@ function Show-GuardView {
                 Write-Host $report.BriefText
                 break
             }
-            if((Get-Date) -ge $deadline){throw (T 'Отчёт этого запуска не создан. Проверьте guard.log в папке guard.' 'No report was created for this run. Check guard.log in the guard folder.')}
+            if((Get-Date) -ge $deadline){throw (T 'Отчёт этого запуска не создан. Проверьте ежедневный журнал в папке Logs.' 'No report was created for this run. Check the daily log in the Logs folder.')}
             Start-Sleep -Milliseconds 200
         }
     }
@@ -2752,29 +2894,16 @@ function Show-GuardView {
 
 function Write-GuardLog {
     param([string]$Level, [string]$Message)
-    $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Message"
-    $encoding = [Text.UTF8Encoding]::new($true)
-    [byte[]]$data = $encoding.GetBytes($line + [Environment]::NewLine)
-    # Windows PowerShell 5.1 Add-Content denies concurrent readers, including
-    # our Get-Content -Wait viewer. Open explicitly with shared read/write access.
-    $attempts = if ($counts.LogFailed) { 1 } else { 5 }
-    for ($attempt = 0; $attempt -lt $attempts; $attempt++) {
-        try {
-            $stream = [IO.File]::Open($logFile,[IO.FileMode]::Append,[IO.FileAccess]::Write,[IO.FileShare]::ReadWrite)
-            try {
-                [byte[]]$record = if ($stream.Length -eq 0) { $encoding.GetPreamble() + $data } else { $data }
-                $stream.Write($record,0,$record.Length)
-            } finally { $stream.Dispose() }
-            return
-        } catch {
-            $problem = $_.Exception.GetBaseException()
-            $code = $problem.HResult -band 0xFFFF
-            if ($code -in @(32,33) -and $attempt + 1 -lt $attempts) { Start-Sleep -Milliseconds 100; continue }
-            break
-        }
-    }
+    $now=Get-Date
+    $line=$now.ToString('yyyy-MM-dd HH:mm:ss')+" [guard:$guardRunId] [$Level] $Message"
+    try{
+        $logFile=Get-GuestLogPath -At $now -Create
+        Set-GuardLogPosition -Path $logFile
+        Write-GuestLogRecord -Path $logFile -Text $line -Attempts $(if($counts.LogFailed){1}else{5})
+        return
+    }catch{$problem=$_.Exception.GetBaseException()}
     # A logging failure must never become a policy/service failure or abort the
-    # remaining checks. The runner captures stderr in launcher.log.
+    # remaining checks. The runner captures stderr in the daily log.
     $counts.LogFailed++
     try { [Console]::Error.WriteLine("[LOG ERROR] ${logFile}: $($problem.Message)`r`n$line") } catch { }
 }
@@ -3114,11 +3243,7 @@ if ($Mode -eq 'guard') {
     try { $runLock = [IO.File]::Open((Join-Path $PSScriptRoot 'guard.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
     catch [IO.IOException] { return }
     try {
-        try{
-            $offset=if(Test-Path -LiteralPath $logFile){(Get-Item -LiteralPath $logFile).Length}else{0}
-            $marker=@{RunId=$guardRunId;BuildId=$config.BuildId;Started=$guardStartedAt.ToString('o');LogOffset=$offset}|ConvertTo-Json
-            [IO.File]::WriteAllText((Join-Path $PSScriptRoot 'guard-run.json'),$marker,[Text.UTF8Encoding]::new($true))
-        }catch{$counts.LogFailed++;$guardWarnings.Add((T 'Не удалось записать начало проверки.' 'Could not record the check start.'))}
+        try{Set-GuardLogPosition -Path (Get-GuestLogPath -Create)}catch{$counts.LogFailed++;$guardWarnings.Add((T 'Не удалось записать начало проверки.' 'Could not record the check start.'))}
         try {
             $historyPath=Join-Path $PSScriptRoot 'guard-state.json'
             if(Test-Path -LiteralPath $historyPath){
@@ -3142,7 +3267,7 @@ if ($Mode -eq 'guard') {
                     $hadBrowser = @($browserPaths | Where-Object { Test-Path -LiteralPath $_ }).Count -gt 0
                     $observation.Found=$hadBrowser;$observation.Before=if($hadBrowser){'Present'}else{'Absent'}
                     Invoke-Finalize -EdgeOnly
-                    if ($script:FinalizeFailed) { throw (T 'Ошибка очистки Edge; см. finalize.log' 'Edge cleanup failed; see finalize.log') }
+                    if ($script:FinalizeFailed) { throw (T 'Ошибка очистки Edge; см. записи finalize в ежедневном журнале Logs.' 'Edge cleanup failed; see finalize entries in the daily Logs file.') }
                     if (@($browserPaths | Where-Object { Test-Path -LiteralPath $_ }).Count) { throw (T 'Файлы Edge всё ещё присутствуют' 'Edge files are still present') }
                     $observation.After='Absent'
                     if ($hadBrowser) { 'changed' } else { 'ok' }
@@ -3281,7 +3406,7 @@ if ($Mode -eq 'guard') {
         finally { $runLock.Dispose() }
     }
     if ($counts.LogFailed) {
-        try { [Console]::Error.WriteLine((T "[LOG ERROR] Не записано строк в guard.log: $($counts.LogFailed); строки переданы в stderr (launcher.log при штатном запуске)." "[LOG ERROR] Lines not written to guard.log: $($counts.LogFailed); forwarded to stderr (launcher.log during normal startup).")) } catch { }
+        try { [Console]::Error.WriteLine((T "[LOG ERROR] Ошибок записи журнала/отчётов: $($counts.LogFailed); строки переданы в stderr (записи launcher в ежедневном журнале Logs при штатном запуске)." "[LOG ERROR] Log/report write errors: $($counts.LogFailed); forwarded to stderr (launcher entries in the daily Logs file during normal startup).")) } catch { }
     }
     if ($counts.Failed -or $counts.LogFailed -or $counts.ViewFailed) { exit 1 }
     exit 0

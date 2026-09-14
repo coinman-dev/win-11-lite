@@ -4,7 +4,7 @@
 
 [![Windows 11 x64](https://img.shields.io/badge/Windows%2011-x64-0078D4.svg)](#requirements-and-supported-images)
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20%7C%207-5391FE.svg)](#requirements-and-supported-images)
-[![Tests](https://img.shields.io/badge/tests-1150%20%C3%97%202-success.svg)](#validation-status)
+[![Tests](https://img.shields.io/badge/tests-1181%20%C3%97%202-success.svg)](#validation-status)
 
 **win-11-lite** builds a smaller, privacy-focused Windows 11 installation ISO from an original Microsoft x64 image. It removes selected inbox applications and components, applies privacy and OOBE settings, can integrate updates, languages and drivers, and exports one chosen Windows edition into a new bootable ISO.
 
@@ -91,8 +91,9 @@ Reports are stored in `C:\Windows\Setup\Scripts\Win11Lite\`:
 | `guard-report.txt` | Full human-readable report with before/after state and technical details. |
 | `guard-report.json` | Structured report with run ID, completeness, inventory state and item-level outcomes. |
 | `guard-state.json` | History used to identify confirmed reappearances and repeated fixes. |
-| `guard.log` | Detailed execution log. |
-| `launcher.log` | PowerShell worker output and exit codes. |
+| `Logs\YYYY-MM-DD.log` | One daily log for Guard, preparation, finalization and both launchers, including full Guard reports, worker output and exit codes. |
+
+Logs retain **today and the previous 29 days**. Repeated runs append to the same daily file; midnight starts a new one. Old daily files are removed automatically when the guest runtime writes its first log entry of the day. Debug follows its current Guard run across midnight. The latest `guard-report.txt/json` and `guard-summary.txt` are overwritten on each check; `guard-state.json` remains the working state for detecting restored components. Legacy log files stop growing and are removed once their last write is older than the retention window. Cleanup targets only recognized log files and never traverses filesystem links.
 
 Standard and Debug display the path to the full report before closing. Unknown inventory state, pending servicing and failed verification are never counted as successful removal.
 
@@ -183,7 +184,7 @@ Use `-NoOobeNetworkBlock` to leave networking available during OOBE.
 
 To avoid the brief black PowerShell window that Windows Setup can show, every preset preserves VBScript and uses a generated text file, `Run-Setup.vbs`, when `wscript.exe` and `vbscript.dll` exist in the image. WScript creates the first PowerShell process hidden, waits for its result and propagates the exit code. No custom EXE is compiled or embedded. If the source image lacks the host or engine, the builder reports the fallback to direct PowerShell, where an initial console may appear.
 
-VBS/PowerShell launcher logs are written to `vbs-launcher.log` and `launcher.log`. The new launcher has passed real WScript fixture tests; appearance and antivirus behavior during a complete VM installation still require verification.
+VBS and PowerShell write to the same daily `Logs\YYYY-MM-DD.log`, tagged `vbs-launcher` and `launcher`. The new launcher has passed real WScript fixture tests; appearance and antivirus behavior during a complete VM installation still require verification.
 
 ---
 
@@ -390,20 +391,20 @@ Builder logging creates a main `.log`, a `.details.log` for commands/technical d
 
 Every builder progress bar switches to a moving `...` indicator after five minutes without a changed percentage, while the elapsed timer keeps running. A new value automatically restores the percentage bar; this can repeat during the same operation. The rule applies to DISM operations, file copying and ISO creation. A reported 100% while the process is still running continues to show the existing completion-wait indicator.
 
-Guest runtime files live under `C:\Windows\Setup\Scripts\Win11Lite`. `prepare.log`, `finalize.log`, `launcher.log`, `vbs-launcher.log` and `guard.log` are the useful files when diagnosing behavior inside a VM; host build logs cannot show what happened after Windows booted.
+Guest runtime files live under `C:\Windows\Setup\Scripts\Win11Lite`. For VM diagnostics, use the relevant daily files under `Logs` and the latest `guard-report.txt/json`. Entries identify `prepare`, `finalize`, `launcher`, `vbs-launcher` or a Guard run ID. Host build logs cannot show what happened after Windows booted.
 
 ---
 
 ## Validation status
 
-As of 2026-09-14, 12 suites contain **1,150 checks on Windows PowerShell 5.1 and another 1,150 on PowerShell 7**. They cover parsers, safe paths, work-drive capacity and retry prompts, downloads/cache, WIM metadata, ADK catalogs, languages, answer files, Appx/removal rules, Guard reports/history, OOBE networking, real child processes, progress stalls and recovery, Windows batch files and the WScript launcher.
+As of 2026-09-14, 13 suites contain **1,181 checks on Windows PowerShell 5.1 and another 1,181 on PowerShell 7**. They cover parsers, safe paths, work-drive capacity and retry prompts, downloads/cache, WIM metadata, ADK catalogs, languages, answer files, Appx/removal rules, Guard reports/history, daily log retention and midnight rollover, OOBE networking, real child processes, progress stalls and recovery, Windows batch files and the WScript launcher.
 
 Tests that exercise Guard, OOBE, registry, services or servicing replace system APIs with controlled fixtures. They are not presented as a real VM result. Real builds and prior VM logs confirm substantial parts of the 24H2/26H1 flow; the newest VBS launcher, localized winget Firefox installation and current `max` exception still need a fresh VM installation.
 
 Run the complete test set sequentially:
 
 ```powershell
-$suites = 'Test-SingleFile', 'Test-Win11Lite', 'Test-WindowsBatch', 'Test-WingetDetection', 'Test-Guard', 'Test-GuardModes', 'Test-Downloads', 'Test-SetupLanguage', 'Test-OobeNetwork', 'Test-SetupLauncher', 'Test-Compatibility', 'Test-Servicing'
+$suites = 'Test-SingleFile', 'Test-Win11Lite', 'Test-WindowsBatch', 'Test-WingetDetection', 'Test-Guard', 'Test-GuardModes', 'Test-GuestLogs', 'Test-Downloads', 'Test-SetupLanguage', 'Test-OobeNetwork', 'Test-SetupLauncher', 'Test-Compatibility', 'Test-Servicing'
 foreach ($suite in $suites) {
     powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ".\tests\$suite.ps1"
     if ($LASTEXITCODE -ne 0) { throw "Failed: $suite" }
