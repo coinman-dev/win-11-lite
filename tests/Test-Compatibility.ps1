@@ -48,7 +48,12 @@ foreach($Preset in 'safe','balanced'){
     Assert (-not (Test-Protected 'Microsoft.BingWeather')) "$Preset still permits selected consumer app removal"
 }
 $Preset='max'
-Assert (@(Get-ProtectedPatterns).Count -eq $script:NeverRemove.Count) 'Max keeps its previous protection set'
+Assert (@(Get-ProtectedPatterns).Count -eq $script:NeverRemove.Count) 'Max uses the shared protection set including the setup launcher dependency'
+foreach($name in 'Microsoft-Windows-VBSCRIPT-FoD-Package~31bf3856ad364e35~amd64~~10.0.28000.1','Microsoft-Windows-VBSCRIPT-FoD-Package~31bf3856ad364e35~amd64~ru-RU~10.0.28000.1','VBSCRIPT~~~~0.0.1.0','Microsoft.Windows.VBSCRIPT~~~~0.0.1.0'){
+    Assert (Test-Protected $name) "Max protects $name even from RemoveExtra"
+}
+$wmic='Microsoft-Windows-WMIC-FoD-Package~31bf3856ad364e35~amd64~~10.0.28000.1'
+Assert (-not (Test-Protected $wmic) -and @($script:PackageRules|Where-Object{(Test-GroupActive -RulePreset $_.Preset -Group $_.Group) -and $wmic -match $_.Pattern}).Count -gt 0) 'The VBScript exception still permits WMIC removal in max'
 
 foreach($name in 'AppXSvc','ClipSVC','InstallService','LicenseManager','StateRepository','AppReadiness','TokenBroker','BITS','wuauserv','DoSvc','mpssvc'){
     Assert ($name -notin @($script:DisableServices | ForEach-Object{$_.Names})) "Application and network service $name is not disabled"

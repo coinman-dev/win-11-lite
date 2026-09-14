@@ -123,9 +123,11 @@ exit ([int]$env:RUNNER_TEST_EXIT)
 
     $engineFixture=Join-Path $root 'engine\Windows\System32';$null=New-Item -ItemType Directory -Path $engineFixture
     foreach($file in 'wscript.exe','vbscript.dll'){[IO.File]::WriteAllText((Join-Path $engineFixture $file),'fixture')}
-    Assert (Test-ImageVbsLauncher -Image (Join-Path $root 'engine') -Profile balanced) 'Balanced uses VBS when the image contains its host and engine'
-    Assert (-not (Test-ImageVbsLauncher -Image (Join-Path $root 'engine') -Profile max)) 'Max retains its aggressive VBScript removal and uses PowerShell'
-    Assert (-not (Test-ImageVbsLauncher -Image (Join-Path $root 'absent-engine') -Profile safe)) 'An image without VBScript uses the working PowerShell fallback'
+    Assert (Test-ImageVbsLauncher -Image (Join-Path $root 'engine')) 'Every preset uses VBS when the image contains its host and engine'
+    $hostOnly=Join-Path $root 'host-only\Windows\System32';$null=New-Item -ItemType Directory -Path $hostOnly
+    [IO.File]::WriteAllText((Join-Path $hostOnly 'wscript.exe'),'fixture')
+    Assert (-not (Test-ImageVbsLauncher -Image (Join-Path $root 'host-only'))) 'The script host without its VBScript engine cannot select VBS'
+    Assert (-not (Test-ImageVbsLauncher -Image (Join-Path $root 'absent-engine'))) 'An image without VBScript uses the working PowerShell fallback'
     foreach($mode in 'prepare','prepare-register','finalize'){
         Assert ((Get-SetupEntryCommand -Mode $mode -UseVbs $true) -match ('wscript\.exe" //B //NoLogo .*Run-Setup\.vbs" '+$mode+'$')) 'VBS entry points use the GUI host in batch mode'
         Assert ((Get-SetupEntryCommand -Mode $mode -UseVbs $false) -match ('powershell\.exe" .*Win11Lite\.ps1" -Mode '+$mode+'$')) 'Fallback entry points still use the same guest PowerShell file'

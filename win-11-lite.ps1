@@ -682,7 +682,7 @@ $script:PackageRules = @(
     @{ Preset = 'balanced'; Group = 'Misc';     Pattern = '^Microsoft-Windows-TabletPCMath-Package';                   Desc = (T 'Панель математического ввода' 'Math input panel') }
     @{ Preset = 'balanced'; Group = 'AI';       Pattern = '^Microsoft-Windows-Hello-Face-Package';                     Desc = (T 'Windows Hello Face' 'Windows Hello Face') }
     @{ Preset = 'max';      Group = 'Misc';     Pattern = '^Microsoft-Windows-PowerShell-ISE-FOD-Package';             Desc = (T 'PowerShell ISE' 'PowerShell ISE') }
-    @{ Preset = 'max';      Group = 'Misc';     Pattern = '^Microsoft-Windows-(VBSCRIPT|WMIC)-FoD-Package';            Desc = (T 'VBScript и WMIC' 'VBScript and WMIC') }
+    @{ Preset = 'max';      Group = 'Misc';     Pattern = '^Microsoft-Windows-WMIC-FoD-Package';                       Desc = 'WMIC' }
     @{ Preset = 'max';      Group = 'Misc';     Pattern = '^Microsoft-Windows-Printing-PMCPPC-FoD-Package';            Desc = (T 'Драйверы печати PMC PPC' 'PMC PPC print drivers') }
 )
 
@@ -703,6 +703,8 @@ $script:BootFontPatterns = @(
 
 # Никогда не трогаем — даже если попадает под regex выше или из -RemoveExtra.
 $script:NeverRemove = @(
+    '^Microsoft-Windows-VBSCRIPT-FoD-Package(~|$)'                # VBS-запускатель установки, включая max
+    '^(Microsoft\.Windows\.)?VBSCRIPT~'                           # тот же движок как capability; защита и для guard
     'Microsoft-Edge-WebView-FOD-Package'                            # WebView2 — нужен приложениям
     'Microsoft-OneCore-Edge-WebRuntime-Package'                     # WebView2 runtime
     'Microsoft-OneCore-Fonts-DesktopFonts-NonLeanSupplement-Package' # обычные шрифты
@@ -2162,9 +2164,7 @@ function Get-SetupEntryCommand {
 }
 
 function Test-ImageVbsLauncher {
-    param([string]$Image, [string]$Profile)
-    # Max deliberately removes the VBScript FoD, including pending removals.
-    if ($Profile -eq 'max') { return $false }
+    param([string]$Image)
     (Test-Path -LiteralPath (Join-Path $Image 'Windows\System32\wscript.exe') -PathType Leaf) -and
     (Test-Path -LiteralPath (Join-Path $Image 'Windows\System32\vbscript.dll') -PathType Leaf)
 }
@@ -5222,11 +5222,11 @@ $firefoxCmd = Get-FirefoxInstallerCommand -Language $imgLang -MozillaLanguage $m
 # Накопительные обновления умеют восстанавливать Defender, Edge и AI-компоненты
 # и сбрасывать политики. Скрипт запускается при каждом входе и правит это.
 $guardDir = Join-Path $mountDir 'Windows\Setup\Scripts\Win11Lite'
-$useVbsLauncher = Test-ImageVbsLauncher -Image $mountDir -Profile $Preset
+$useVbsLauncher = Test-ImageVbsLauncher -Image $mountDir
 if ($useVbsLauncher) {
     Write-Ok (T 'Запуск при установке: VBS без окна PowerShell' 'Setup launcher: VBS with hidden PowerShell')
 } else {
-    Write-Note (T 'Запуск при установке: PowerShell; VBScript отсутствует или удаляется в max, начальная консоль может появиться' 'Setup launcher: PowerShell; VBScript is unavailable or removed by max, so the initial console may appear')
+    Write-Note (T 'Запуск при установке: PowerShell; в образе отсутствует Windows Script Host или VBScript, начальная консоль может появиться' 'Setup launcher: PowerShell; the image has no Windows Script Host or VBScript, so the initial console may appear')
 }
 if ($Guard -ne 'None') {
     $null = New-Item -ItemType Directory -Path $guardDir -Force
@@ -5408,7 +5408,7 @@ if ($Preset -eq 'balanced') {
 
 # В balanced проверяем файлы после всех действий DISM, которые могли их восстановить.
 if ($Preset -eq 'balanced') { Assert-ImageFileState -Image $mountDir }
-if ($useVbsLauncher -and -not (Test-ImageVbsLauncher -Image $mountDir -Profile $Preset)) {
+if ($useVbsLauncher -and -not (Test-ImageVbsLauncher -Image $mountDir)) {
     throw (T 'Средства VBScript исчезли после обслуживания образа; запуск установки не будет работать' 'VBScript host or engine disappeared after servicing; the setup launcher would not work')
 }
 

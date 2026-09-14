@@ -71,6 +71,12 @@ try{
         Assert (-not @($kept.Apps | Where-Object {$name -match $_}).Count) "Keep WMP/Apps also protects $name from guard"
     }
     Assert (@($kept.Protected | Where-Object {'Language.Speech~~~en-US~0.0.1.0' -match $_}).Count -gt 0) 'Keep Speech is protected even from RemoveExtra'
+    $Preset='max';$Keep=@();$RemoveExtra=@('^VBSCRIPT~')
+    & ([scriptblock]::Create($node.Extent.Text))
+    $maxConfig=Get-Content -LiteralPath (Join-Path $guardDir 'guard.json') -Raw | ConvertFrom-Json
+    Assert (@($maxConfig.Protected | Where-Object {'VBSCRIPT~~~~0.0.1.0' -match $_}).Count -gt 0) 'Max guard protects the VBScript capability from broad removal requests'
+    Assert (@($maxConfig.Protected | Where-Object {'Microsoft-Windows-WMIC-FoD-Package~fixture' -match $_}).Count -eq 0) 'Max guard does not broaden the exception to WMIC'
+    $Preset='balanced'
     $Keep=@('Family','ToDo');$RemoveExtra=@()
     & ([scriptblock]::Create($node.Extent.Text))
     $targeted=Get-Content -LiteralPath (Join-Path $guardDir 'guard.json') -Raw | ConvertFrom-Json
