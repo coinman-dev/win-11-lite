@@ -2042,6 +2042,9 @@ function Write-FirefoxInstallerFile {
 function Get-FirefoxInstallerCommand {
     param([string]$Language = 'en-US', [ValidatePattern('^[a-zA-Z0-9-]+$')][string]$MozillaLanguage = 'en-US')
     $ru = $Language -like 'ru*'
+    # The current winget catalog publishes en-US as Mozilla.Firefox and each
+    # other installer language as a separate package, for example .ru or .de.
+    $wingetId = if ($MozillaLanguage -eq 'en-US') { 'Mozilla.Firefox' } else { "Mozilla.Firefox.$MozillaLanguage" }
     $title = if ($ru) { 'Установка Mozilla Firefox' } else { 'Installing Mozilla Firefox' }
     $tryWinget = if ($ru) { 'Пробую через winget...' } else { 'Trying winget...' }
     $fallback = if ($ru) { 'winget не справился, качаю установщик напрямую...' } else { 'winget failed, downloading the installer directly...' }
@@ -2059,7 +2062,7 @@ echo.
 where winget >nul 2>&1
 if not errorlevel 1 (
     echo  $tryWinget
-    winget install --id Mozilla.Firefox -e --source winget --accept-package-agreements --accept-source-agreements
+    winget install --id $wingetId -e --source winget --accept-package-agreements --accept-source-agreements
     if errorlevel 0 if not errorlevel 1 goto :done
     echo.
     echo  $fallback

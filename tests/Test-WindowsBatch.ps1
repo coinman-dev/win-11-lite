@@ -36,6 +36,7 @@ try {
     foreach ($language in @('ru-RU','en-US')) {
         $tag = if ($language -eq 'ru-RU') {'ru'} else {'en-US'}
         $command = Get-FirefoxInstallerCommand -Language $language -MozillaLanguage $tag
+        $wingetId = if ($tag -eq 'en-US') { 'Mozilla.Firefox' } else { "Mozilla.Firefox.$tag" }
         # Normalize mixed source line endings, including an LF-only PS1 checkout.
         $original = Join-Path $root "$tag-original.cmd"
         Write-WindowsBatchFile -Path $original -Content ($command -replace "`r`n", "`n")
@@ -85,7 +86,7 @@ try {
                 $events = [IO.File]::ReadAllText($trace, [Text.Encoding]::UTF8)
                 $label = "$tag/$($case.Name)"
                 if ($case.Where -eq 0) {
-                    Assert ($events -match 'WINGET install --id Mozilla\.Firefox -e --source winget --accept-package-agreements --accept-source-agreements') "Firefox selects the winget source without querying msstore ($label)"
+                    Assert ($events.Contains("WINGET install --id $wingetId -e --source winget --accept-package-agreements --accept-source-agreements")) "Firefox selects the localized package from the winget source ($label)"
                 }
                 Assert ($process.ExitCode -eq $case.Exit) "Exit code ($label): $($process.ExitCode); stdout=$output; stderr=$errorText"
                 Assert ($errorText.Trim().Length -eq 0) "CMD parsing ($label): $errorText"
@@ -102,6 +103,8 @@ try {
             } finally { $process.Dispose() }
         }
     }
+    $german = Get-FirefoxInstallerCommand -Language 'de-DE' -MozillaLanguage 'de'
+    Assert ($german.Contains('winget install --id Mozilla.Firefox.de -e --source winget') -and $german.Contains('lang=de')) 'Other image languages select matching winget and Mozilla download locales'
     Write-Host "PASS: $checks CMD checks; PowerShell $($PSVersionTable.PSVersion)"
 } finally {
     $allowed = [IO.Path]::GetFullPath((Join-Path $repo 'tmp')).TrimEnd('\') + '\batch-tests-'
