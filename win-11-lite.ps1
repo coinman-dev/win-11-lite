@@ -19,6 +19,8 @@
       * на общий рабочий стол кладётся ярлык Install-Firefox;
       * встраивается обход проверок TPM 2.0 и Secure Boot;
       * обновления отключаются на время установки и включаются сразу после неё;
+      * подкачка ограничивается 128–1024 МБ; swap, гибернация и дампы отключаются
+        (PageFileMode/MinMB/MaxMB, SwapFile, Hibernation, CrashDumps меняют выбор);
       * итоговый ISO собирается через oscdimg.
 
     Все загрузки выполняются до копирования и обработки образа. При ошибке
@@ -174,6 +176,27 @@ param(
     # Ставить систему в сжатом виде (CompactOS, LZX) — экономит ~2 ГБ на диске,
     # ценой небольшой нагрузки на процессор при чтении системных файлов.
     [switch]$CompactOS,
+
+    # Подкачка: custom = заданный диапазон, system = размер выбирает Windows.
+    [ValidateSet('custom', 'system')]
+    [string]$PageFileMode = 'custom',
+    [ValidateRange(16, 1048576)]
+    [int]$PageFileMinMB = 128,
+    [ValidateRange(16, 1048576)]
+    [int]$PageFileMaxMB = 1024,
+
+    # У swapfile.sys нет штатного параметра фиксированного размера.
+    # disabled использует SwapfileControl=0; результат проверять на целевой Windows.
+    [ValidateSet('disabled', 'system')]
+    [string]$SwapFile = 'disabled',
+
+    # disabled отключает гибернацию и быстрый запуск; system сохраняет исходные настройки.
+    [ValidateSet('disabled', 'system')]
+    [string]$Hibernation = 'disabled',
+
+    # disabled отключает аварийные/полные live-дампы и журнал DumpStack.
+    [ValidateSet('disabled', 'system')]
+    [string]$CrashDumps = 'disabled',
 
     # None: не встраивать guard; Standard: краткий итог; Debug: живой журнал;
     # Silent: проверка без окна, отчёты сохраняются в папке guard.
@@ -506,13 +529,18 @@ function Get-IsoEditions {
         $mounted = Get-DiskImage -ImagePath $Path -ErrorAction Stop
         if (-not $mounted.Attached) { $mounted = Mount-DiskImage -ImagePath $Path -PassThru -Access ReadOnly -ErrorAction Stop; $owned = $true }
         Start-Sleep -Seconds 2
-        $drive = "$(($mounted | Get-Volume).DriveLetter):"
+        $volumes = @($mounted | Get-Volume -ErrorAction Stop)
+        if ($volumes.Count -ne 1 -or [string]$volumes[0].DriveLetter -notmatch '^[A-Za-z]$') {
+            throw (T 'У подключённого ISO нет однозначно определённого диска с буквой' 'The mounted ISO has no uniquely identified drive letter')
+        }
+        $drive = "$($volumes[0].DriveLetter):"
         $wim = Join-Path $drive 'sources\install.wim'
         if (-not (Test-Path -LiteralPath $wim)) { $wim = Join-Path $drive 'sources\install.esd' }
-        if (-not (Test-Path -LiteralPath $wim)) { return @() }
+        if (-not (Test-Path -LiteralPath $wim)) { throw (T 'В ISO не найден sources\install.wim или sources\install.esd' 'The ISO contains neither sources\install.wim nor sources\install.esd') }
         $result = @(Get-WimImageList -Path $wim)
+        if (-not $result.Count) { throw (T 'В образе не найдено ни одной редакции Windows' 'No Windows editions were found in the image') }
     } catch {
-        Write-Host (T "  Не удалось прочитать образ: $($_.Exception.Message)" "  Could not read the image: $($_.Exception.Message)") -ForegroundColor Yellow
+        throw [InvalidOperationException]::new((T "Не удалось прочитать ISO «$Path»: $($_.Exception.Message). Сборка остановлена." "Could not read ISO '$Path': $($_.Exception.Message). Build stopped."), $_.Exception)
     } finally {
         if ($owned) { try { Dismount-DiskImage -ImagePath $Path | Out-Null } catch { } }
     }
@@ -2226,6 +2254,70 @@ function Test-ImageVbsLauncher {
 # The single guest runtime, written into the image as
 # %SystemRoot%\Setup\Scripts\Win11Lite\Win11Lite.ps1. This literal is the only
 # copy: edit it here. No separate file, archive or download is involved.
+function Get-MemoryFilePolicy {
+    param(
+        [ValidateSet('custom','system')][string]$PageFileMode = 'custom',
+        [ValidateRange(16,1048576)][int]$PageFileMinMB = 128,
+        [ValidateRange(16,1048576)][int]$PageFileMaxMB = 1024,
+        [ValidateSet('disabled','system')][string]$SwapFile = 'disabled',
+        [ValidateSet('disabled','system')][string]$Hibernation = 'disabled',
+        [ValidateSet('disabled','system')][string]$CrashDumps = 'disabled'
+    )
+    if ($PageFileMode -eq 'custom' -and $PageFileMaxMB -lt $PageFileMinMB) {
+        throw (T 'PageFileMaxMB должен быть не меньше PageFileMinMB' 'PageFileMaxMB must be at least PageFileMinMB')
+    }
+    $memory = 'Control\Session Manager\Memory Management'
+    $paging = if ($PageFileMode -eq 'custom') { "?:\pagefile.sys $PageFileMinMB $PageFileMaxMB" } else { '?:\pagefile.sys 0 0' }
+    $entries = @(
+        [pscustomobject]@{Path=$memory;Name='PagingFiles';Type='MultiString';Value=@($paging);Delete=$false}
+        [pscustomobject]@{Path=$memory;Name='SwapfileControl';Type='DWord';Value=0;Delete=($SwapFile -eq 'system')}
+        if ($Hibernation -eq 'disabled') {
+            foreach ($name in 'HibernateEnabled','HibernateEnabledDefault') {
+                [pscustomobject]@{Path='Control\Power';Name=$name;Type='DWord';Value=0;Delete=$false}
+            }
+            [pscustomobject]@{Path='Control\Session Manager\Power';Name='HiberbootEnabled';Type='DWord';Value=0;Delete=$false}
+        }
+        if ($CrashDumps -eq 'disabled') {
+            foreach ($name in 'CrashDumpEnabled','EnableLogFile') {
+                [pscustomobject]@{Path='Control\CrashControl';Name=$name;Type='DWord';Value=0;Delete=$false}
+            }
+            [pscustomobject]@{Path='Control\CrashControl\FullLiveKernelReports';Name='FullLiveReportsMax';Type='DWord';Value=0;Delete=$false}
+            foreach ($name in 'DedicatedDumpFile','DumpFileSize') {
+                [pscustomobject]@{Path='Control\CrashControl';Name=$name;Type='String';Value='';Delete=$true}
+            }
+        }
+    )
+    [pscustomobject]@{PageFileMode=$PageFileMode;PageFileMinMB=$PageFileMinMB;PageFileMaxMB=$PageFileMaxMB;SwapFile=$SwapFile;Hibernation=$Hibernation;CrashDumps=$CrashDumps;Registry=$entries}
+}
+
+function Set-OfflineMemoryFilePolicy {
+    param([Parameter(Mandatory)]$Policy)
+    # Only the mounted image hive is reachable from this builder function.
+    $sets = @(Get-ChildItem -LiteralPath 'HKLM:\LITE_SYSTEM' -ErrorAction Stop | Where-Object { $_.PSChildName -match '^ControlSet\d{3}$' })
+    if (-not $sets.Count) { throw (T 'В SYSTEM образа не найден ControlSet' 'No ControlSet found in the image SYSTEM hive') }
+    foreach ($set in $sets) {
+        foreach ($entry in $Policy.Registry) {
+            $path = "HKLM:\LITE_SYSTEM\$($set.PSChildName)\$($entry.Path)"
+            try {
+            if ($entry.Delete) {
+                if (Get-ItemProperty -LiteralPath $path -Name $entry.Name -ErrorAction SilentlyContinue) {
+                    Remove-ItemProperty -LiteralPath $path -Name $entry.Name -ErrorAction Stop
+                }
+            } else {
+                # Registry New-Item -Force deletes/recreates an existing key.
+                # Only create missing keys; change individual values below.
+                if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) {
+                    $null = New-Item -Path $path -ErrorAction Stop
+                }
+                $null = New-ItemProperty -LiteralPath $path -Name $entry.Name -PropertyType $entry.Type -Value $entry.Value -Force -ErrorAction Stop
+            }
+            } catch {
+                throw [InvalidOperationException]::new((T "Не удалось применить параметр памяти '$path\$($entry.Name)': $($_.Exception.Message)" "Could not apply memory-file setting '$path\$($entry.Name)': $($_.Exception.Message)"), $_.Exception)
+            }
+        }
+    }
+}
+
 function Get-GuestScript {
     $text = @'
 #Requires -Version 5.1
@@ -2411,9 +2503,79 @@ function Start-GuestChild {
 
 # ── Windows Setup: specialize and SetupComplete ────────────────────────────────
 
+function Disable-GuestHibernation {
+    # Windows PowerShell 5.1 must not turn native stderr into a terminating error.
+    $ErrorActionPreference = 'Continue'
+    $output = & "$env:SystemRoot\System32\powercfg.exe" /hibernate off 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "powercfg /hibernate off: ExitCode=$LASTEXITCODE; $output" }
+}
+
+function Set-GuestMemoryFilePolicy {
+    # Old build manifests and their test fixtures have no memory-file policy.
+    $policy = $script:BuildInfo.MemoryFiles
+    if ($null -eq $policy) { return }
+    foreach ($entry in $policy.Registry) {
+        $path = "HKLM:\SYSTEM\CurrentControlSet\$($entry.Path)"
+        try {
+        if ($entry.Delete) {
+            if (Get-ItemProperty -LiteralPath $path -Name $entry.Name -ErrorAction SilentlyContinue) {
+                Remove-ItemProperty -LiteralPath $path -Name $entry.Name -ErrorAction Stop
+            }
+        } else {
+            $value = $entry.Value
+            if ($entry.Type -eq 'MultiString') {
+                $value = [string[]]@($value | ForEach-Object { ([string]$_).Replace('?:', $env:SystemDrive) })
+            }
+            if (-not (Test-Path -LiteralPath $path -ErrorAction Stop)) {
+                $null = New-Item -Path $path -ErrorAction Stop
+            }
+            $null = New-ItemProperty -LiteralPath $path -Name $entry.Name -PropertyType $entry.Type -Value $value -Force -ErrorAction Stop
+        }
+        } catch {
+            throw [InvalidOperationException]::new((T "Не удалось применить параметр памяти '$path\$($entry.Name)': $($_.Exception.Message)" "Could not apply memory-file setting '$path\$($entry.Name)': $($_.Exception.Message)"), $_.Exception)
+        }
+    }
+    if ($policy.Hibernation -eq 'disabled') {
+        Disable-GuestHibernation
+    }
+}
+
+function Write-MemoryFileReport {
+    if ($null -eq $script:BuildInfo.MemoryFiles) { return }
+    $files = @(foreach ($relative in 'pagefile.sys','swapfile.sys','hiberfil.sys','DumpStack.log','DumpStack.log.tmp','Windows\MEMORY.DMP') {
+        $path = if ($relative -eq 'Windows\MEMORY.DMP') { Join-Path $env:SystemRoot 'MEMORY.DMP' } else { Join-Path ($env:SystemDrive + '\') $relative }
+        $item = $null; $readError = $null
+        try { $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop }
+        catch [System.Management.Automation.ItemNotFoundException] { }
+        catch { $readError = $_.Exception.Message }
+        [pscustomobject]@{Path=$path;Exists=$(if($readError){$null}else{$null -ne $item});Bytes=$(if($readError){$null}elseif($item){$item.Length}else{0});Error=$readError}
+    })
+    $report = [ordered]@{
+        BuildId=$script:BuildInfo.BuildId;At=(Get-Date -Format o)
+        Requested=$script:BuildInfo.MemoryFiles;Files=$files
+        Note=(T 'Размеры на момент проверки. Подкачка/swap и DumpStack могут требовать перезагрузки; 16 МБ swap не фиксируются.' 'Sizes at the time of inspection. Paging/swap and DumpStack changes may require a restart; swap is not fixed at 16 MB.')
+    }
+    $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $PSScriptRoot 'memory-files-report.json') -Encoding UTF8 -ErrorAction Stop
+    foreach ($file in $files) { Write-FinalizeLog ("Memory files: $($file.Path); Exists=$($file.Exists); Bytes=$($file.Bytes)") }
+    Write-FinalizeLog $report.Note
+}
+
+function Get-NetworkRestoreRecords {
+    param($InputObject)
+    # Import-Clixml can emit an array as one object. Older repeated Prepare runs
+    # could nest that array again, so recover individual records recursively.
+    foreach ($record in $InputObject) {
+        if ($record -is [Collections.IList]) { Get-NetworkRestoreRecords -InputObject $record }
+        elseif ($record -and -not [string]::IsNullOrWhiteSpace([string]$record.InterfaceGuid)) { $record }
+        else { throw (T 'Некорректная запись восстановления сети' 'Invalid network restoration record') }
+    }
+}
+
 function Invoke-Prepare {
     param([switch]$RegisterOnly)
     Write-PrepareLog (T "START: RegisterOnly=$RegisterOnly; пользователь=$env:USERNAME" "START: RegisterOnly=$RegisterOnly; user=$env:USERNAME")
+    try { Set-GuestMemoryFilePolicy }
+    catch { Write-PrepareLog (T "Файлы памяти: $($_.Exception.Message); повторю после OOBE" "Memory files: $($_.Exception.Message); will retry after OOBE") }
     # The answer file runs finalize directly at the first real user logon.
     # Scheduler availability during specialize must not prevent network blocking.
     if ((Get-GuestFlag 'OobeNetworkBlock') -and -not (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'oobe-complete'))) {
@@ -2435,7 +2597,7 @@ function Invoke-Prepare {
         }
         $statePath = Join-Path $PSScriptRoot 'network-state.clixml'
         $saved = @()
-        if (Test-Path -LiteralPath $statePath) { $saved = @(Import-Clixml -LiteralPath $statePath) }
+        if (Test-Path -LiteralPath $statePath) { $saved = @(Get-NetworkRestoreRecords -InputObject (Import-Clixml -LiteralPath $statePath)) }
         $allAdapters = @()
         for ($attempt = 0; $attempt -lt 15; $attempt++) {
             try { $allAdapters = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop) }
@@ -2450,7 +2612,7 @@ function Invoke-Prepare {
             if ($attempt -lt 14) { Start-Sleep -Seconds 1 }
         }
         $adapters = @($allAdapters | Where-Object { [string]$_.AdminStatus -in @('Up', '1') })
-        $saved = @(@($saved) + @($adapters | Select-Object InterfaceGuid) | Sort-Object InterfaceGuid -Unique)
+        $saved = @(@($saved) + @($adapters | Select-Object InterfaceGuid, PnPDeviceID) | Sort-Object InterfaceGuid -Unique)
         Export-Clixml -LiteralPath $statePath -InputObject $saved
         foreach ($adapter in $adapters) { $adapter | Disable-NetAdapter -Confirm:$false }
         foreach ($adapter in $adapters) { Write-PrepareLog (T "OOBE: отключён $($adapter.Name), GUID=$($adapter.InterfaceGuid)" "OOBE: disabled $($adapter.Name), GUID=$($adapter.InterfaceGuid)") }
@@ -2480,7 +2642,7 @@ function Invoke-Prepare {
     $trigger.Delay = 'PT30S'
     $principal = New-ScheduledTaskPrincipal -UserId 'S-1-5-18' -LogonType ServiceAccount -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 20)
-    $finalizeSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 3)
+    $finalizeSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 3) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $finalizeSettings -Force | Out-Null
     $configuredGuardMode=Get-GuestGuardMode
     if ($configuredGuardMode -ne 'None') {
@@ -2581,18 +2743,49 @@ function Invoke-Finalize {
         Write-FinalizeLog $_.Exception.Message
     } finally {
         # Always restore connectivity, even if optional cleanup failed.
+        if (-not $EdgeOnly) {
+        try { Set-GuestMemoryFilePolicy; Write-MemoryFileReport }
+        catch {
+            $script:FinalizeFailed = $true
+            Write-FinalizeLog (T "Ошибка настройки файлов памяти: $($_.Exception.Message)" "Memory file configuration failed: $($_.Exception.Message)")
+        }
+        }
         if (-not $EdgeOnly -and (Get-GuestFlag 'ManageOobe')) {
         try {
             $statePath = Join-Path $PSScriptRoot 'network-state.clixml'
             if (Test-Path -LiteralPath $statePath) {
-                $saved = @(Import-Clixml -LiteralPath $statePath)
-                foreach ($adapter in Get-NetAdapter -IncludeHidden) {
-                    if ([string]$adapter.InterfaceGuid -in @($saved | ForEach-Object { [string]$_.InterfaceGuid })) {
-                        $adapter | Enable-NetAdapter -Confirm:$false
-                        Write-FinalizeLog (T "Сеть: включён GUID=$($adapter.InterfaceGuid)" "Network: enabled GUID=$($adapter.InterfaceGuid)")
+                $saved = @(Get-NetworkRestoreRecords -InputObject (Import-Clixml -LiteralPath $statePath))
+                for ($attempt = 0; $attempt -lt 5 -and $saved.Count; $attempt++) {
+                    $pending = [Collections.Generic.List[object]]::new()
+                    try { $available = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop) }
+                    catch {
+                        Write-FinalizeLog (T "Сеть: повтор получения адаптеров: $($_.Exception.Message)" "Network: adapter enumeration retry: $($_.Exception.Message)")
+                        if ($attempt -lt 4) { Start-Sleep -Seconds 2 }
+                        continue
                     }
+                    foreach ($record in $saved) {
+                        try {
+                            $matches = @($available | Where-Object { ([string]$_.InterfaceGuid).Trim('{}') -eq ([string]$record.InterfaceGuid).Trim('{}') })
+                            if (-not $matches.Count -and $record.PnPDeviceID) {
+                                $matches = @($available | Where-Object { $_.PnPDeviceID -eq $record.PnPDeviceID })
+                            }
+                            if ($matches.Count -ne 1) { throw (T "Адаптер пока не найден однозначно: $($record.InterfaceGuid)" "Adapter not uniquely available yet: $($record.InterfaceGuid)") }
+                            $adapter = $matches[0]
+                            if ([string]$adapter.AdminStatus -notin @('Up','1')) { $adapter | Enable-NetAdapter -Confirm:$false -ErrorAction Stop }
+                            $verified = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object { $_.InterfaceGuid -eq $adapter.InterfaceGuid -and [string]$_.AdminStatus -in @('Up','1') })
+                            if (-not $verified.Count) { throw (T "Включение адаптера ещё не подтверждено: $($adapter.InterfaceGuid)" "Adapter enablement is not confirmed yet: $($adapter.InterfaceGuid)") }
+                            Write-FinalizeLog (T "Сеть: включён GUID=$($adapter.InterfaceGuid)" "Network: enabled GUID=$($adapter.InterfaceGuid)")
+                        } catch {
+                            $pending.Add($record)
+                            Write-FinalizeLog (T "Сеть: повтор восстановления: $($_.Exception.Message)" "Network: restoration retry: $($_.Exception.Message)")
+                        }
+                    }
+                    $saved = @($pending.ToArray())
+                    if ($saved.Count) { Export-Clixml -LiteralPath $statePath -InputObject $saved -ErrorAction Stop }
+                    if ($saved.Count -and $attempt -lt 4) { Start-Sleep -Seconds 2 }
                 }
-                Remove-Item -LiteralPath $statePath -Force
+                if ($saved.Count) { throw (T "Не восстановлено адаптеров: $($saved.Count); состояние и задача сохранены для следующего входа" "Adapters not restored: $($saved.Count); state and task retained for next logon") }
+                Remove-Item -LiteralPath $statePath -Force -ErrorAction Stop
             }
         } catch {
             $script:FinalizeFailed = $true
@@ -4057,6 +4250,22 @@ if ($script:WizardMode) {
         Write-Note (T 'Включён классический установщик: без него установка без winre.wim падает с 0x80070003' 'Classic setup enabled: without it, installing without winre.wim fails with 0x80070003')
     }
 
+    # Файлы памяти установленной Windows — независимо от размера ISO.
+    $PageFileMode = Read-Option -Question (T 'Файл подкачки pagefile.sys' 'Paging file pagefile.sys') -Items @(
+        (T "Заданный диапазон: $PageFileMinMB–$PageFileMaxMB МБ" "Custom range: $PageFileMinMB–$PageFileMaxMB MB"),
+        (T 'Размер выбирает Windows' 'Windows manages the size')
+    ) -Values @('custom','system') -Default $(if($PageFileMode -eq 'custom'){1}else{2})
+    $SwapFile = Read-Option -Question 'swapfile.sys' -Items @(
+        (T 'Отключить (результат зависит от версии Windows)' 'Disable (result depends on the Windows version)'),
+        (T 'Управляется Windows, фиксированный размер недоступен' 'Windows managed; a fixed size is unavailable')
+    ) -Values @('disabled','system') -Default $(if($SwapFile -eq 'disabled'){1}else{2})
+    $Hibernation = Read-Option -Question (T 'Гибернация и быстрый запуск (hiberfil.sys)' 'Hibernation and Fast Startup (hiberfil.sys)') -Items @(
+        (T 'Отключить' 'Disable'), (T 'Сохранить настройки исходной Windows' 'Keep source Windows settings')
+    ) -Values @('disabled','system') -Default $(if($Hibernation -eq 'disabled'){1}else{2})
+    $CrashDumps = Read-Option -Question (T 'Дампы памяти и журнал DumpStack' 'Memory dumps and the DumpStack log') -Items @(
+        (T 'Отключить' 'Disable'), (T 'Сохранить настройки исходной Windows' 'Keep source Windows settings')
+    ) -Values @('disabled','system') -Default $(if($CrashDumps -eq 'disabled'){1}else{2})
+
     # 10. Отладка
     Write-Host ''
     if (Read-YesNo -Question (T 'Вести подробный лог работы?' 'Write a detailed log?') -Default $false) {
@@ -4088,6 +4297,7 @@ if ($script:WizardMode) {
     if ($TrimSources)        { $cmd += ' -TrimSources' }
     if ($RemoveWinRE)        { $cmd += ' -RemoveWinRE' }
     if ($SaveWinRE)          { $cmd += ' -SaveWinRE' }
+    $cmd += " -PageFileMode $PageFileMode -PageFileMinMB $PageFileMinMB -PageFileMaxMB $PageFileMaxMB -SwapFile $SwapFile -Hibernation $Hibernation -CrashDumps $CrashDumps"
     $cmd += " -Guard $Guard"
     if ($script:DebugMode)   { $cmd += ' -Debug' }
 
@@ -4101,6 +4311,9 @@ if ($script:WizardMode) {
         exit 0
     }
 }
+
+# Validate before downloads, image servicing or working-directory cleanup.
+$memoryFilePolicy = Get-MemoryFilePolicy -PageFileMode $PageFileMode -PageFileMinMB $PageFileMinMB -PageFileMaxMB $PageFileMaxMB -SwapFile $SwapFile -Hibernation $Hibernation -CrashDumps $CrashDumps
 
 # --- пути ---
 if (-not $InputIso) { $InputIso = Select-InputIso }
@@ -4722,6 +4935,15 @@ $vOobeNet = if ($NoOobeNetworkBlock) { T 'сеть включена  (OOBE ск�
             else { T 'сеть выключена, вернётся при первом входе' 'network off, restored at first logon' }
 Write-Host (T "  OOBE           : $vOobeNet" "  OOBE           : $vOobeNet")
 Write-Host (T "  Сжатие         : $Compression" "  Compression    : $Compression")
+$pageFilePlan = if ($PageFileMode -eq 'custom') { "$PageFileMinMB–$PageFileMaxMB MB" } else { T 'размер выбирает Windows' 'Windows managed' }
+Write-Host "  pagefile.sys   : $pageFilePlan"
+Write-Host "  swapfile.sys   : $SwapFile"
+Write-Host (T "  Гибернация     : $Hibernation" "  Hibernation    : $Hibernation")
+Write-Host (T "  Дампы памяти   : $CrashDumps" "  Memory dumps   : $CrashDumps")
+if ($PageFileMode -eq 'custom') { Write-Note (T "Маленькая подкачка ограничивает доступную приложениям память: при нехватке RAM возможны ошибки выделения памяти.`r`n  Для тяжёлых задач увеличьте PageFileMaxMB или выберите PageFileMode system." "A small page file limits memory available to apps: low RAM can cause allocation failures.`r`n  For memory-heavy workloads, increase PageFileMaxMB or choose PageFileMode system.") }
+if ($SwapFile -eq 'disabled') { Write-Note (T 'Отключение swapfile.sys требует проверки на целевой версии Windows; штатного ограничения до 16 МБ нет.' 'Disabling swapfile.sys requires validation on the target Windows version; there is no supported 16 MB size limit.') }
+if ($Hibernation -eq 'disabled') { Write-Note (T 'Гибернация и быстрый запуск будут отключены.' 'Hibernation and Fast Startup will be disabled.') }
+if ($CrashDumps -eq 'disabled') { Write-Note (T 'Аварийные и полные live-дампы не будут сохраняться для разбора сбоев.' 'Crash dumps and full live dumps will not be saved for troubleshooting.') }
 
 if ($DryRun) {
     Write-Host ''
@@ -4998,33 +5220,28 @@ $capsRaw = Invoke-Dism -Arguments @("/Image:$mountDir", '/Get-Capabilities') -Qu
 # @(): у одиночного PSCustomObject в Windows PowerShell 5.1 нет свойства Count
 $caps = @(ConvertFrom-DismList -Lines $capsRaw.Output -Key 'Capability Identity' |
         Where-Object { $_.State -eq 'Installed' -or ($Preset -eq 'balanced' -and $_.State -in @('Staged', 'Install Pending', 'Uninstall Pending')) })
-Write-Step (T "Возможностей с файлами или ожидающими действиями: $($caps.Count)" "Capabilities with payload or pending actions: $($caps.Count)")
-
-$patterns = @()
-foreach ($rule in $script:CapabilityRules) {
-    if (Test-GroupActive -RulePreset $rule.Preset -Group $rule.Group) { $patterns += $rule.Pattern }
-}
-$patterns += $RemoveExtra
+Write-Step (T "Всего обнаружено возможностей с файлами или ожидающими действиями: $($caps.Count)" "Total capabilities found with payload or pending actions: $($caps.Count)")
+$selectedCaps = @(Get-RequestedRemovalItems -Items $caps -Identity 'Capability Identity' -Rules $script:CapabilityRules -IncludeExtra)
+$retainedCaps = $caps.Count - $selectedCaps.Count
+Write-Step (T "Выбрано для удаления: $($selectedCaps.Count); сохраняется по правилам сборки: $retainedCaps" "Selected for removal: $($selectedCaps.Count); retained by build rules: $retainedCaps")
 
 $removedCaps = 0
-foreach ($cap in $caps) {
+$failedCaps = 0
+$deferredCaps = 0
+foreach ($cap in $selectedCaps) {
     $name = $cap.'Capability Identity'
-    if (Test-Protected $name) { continue }
-    foreach ($pattern in $patterns) {
-        if ($name -match $pattern) {
-            if ($cap.State -match 'Pending') {
-                Write-Note (T "$name — $($cap.State), удаление offline отложено до завершения обслуживания при загрузке Windows" "$name - $($cap.State), offline removal deferred until servicing completes when Windows boots")
-                break
-            }
-            Write-Step (T "Удаляю возможность $name" "Removing capability $name")
-            $r = Invoke-Dism -Arguments @("/Image:$mountDir", '/Remove-Capability', "/CapabilityName:$name") -AllowFail -Quiet
-            if (Test-DismSuccess $r.ExitCode) { $removedCaps++; Write-Ok $name }
-            else { Write-ServicingRemovalFailure -Kind 'Capability' -Name $name -Result $r }
-            break
-        }
+    if ($cap.State -match 'Pending') {
+        $deferredCaps++
+        Write-Note (T "$name — $($cap.State), удаление offline отложено до завершения обслуживания при загрузке Windows" "$name - $($cap.State), offline removal deferred until servicing completes when Windows boots")
+        continue
     }
+    Write-Step (T "Удаляю возможность $name" "Removing capability $name")
+    $r = Invoke-Dism -Arguments @("/Image:$mountDir", '/Remove-Capability', "/CapabilityName:$name") -AllowFail -Quiet
+    if (Test-DismSuccess $r.ExitCode) { $removedCaps++; Write-Ok $name }
+    else { $failedCaps++; Write-ServicingRemovalFailure -Kind 'Capability' -Name $name -Result $r }
 }
-Write-Ok (T "Удалено возможностей: $removedCaps" "Capabilities removed: $removedCaps")
+$capSummary = T "Итог выбранных возможностей ($($selectedCaps.Count)): удалено $removedCaps; ошибок $failedCaps; отложено $deferredCaps" "Selected capabilities summary ($($selectedCaps.Count)): removed $removedCaps; failed $failedCaps; deferred $deferredCaps"
+if ($failedCaps -or $deferredCaps) { Write-Note $capSummary } else { Write-Ok $capSummary }
 
 #endregion
 
@@ -5200,6 +5417,8 @@ Mount-Hive -Name 'LITE_SOFTWARE' -File (Join-Path $mountDir 'Windows\System32\co
 Mount-Hive -Name 'LITE_SYSTEM'   -File (Join-Path $mountDir 'Windows\System32\config\SYSTEM')
 Mount-Hive -Name 'LITE_DEFAULT'  -File (Join-Path $mountDir 'Users\Default\NTUSER.DAT')
 Write-Ok (T 'Кусты реестра смонтированы' 'Registry hives mounted')
+Set-OfflineMemoryFilePolicy -Policy $memoryFilePolicy
+Write-Ok (T 'Параметры подкачки, swap, гибернации и дампов записаны в образ' 'Paging, swap, hibernation and dump settings written to the image')
 
 # --- службы ---
 $svcCount = 0
@@ -5510,6 +5729,7 @@ $buildInfo = [ordered]@{
     OutputIso = $OutputIso
     Preset = $Preset
     Keep = @($Keep)
+    MemoryFiles = $memoryFilePolicy
     Language = $imgLang
     SetupLanguage = $setupLang
     SetupLanguageUpdate = $(if ($setupRepair) { Split-Path $setupRepair -Leaf } else { $null })
@@ -5528,7 +5748,7 @@ $buildInfo = [ordered]@{
     SetupScriptLauncher = $(if ($useVbsLauncher) { 'VBScript / Run-Setup.vbs -> Win11Lite.ps1' } else { 'PowerShell / Win11Lite.ps1' })
     ServicingDismVersion = [string](Get-NativeToolVersion $script:Dism)
     AccountMode = $AccountMode
-} | ConvertTo-Json -Depth 4
+} | ConvertTo-Json -Depth 8
 [IO.File]::WriteAllText((Join-Path $supportDir 'build-info.json'), $buildInfo, [Text.UTF8Encoding]::new($false))
 [IO.File]::WriteAllText((Join-Path $isoDir 'win11-lite-build.json'), $buildInfo, [Text.UTF8Encoding]::new($false))
 Write-Ok (T "ID сборки: $($script:StartedAt.ToString('yyyyMMdd-HHmmss')) — записан в ISO и установленную Windows" "Build ID: $($script:StartedAt.ToString('yyyyMMdd-HHmmss')) - recorded in the ISO and installed Windows")

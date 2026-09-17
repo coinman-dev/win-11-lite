@@ -7,7 +7,7 @@ $repo=Split-Path $PSScriptRoot -Parent
 $t=$null;$e=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'win-11-lite.ps1'),[ref]$t,[ref]$e)
 if($e.Count){throw ($e|Out-String)}
-foreach($name in 'T','Get-AdkSourceHash','Confirm-MicrosoftSignature','Read-MsiTable','Get-MsiDirectoryPath','Get-MsiFileMap','Save-AdkInstallers','Get-AdkCatalog','Get-WimImageList','Get-NativeToolVersion','Save-DeploymentTools','Initialize-DeploymentTools','Ensure-WimMountDriver','Read-PreparedCache','Write-PreparedCache','Assert-ChildPath','Invoke-NativeQuiet','Test-DismSuccess','Resolve-AccountMode','Assert-LocalUserName','Test-SecureStringEqual','Read-ConfirmedLocalAccountPassword','Read-LocalAccountOptions','Get-LocalAccountXml','Get-ImageInstallXml','Get-ProductKeyUiMode','Get-ElevationCommand'){
+foreach($name in 'T','Get-AdkSourceHash','Confirm-MicrosoftSignature','Read-MsiTable','Get-MsiDirectoryPath','Get-MsiFileMap','Save-AdkInstallers','Get-AdkCatalog','Get-WimImageList','Get-IsoEditions','Get-NativeToolVersion','Save-DeploymentTools','Initialize-DeploymentTools','Ensure-WimMountDriver','Read-PreparedCache','Write-PreparedCache','Assert-ChildPath','Invoke-NativeQuiet','Test-DismSuccess','Resolve-AccountMode','Assert-LocalUserName','Test-SecureStringEqual','Read-ConfirmedLocalAccountPassword','Read-LocalAccountOptions','Get-LocalAccountXml','Get-ImageInstallXml','Get-ProductKeyUiMode','Get-ElevationCommand'){
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     if(-not $node){throw "Missing function: $name"}
     . ([scriptblock]::Create($node.Extent.Text))
@@ -56,6 +56,63 @@ try{
         }
         [IO.File]::WriteAllBytes($wim,$bytes)
         Assert-Throws {Get-WimImageList $wim} "Invalid metadata is rejected and handles close: $damage"
+    }
+    & {
+        # Real sharing violation on a fixture; disk mounting itself is mocked.
+        $iso=Join-Path $root 'locked source.iso';[IO.File]::WriteAllText($iso,'fixture')
+        $testDrive=(Split-Path -Qualifier $root).TrimEnd(':')
+        $state=@{Attached=$false;Mounts=0;Unmounts=0;Prompted=$false;Wim=$true;Esd=$false;Empty=$false;ReadError=$false;VolumeError=$false;DriveLetter=$testDrive;ReadPath=''}
+        function Get-DiskImage {param($ImagePath,$ErrorAction)[pscustomobject]@{Attached=$state.Attached}}
+        function Mount-DiskImage {
+            param($ImagePath,[switch]$PassThru,$Access,$ErrorAction)
+            $stream=[IO.File]::Open($ImagePath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+            $stream.Dispose();$state.Mounts++;[pscustomobject]@{Attached=$true}
+        }
+        function Dismount-DiskImage {param($ImagePath)$state.Unmounts++}
+        function Get-Volume {
+            [CmdletBinding()]param([Parameter(ValueFromPipeline)]$Disk)
+            process{if($state.VolumeError){Write-Error 'fixture volume failure';return};[pscustomobject]@{DriveLetter=$state.DriveLetter}}
+        }
+        function Start-Sleep {param($Seconds)}
+        function Test-Path {param($LiteralPath)if($LiteralPath -like '*\sources\install.wim'){$state.Wim}elseif($LiteralPath -like '*\sources\install.esd'){$state.Esd}else{Microsoft.PowerShell.Management\Test-Path -LiteralPath $LiteralPath}}
+        function Get-WimImageList {param($Path)$state.ReadPath=$Path;if($state.ReadError){throw 'fixture metadata failure'};if(-not $state.Empty){$images}}
+        function Test-CanPrompt {$true}
+        function Read-PathOrDefault {param($Question,$Default)$state.Prompted=$true;throw 'wizard incorrectly continued'}
+        function Write-Host {param($Object,$ForegroundColor)}
+        $wizard=$ast.Find({param($n)$n -is [Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -eq '$script:WizardMode'},$false)
+        if(-not $wizard){throw 'Wizard block not found'}
+        $oldWizardMode=$script:WizardMode;$script:WizardMode=$true;$InputIso=$iso
+        $lock=[IO.File]::Open($iso,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
+        try{
+            foreach($lang in 'ru','en'){
+                $script:Lang=$lang;$failure=$null
+                try{& ([scriptblock]::Create($wizard.Extent.Text))}catch{$failure=$_}
+                $expected=if($lang -eq 'ru'){'Сборка остановлена'}else{'Build stopped'}
+                Assert ($null -ne $failure -and $failure.Exception.Message.Contains($iso) -and $failure.Exception.Message.Contains($expected)) "Locked ISO terminates the real wizard with its path and localized error ($lang)"
+                Assert (-not $state.Prompted -and $state.Mounts -eq 0 -and $state.Unmounts -eq 0) "A sharing violation cannot reach the work-folder prompt or unmount an unowned image ($lang)"
+            }
+        }finally{$lock.Dispose();$script:WizardMode=$oldWizardMode;$script:Lang='en'}
+        $found=@(Get-IsoEditions -Path $iso)
+        Assert ($found.Count -eq 1 -and $found[0].EditionId -eq 'Core' -and $state.ReadPath -eq "${testDrive}:\sources\install.wim") 'Successful ISO reading still returns the actual edition metadata'
+        Assert ($state.Mounts -eq 1 -and $state.Unmounts -eq 1) 'Successful reading releases the mount it created'
+        $state.Attached=$true;$state.Wim=$false;$state.Esd=$true
+        $found=@(Get-IsoEditions -Path $iso)
+        Assert ($found.Count -eq 1 -and $state.ReadPath -eq "${testDrive}:\sources\install.esd" -and $state.Unmounts -eq 1) 'An already mounted ESD image is read without unmounting the user mount'
+        $state.ReadError=$true
+        Assert-Throws {Get-IsoEditions -Path $iso} 'A metadata read failure terminates instead of returning an empty edition list'
+        Assert ($state.Unmounts -eq 1) 'A metadata failure also preserves a user-owned mount'
+        $state.Attached=$false
+        Assert-Throws {Get-IsoEditions -Path $iso} 'A metadata failure propagates from a newly mounted image'
+        Assert ($state.Unmounts -eq 2) 'A metadata failure releases the mount created by the reader'
+        $state.ReadError=$false;$state.Esd=$false
+        Assert-Throws {Get-IsoEditions -Path $iso} 'Missing install.wim and install.esd is a fatal image error'
+        $state.Esd=$true;$state.Empty=$true
+        Assert-Throws {Get-IsoEditions -Path $iso} 'An image with no editions is a fatal image error'
+        $state.Empty=$false;$state.DriveLetter=$null;$state.ReadPath=''
+        Assert-Throws {Get-IsoEditions -Path $iso} 'A missing drive letter terminates before constructing an invalid path'
+        Assert ($state.ReadPath -eq '') 'A missing drive letter cannot redirect reads to another drive'
+        $state.DriveLetter=$testDrive;$state.VolumeError=$true
+        Assert-Throws {Get-IsoEditions -Path $iso} 'Volume enumeration errors terminate ISO reading'
     }
     & {
         $state=@{Downloads=0}

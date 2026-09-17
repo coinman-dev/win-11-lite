@@ -4,7 +4,7 @@
 
 [![Windows 11 x64](https://img.shields.io/badge/Windows%2011-x64-0078D4.svg)](#requirements-and-supported-images)
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20%7C%207-5391FE.svg)](#requirements-and-supported-images)
-[![Tests](https://img.shields.io/badge/tests-1183%20%C3%97%202-success.svg)](#validation-status)
+[![Tests](https://img.shields.io/badge/tests-1292%20%C3%97%202-success.svg)](#validation-status)
 
 **win-11-lite** builds a smaller, privacy-focused Windows 11 installation ISO from an original Microsoft x64 image. It removes selected inbox applications and components, applies privacy and OOBE settings, can integrate updates, languages and drivers, and exports one chosen Windows edition into a new bootable ISO.
 
@@ -23,6 +23,8 @@ Invoke-WebRequest https://raw.githubusercontent.com/coinman-dev/win-11-lite/main
 ```
 
 Running without parameters opens the interactive wizard. It finds nearby ISO files, asks which edition and preset to use, and requests administrator rights when the build starts.
+
+If the selected ISO is locked by another process, inaccessible or contains no readable Windows image, the wizard stops immediately with the ISO path and the original error. It does not ask for a work folder or continue to later steps.
 
 Preview an image and the complete removal plan without elevation or modification:
 
@@ -147,6 +149,8 @@ Presets are cumulative. `balanced` includes `safe`; `max` includes both and adds
 
 Selected consumer Appx targets include Clipchamp, Bing News/Weather, Get Help/Get Started, Office Hub, Solitaire, Feedback Hub, Phone Link, new Outlook, Teams, Xbox/Game Bar, Family and Microsoft To Do. Exact matches depend on what the source image contains.
 
+The capability-removal stage reports the total inventory separately from the capabilities selected for removal and retained by the build rules. Its final summary counts successful removals, failures and operations deferred because servicing is pending. A DISM removal error is recorded and processing continues with the next selected capability.
+
 ### What `balanced` explicitly preserves
 
 - Microsoft Store, Store Purchase App and Desktop App Installer;
@@ -181,6 +185,8 @@ By default, the builder prevents Windows Setup from downloading updates during O
 4. It restores only the adapters changed by the builder, removes its own firewall rule and temporary Windows Update/OOBE policies, then performs the final Edge cleanup.
 
 Use `-NoOobeNetworkBlock` to leave networking available during OOBE.
+
+If a saved adapter has not appeared or its enabled state is unconfirmed, restoration state and the task are retained. The finalizer retries detection, uses an unambiguous PnPDeviceID match after a GUID change, and restores other adapters independently of a failure. Task Scheduler retries failed runs up to three times at one-minute intervals; later sign-ins can retry again. Unrelated disabled adapters keep their state.
 
 To avoid the brief black PowerShell window that Windows Setup can show, every preset preserves VBScript and uses a generated text file, `Run-Setup.vbs`, when `wscript.exe` and `vbscript.dll` exist in the image. WScript creates the first PowerShell process hidden, waits for its result and propagates the exit code. No custom EXE is compiled or embedded. If the source image lacks the host or engine, the builder reports the fallback to direct PowerShell, where an initial console may appear.
 
@@ -256,6 +262,27 @@ Hardware requirement bypasses for TPM, Secure Boot, CPU, RAM and storage are inc
 | `-SaveWinRE` | Copy the removed recovery image beside the output ISO as `*_winre.wim`. It is not stored inside the ISO. |
 
 WinRE is the installed Windows Recovery Environment. It is different from WinPE in `boot.wim`, which continues to boot and run Windows Setup.
+
+### Memory files in installed Windows
+
+New builds default to a **128–1024 MB paging file**, with `swapfile.sys`, hibernation/Fast Startup and crash dumps disabled. These choices are independent of the preset and ISO compression. The wizard offers separate choices, `-DryRun` displays the selections, and build metadata stores them in `MemoryFiles`.
+
+| Parameter | Default and effect |
+| --- | --- |
+| `-PageFileMode custom|system` | `custom`: use the configured range; `system`: let Windows size the paging file. |
+| `-PageFileMinMB <MB>` | `128`: initial size of `pagefile.sys`. |
+| `-PageFileMaxMB <MB>` | `1024`: growth limit. For a fixed 128 MB file, use `-PageFileMaxMB 128`. |
+| `-SwapFile disabled|system` | `disabled`: request disabling through `SwapfileControl=0`; `system`: remove the override and let Windows manage swap. |
+| `-Hibernation disabled|system` | `disabled`: disable hibernation, Fast Startup and `hiberfil.sys`; `system`: keep source image settings. |
+| `-CrashDumps disabled|system` | `disabled`: disable crash dumps (`MEMORY.DMP`/Minidump), full live dumps, DumpStack logging and dedicated dump file configuration; `system`: keep source settings. |
+
+A small paging file limits the total memory available to apps. For memory-heavy workloads, increase `-PageFileMaxMB` or choose `-PageFileMode system`. Disabling hibernation also disables Fast Startup; disabling dumps removes that troubleshooting data. These options do not disable memory compression in RAM.
+
+There is no documented supported setting to cap `swapfile.sys` at 16 MB: an observed size on one machine is not guaranteed on another. `SwapfileControl` is an undocumented override; its effect and Store/MSIX app compatibility need validation on the target Windows version. Use `-SwapFile system` for normal Windows management.
+
+Settings are written to every ControlSet in the image SYSTEM hive and reapplied during setup preparation/finalization. Existing registry keys, unrelated values and child keys are preserved; failures report the full value path. Paging/swap and DumpStack changes may need a restart to finish resizing or removing files; the builder does not restart Windows automatically. After finalization, `C:\Windows\Setup\Scripts\Win11Lite\memory-files-report.json` records requested settings and observed sizes. It is a snapshot at finalization, not a promise of sizes after a restart. Guard does not reapply these settings at every logon.
+
+VMDK size, ISO size and used space on C: are different measurements. Compare used space inside both Windows installations, including memory files. Identical sizes on different hardware are not guaranteed. See Microsoft's documentation on [paging](https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/how-to-determine-the-appropriate-page-file-size-for-64-bit-versions-of-windows), [powercfg](https://learn.microsoft.com/en-us/windows-hardware/design/device-experiences/powercfg-command-line-options) and [full live dumps](https://learn.microsoft.com/en-us/windows/win32/wer/wer-settings).
 
 ---
 
@@ -335,6 +362,12 @@ The table covers every user-facing parameter. Run `Get-Help .\win-11-lite.ps1 -F
 | `-SaveWinRE` | Save a copy of the removed `winre.wim` beside the ISO. |
 | `-TrimSources` | Remove setup files not required for boot installation. |
 | `-CompactOS` | Install Windows in CompactOS mode. |
+| `-PageFileMode custom|system` | Use a custom paging range or Windows management; default custom. |
+| `-PageFileMinMB <MB>` | Initial paging file size; default 128 MB. |
+| `-PageFileMaxMB <MB>` | Maximum paging file size; default 1024 MB, at least the initial size. |
+| `-SwapFile disabled|system` | Disable swap through an override or let Windows manage it; default disabled. |
+| `-Hibernation disabled|system` | Disable hibernation/Fast Startup or keep source settings; default disabled. |
+| `-CrashDumps disabled|system` | Disable crash/full live dumps and DumpStack or keep source settings; default disabled. |
 | `-Compression recovery|max` | Choose `install.esd` or `install.wim`; default `recovery`. |
 | `-ResetBase` | Make integrated updates non-removable. |
 | `-ProductKey <key>` | Product key for the generated answer file. |
@@ -397,14 +430,14 @@ Guest runtime files live under `C:\Windows\Setup\Scripts\Win11Lite`. For VM diag
 
 ## Validation status
 
-As of 2026-09-15, 13 suites contain **1,183 checks on Windows PowerShell 5.1 and another 1,183 on PowerShell 7**. They cover parsers, safe paths, work-drive capacity and retry prompts, downloads/cache, WIM metadata, ADK catalogs, languages, answer files, Appx/removal rules, Guard reports/history, daily log retention and midnight rollover, OOBE networking, real child processes, progress stalls and recovery, Windows batch files and the WScript launcher.
+As of 2026-09-16, 14 suites contain **1,292 checks for each of Windows PowerShell 5.1 and PowerShell 7**. They cover parsers, safe paths, work-drive capacity, downloads/cache, WIM/ADK, languages, answer files, removal rules, Guard reports/history, log retention, OOBE networking, memory files, child processes, progress, CMD and VBS. For the memory-file and network changes, eight affected suites passed: **646 checks on each PowerShell version**; other suites were not rerun. DryRun against a real ISO passed with RU/7 and EN/5.1. The ISO-read fix passed all 151 Servicing checks on each runtime, including a real file-sharing violation with mocked ISO APIs. The latest registry fix passed MemoryFiles 72 and SingleFile 45 on each runtime (117 checks), including actual registry operations and deletion-denying ACLs inside a disposable HKCU fixture. The capability-counter change passed all 246 Main checks on each runtime, including continuing after a removal error with mocked DISM.
 
-Tests that exercise Guard, OOBE, registry, services or servicing replace system APIs with controlled fixtures. They are not presented as a real VM result. Real builds and prior VM logs confirm substantial parts of the 24H2/26H1 flow; the newest VBS launcher, localized winget Firefox installation and current `max` exception still need a fresh VM installation.
+Tests that exercise Guard, OOBE, registry, services or servicing use controlled fixtures for system operations. Registry preservation tests also use the real provider inside a disposable HKCU key, with HKLM paths redirected there. They are not presented as a real VM result. Real builds and prior VM logs confirm substantial parts of the 24H2/26H1 flow; current memory-file/network changes, the newest VBS launcher, localized winget Firefox installation and current `max` exception still need a fresh installation.
 
 Run the complete test set sequentially:
 
 ```powershell
-$suites = 'Test-SingleFile', 'Test-Win11Lite', 'Test-WindowsBatch', 'Test-WingetDetection', 'Test-Guard', 'Test-GuardModes', 'Test-GuestLogs', 'Test-Downloads', 'Test-SetupLanguage', 'Test-OobeNetwork', 'Test-SetupLauncher', 'Test-Compatibility', 'Test-Servicing'
+$suites = 'Test-SingleFile', 'Test-Win11Lite', 'Test-WindowsBatch', 'Test-WingetDetection', 'Test-Guard', 'Test-GuardModes', 'Test-GuestLogs', 'Test-Downloads', 'Test-SetupLanguage', 'Test-OobeNetwork', 'Test-SetupLauncher', 'Test-Compatibility', 'Test-Servicing', 'Test-MemoryFiles'
 foreach ($suite in $suites) {
     powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ".\tests\$suite.ps1"
     if ($LASTEXITCODE -ne 0) { throw "Failed: $suite" }

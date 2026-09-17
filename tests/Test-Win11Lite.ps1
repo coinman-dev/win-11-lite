@@ -475,6 +475,8 @@ try {
         function Write-Stage { param($Message) }
         function Write-Ok { param($Message) }
         function Write-Fail { param($Message) $regMessages.Add($Message) }
+        # The new registry-provider boundary is covered by Test-MemoryFiles.
+        function Set-OfflineMemoryFilePolicy { param($Policy) }
         $mountDir = Join-Path $testRoot 'registry-mount'
         foreach ($relative in @('Windows\System32\config\SOFTWARE','Windows\System32\config\SYSTEM','Users\Default\NTUSER.DAT')) {
             $file = Join-Path $mountDir $relative
@@ -572,6 +574,10 @@ try {
             & ([scriptblock]::Create($region))
         }
         Assert ($servicing.Caps['Language.Speech~~~en-US~0.0.1.0'] -eq 'Not Present') 'Balanced removes selected staged capability payload'
+        Assert ($notes -contains 'Total capabilities found with payload or pending actions: 4' -and $notes -contains 'Selected for removal: 3; retained by build rules: 1') 'Capability inventory count is separate from selected and protected counts'
+        Assert ($notes -contains 'Selected capabilities summary (3): removed 1; failed 1; deferred 1') 'The capability summary accounts for successes, failures and deferred items separately'
+        $capCalls=@($events | Where-Object { $_ -match '/Remove-Capability ' })
+        Assert ($capCalls.Count -eq 2 -and $capCalls[0] -match 'Language.OCR' -and $capCalls[1] -match 'Language.Speech') 'A failed capability removal does not stop later selected capabilities'
         Assert ($servicing.Packages['Microsoft-Windows-Hello-Face-Package~test'] -eq 'Not Present') 'Balanced removes selected staged package payload'
         Assert (-not @($events | Where-Object { $_ -match '/Remove-.+(Handwriting|TabletPCMath)' }).Count) 'Pending packages are not forced through incomplete servicing'
         Assert ($servicing.Caps['Language.Basic~~~ru-RU~0.0.1.0'] -eq 'Installed') 'Update cleanup preserves required language even with RemoveExtra'

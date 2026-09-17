@@ -21,12 +21,12 @@ try{
         $env:TEMP=$root;$env:TMP=$root
         Add-Type 'namespace Win11Lite { public static class Oobe { public static bool Complete = false; public static bool Success = true; public static bool OOBEComplete(out bool complete) { complete = Complete; return Success; } } }'
     }finally{$env:TEMP=$compileTemp;$env:TMP=$compileTmp}
-    foreach($case in @('late-adapter','enumeration-retry','late-reenable','first-logon','wait-completion','timeout','api-failure','temporary-user','firewall-failure','firewall-query-failure','adapter-failure','edge-failure','network-opt-out','custom-oobe','late-prepare')){
+    foreach($case in @('late-adapter','enumeration-retry','late-reenable','first-logon','wait-completion','timeout','api-failure','temporary-user','firewall-failure','firewall-query-failure','adapter-failure','edge-failure','network-opt-out','custom-oobe','late-prepare','missing-on-restore','late-on-restore','changed-guid','unconfirmed-enable','independent-adapters','restore-query-retry','legacy-nested-state','ambiguous-pnp')){
         & {
             $dir=Join-Path $root $case;$null=New-Item -ItemType Directory -Path $dir
             $state=@{Adapters=@();Calls=0;Firewall=$false;ForeignFirewall=$true;FirewallRemoveFails=$false;EnableFails=$false;EmptyCalls=0;QueryFailures=0;Tasks=@{};Events=[Collections.Generic.List[string]]::new();SleepSeconds=0;CompleteOnSleep=$false;Clock=0}
             $originallyDisabled=[pscustomobject]@{Name='User-disabled';InterfaceGuid='keep-disabled';AdminStatus='Down'}
-            $nic=[pscustomobject]@{Name='Ethernet';InterfaceGuid='main-nic';AdminStatus='Up'}
+            $nic=[pscustomobject]@{Name='Ethernet';InterfaceGuid='main-nic';PnPDeviceID='PCI\NIC1';AdminStatus='Up'}
             $state.Adapters=@($nic,$originallyDisabled)
             $env:USERNAME='real-user'
             [Win11Lite.Oobe]::Complete=$false;[Win11Lite.Oobe]::Success=$true
@@ -51,7 +51,7 @@ try{
                 $state.Adapters
             }
             function Disable-NetAdapter {[CmdletBinding(SupportsShouldProcess)]param([Parameter(ValueFromPipeline)]$InputObject)process{$state.Events.Add('disable:'+$InputObject.InterfaceGuid);$InputObject.AdminStatus='Down'}}
-            function Enable-NetAdapter {[CmdletBinding(SupportsShouldProcess)]param([Parameter(ValueFromPipeline)]$InputObject)process{if($state.EnableFails){throw 'Enable denied'};$state.Events.Add('enable:'+$InputObject.InterfaceGuid);$InputObject.AdminStatus='Up'}}
+            function Enable-NetAdapter {[CmdletBinding(SupportsShouldProcess)]param([Parameter(ValueFromPipeline)]$InputObject)process{if($state.EnableFails -or $InputObject.InterfaceGuid -eq $state.FailGuid){throw 'Enable denied'};$state.Events.Add('enable:'+$InputObject.InterfaceGuid);if(-not $state.EnableNoOp){$InputObject.AdminStatus='Up'}}}
             function Get-NetFirewallRule {
                 param($Name,$PolicyStore,$ErrorAction)
                 if(($Name -and $Name -ne 'Win11Lite-OOBE-Temporary-Outbound-Block') -or $PolicyStore -ne 'PersistentStore'){throw 'Unexpected firewall access'}
@@ -69,7 +69,7 @@ try{
             function New-ScheduledTaskAction {param($Execute,$Argument)[pscustomobject]@{Execute=$Execute;Argument=$Argument}}
             function New-ScheduledTaskTrigger {param([switch]$AtLogOn)[pscustomobject]@{Delay=''}}
             function New-ScheduledTaskPrincipal {param($UserId,$LogonType,$RunLevel)'principal'}
-            function New-ScheduledTaskSettingsSet {param([switch]$StartWhenAvailable,[switch]$AllowStartIfOnBatteries,[switch]$DontStopIfGoingOnBatteries,$MultipleInstances,$ExecutionTimeLimit)[pscustomobject]@{Limit=$ExecutionTimeLimit}}
+            function New-ScheduledTaskSettingsSet {param([switch]$StartWhenAvailable,[switch]$AllowStartIfOnBatteries,[switch]$DontStopIfGoingOnBatteries,$MultipleInstances,$ExecutionTimeLimit,$RestartCount,$RestartInterval)[pscustomobject]@{Limit=$ExecutionTimeLimit;RestartCount=$RestartCount;RestartInterval=$RestartInterval}}
             function Register-ScheduledTask {param($TaskName,$Action,$Trigger,$Principal,$Settings,[switch]$Force)$state.Tasks[$TaskName]=[pscustomobject]@{Action=$Action;Settings=$Settings}}
             function Unregister-ScheduledTask {[CmdletBinding(SupportsShouldProcess)]param($TaskName)$state.Tasks.Remove($TaskName)}
             function Start-Process {param($FilePath,$WindowStyle,$ArgumentList)Assert ($WindowStyle -eq 'Hidden' -and $FilePath -like '*\powershell.exe' -and $ArgumentList -match 'Win11Lite\.ps1" -Mode finalize-wait$') 'FirstLogon starts a hidden PowerShell waiter without holding up desktop startup';$state.Events.Add('background-wait')}
@@ -87,8 +87,63 @@ try{
             if($case -eq 'late-adapter'){$state.EmptyCalls=20}
             if($case -eq 'enumeration-retry'){$state.QueryFailures=2}
             & $guest -Mode prepare -Direct
-            Assert ($state.Tasks['win-11-lite finalize'].Action.Argument -match 'Win11Lite\.ps1" -Mode finalize-wait$' -and $state.Tasks['win-11-lite finalize'].Action.Execute -like '*\powershell.exe') 'SYSTEM logon task waits for actual OOBE completion through the PowerShell runner'
+            Assert ($state.Tasks['win-11-lite finalize'].Action.Argument -match 'Win11Lite\.ps1" -Mode finalize-wait$' -and $state.Tasks['win-11-lite finalize'].Action.Execute -like '*\powershell.exe' -and $state.Tasks['win-11-lite finalize'].Settings.RestartCount -eq 3 -and $state.Tasks['win-11-lite finalize'].Settings.RestartInterval.TotalMinutes -eq 1) 'SYSTEM logon task waits for OOBE and retries failures three times at one-minute intervals'
             switch($case){
+                'legacy-nested-state'{
+                    $statePath=Join-Path $dir 'network-state.clixml'
+                    $legacy=[Collections.ArrayList]::new();$inner=[Collections.ArrayList]::new()
+                    $null=$inner.Add([pscustomobject]@{InterfaceGuid='main-nic'})
+                    $null=$legacy.Add($inner)
+                    Export-Clixml -LiteralPath $statePath -InputObject $legacy
+                    [Win11Lite.Oobe]::Complete=$true
+                    & $guest -Mode finalize -Direct
+                    Assert ($LASTEXITCODE -eq 0 -and $nic.AdminStatus -eq 'Up' -and -not (Test-Path -LiteralPath $statePath)) 'Nested legacy state without PnP identity still restores by GUID'
+                }
+                'ambiguous-pnp'{
+                    [Win11Lite.Oobe]::Complete=$true;$nic.InterfaceGuid='new-guid'
+                    $duplicate=[pscustomobject]@{Name='Ethernet';InterfaceGuid='another-guid';PnPDeviceID='PCI\NIC1';AdminStatus='Down'}
+                    $state.Adapters=@($nic,$duplicate,$originallyDisabled)
+                    & $guest -Mode finalize -Direct
+                    Assert ($LASTEXITCODE -eq 1 -and $nic.AdminStatus -eq 'Down' -and $duplicate.AdminStatus -eq 'Down' -and $state.Tasks.ContainsKey('win-11-lite finalize')) 'Ambiguous PnP identity never enables an arbitrary device'
+                }
+                'missing-on-restore'{
+                    [Win11Lite.Oobe]::Complete=$true;$state.Adapters=@($originallyDisabled)
+                    & $guest -Mode finalize -Direct
+                    Assert ($LASTEXITCODE -eq 1 -and $state.Tasks.ContainsKey('win-11-lite finalize') -and (Test-Path -LiteralPath (Join-Path $dir 'network-state.clixml'))) 'Absent saved NIC retains state and retry task and is not reported as success'
+                    Assert (-not $state.Firewall -and $originallyDisabled.AdminStatus -eq 'Down') 'Missing NIC does not retain the firewall block or enable unrelated NICs'
+                    $state.Adapters=@($nic,$originallyDisabled)
+                    & $guest -Mode finalize -Direct
+                    Assert ($LASTEXITCODE -eq 0 -and $nic.AdminStatus -eq 'Up' -and -not (Test-Path -LiteralPath (Join-Path $dir 'network-state.clixml'))) 'A later logon can restore the NIC from the retained record'
+                }
+                'late-on-restore'{
+                    [Win11Lite.Oobe]::Complete=$true;$state.EmptyCalls=$state.Calls+2
+                    & $guest -Mode finalize -Direct
+                    Assert ($LASTEXITCODE -eq 0 -and $nic.AdminStatus -eq 'Up' -and $state.SleepSeconds -ge 4) 'Restoration retries adapters that appear late'
+                }
+                'restore-query-retry'{
+                    [Win11Lite.Oobe]::Complete=$true;$state.QueryFailures=$state.Calls+2
+                    & $guest -Mode finalize -Direct
+                    Assert ($LASTEXITCODE -eq 0 -and $nic.AdminStatus -eq 'Up') 'Restoration retries transient enumeration failures'
+                }
+                'changed-guid'{
+                    [Win11Lite.Oobe]::Complete=$true;$nic.InterfaceGuid='new-guid'
+                    & $guest -Mode finalize -Direct
+                    Assert ($LASTEXITCODE -eq 0 -and $nic.AdminStatus -eq 'Up' -and $originallyDisabled.AdminStatus -eq 'Down') 'Stable PnP identity restores a re-enumerated NIC without enabling unrelated NICs'
+                }
+                'unconfirmed-enable'{
+                    [Win11Lite.Oobe]::Complete=$true;$state.EnableNoOp=$true
+                    & $guest -Mode finalize -Direct
+                    Assert ($LASTEXITCODE -eq 1 -and $state.Tasks.ContainsKey('win-11-lite finalize') -and (Test-Path -LiteralPath (Join-Path $dir 'network-state.clixml'))) 'A successful Enable call without AdminStatus Up cannot discard restoration state'
+                }
+                'independent-adapters'{
+                    $second=[pscustomobject]@{Name='Second';InterfaceGuid='second-nic';PnPDeviceID='PCI\NIC2';AdminStatus='Up'}
+                    $state.Adapters=@($nic,$second,$originallyDisabled)
+                    & $guest -Mode prepare-register -Direct
+                    [Win11Lite.Oobe]::Complete=$true;$state.FailGuid='main-nic'
+                    & $guest -Mode finalize -Direct
+                    $pending=@(Import-Clixml -LiteralPath (Join-Path $dir 'network-state.clixml') | ForEach-Object { $_ })
+                    Assert ($LASTEXITCODE -eq 1 -and $second.AdminStatus -eq 'Up' -and $pending.Count -eq 1 -and $pending[0].InterfaceGuid -eq 'main-nic') 'One failing NIC does not prevent another from restoring; only pending records are retained'
+                }
                 'late-adapter'{
                     Assert ($state.Firewall -and $nic.AdminStatus -eq 'Up' -and $state.SleepSeconds -eq 14) 'No initial adapters leaves the persistent firewall block in place'
                     $state.EmptyCalls=0
