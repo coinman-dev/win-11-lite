@@ -2441,8 +2441,40 @@ function Write-GuestLog {
 function Write-RunnerLog   { param([string]$Message) Write-GuestLog 'launcher.log' $Message }
 function Write-PrepareLog  { param([string]$Message) Write-GuestLog 'prepare.log' $Message }
 function Write-FinalizeLog { param([string]$Message) Write-GuestLog 'finalize.log' $Message }
+# Add-Type компилирует код через csc.exe и кладёт исходник в %TEMP%. Профиль без
+# HKCU\Environment\TEMP наследует машинный C:\Windows\TEMP, а там у группы
+# «Пользователи» есть запись, но нет перечисления содержимого: свой же файл
+# читается, csc.exe ищет его через каталог и выдаёт CS2001 «не найден исходный
+# файл». Такой профиль оставляют установщики, переписывающие HKCU\Environment.
+function Get-GuestCompilerTempPath {
+    $candidates = @([IO.Path]::GetTempPath())
+    if ($env:LOCALAPPDATA) { $candidates += (Join-Path $env:LOCALAPPDATA 'Temp') }
+    if ($env:SystemRoot)   { $candidates += (Join-Path $env:SystemRoot 'Temp') }
+    foreach ($candidate in $candidates) {
+        if (-not $candidate) { continue }
+        $probe = $null
+        try {
+            [void][IO.Directory]::CreateDirectory($candidate)
+            $name = 'win11lite-' + [guid]::NewGuid().ToString('N') + '.tmp'
+            $probe = [IO.Path]::Combine($candidate, $name)
+            [IO.File]::WriteAllText($probe, 'probe')
+            [void][IO.File]::ReadAllText($probe)
+            # Повторяет поиск компилятора: без перечисления каталога csc.exe не
+            # находит уже записанный файл, поэтому одной записи и чтения мало.
+            if (@([IO.Directory]::GetFiles($candidate, $name)).Count -ne 1) { continue }
+            return $candidate
+        } catch { }
+        finally { if ($probe) { try { [IO.File]::Delete($probe) } catch { } } }
+    }
+    $null
+}
 function Test-NativeOobeComplete {
     if (-not ('Win11Lite.Oobe' -as [type])) {
+        $compilerTemp = Get-GuestCompilerTempPath
+        $savedTemp = $env:TEMP
+        $savedTmp  = $env:TMP
+        if ($compilerTemp) { $env:TEMP = $compilerTemp; $env:TMP = $compilerTemp }
+        try {
         Add-Type -TypeDefinition @"
 using System.Runtime.InteropServices;
 namespace Win11Lite {
@@ -2453,6 +2485,7 @@ namespace Win11Lite {
     }
 }
 "@
+        } finally { $env:TEMP = $savedTemp; $env:TMP = $savedTmp }
     }
     $complete = $false
     if (-not [Win11Lite.Oobe]::OOBEComplete([ref]$complete)) {
@@ -2871,14 +2904,23 @@ function Register-GuardViewerTask {
 }
 
 function Test-GuardOobeComplete {
+    param([string]$SupportDirectory=$PSScriptRoot)
     $setup=Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\Setup' -ErrorAction Stop
     if($env:USERNAME -eq 'defaultuser0' -or $setup.OOBEInProgress -eq 1 -or $setup.SystemSetupInProgress -eq 1){return $false}
     # An unavailable probe must not open a window, and must not fail the run.
-    try{Test-NativeOobeComplete}catch{$false}
+    # Оно также не должно молча прятать готовый отчёт: отметку конца OOBE пишет
+    # finalize, и её достаточно. Причина отказа probe попадает в дневной журнал —
+    # без неё исчезнувшее окно выглядит как отсутствие проверки.
+    try{Test-NativeOobeComplete}
+    catch{
+        $marker=[bool]($SupportDirectory -and (Test-Path -LiteralPath (Join-Path $SupportDirectory 'oobe-complete')))
+        Write-RunnerLog (T "Состояние OOBE недоступно: $($_.Exception.Message); отметка oobe-complete: $marker" "OOBE state unavailable: $($_.Exception.Message); oobe-complete marker: $marker")
+        $marker
+    }
 }
 function Start-GuardViewer {
     param([string]$SupportDirectory,[guid]$RunId,[ValidateSet('Debug','Standard','Silent')][string]$Mode)
-    if($Mode -eq 'Silent' -or -not (Test-GuardOobeComplete)){return}
+    if($Mode -eq 'Silent' -or -not (Test-GuardOobeComplete $SupportDirectory)){return}
     $sessions=@(Get-Process -Name explorer -IncludeUserName -ErrorAction SilentlyContinue |
         Where-Object{$_.SessionId -gt 0 -and $_.UserName -and $_.UserName -notmatch '\\defaultuser0$'} |
         Select-Object -ExpandProperty SessionId -Unique)
@@ -3056,7 +3098,7 @@ function Read-GuardLiveLog {
 
 function Show-GuardView {
     param([string]$SupportDirectory,[ValidateSet('Debug','Standard','Silent')][string]$Mode,[string]$RunId,[int]$WaitSeconds=120)
-    if($Mode -eq 'Silent' -or -not (Test-GuardOobeComplete)){return}
+    if($Mode -eq 'Silent' -or -not (Test-GuardOobeComplete $SupportDirectory)){return}
     if($RunId -and $RunId -ne '$(Arg0)'){$null=[guid]::Parse($RunId)}else{$RunId=''}
     $Host.UI.RawUI.WindowTitle='win-11-lite guard - '+$Mode
     $deadline=(Get-Date).AddSeconds($WaitSeconds)

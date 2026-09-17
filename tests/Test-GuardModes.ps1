@@ -11,7 +11,7 @@ if(-not $accessor){throw 'Missing Get-GuestScript'}
 . ([scriptblock]::Create($accessor.Extent.Text))
 $guestAst=[Management.Automation.Language.Parser]::ParseInput((Get-GuestScript),[ref]$t,[ref]$e)
 if($e.Count){throw ($e|Out-String)}
-foreach($name in 'Get-GuardMode','Get-GuardExpectedApps','Get-GuardControlText','Get-GuardBriefReport','Start-GuardViewer','Show-GuardView','Read-GuardLiveLog','Assert-GuestLogPath','New-GuardViewerAction','Register-GuardViewerTask','Remove-GuardSelectedPath'){
+foreach($name in 'Get-GuardMode','Get-GuardExpectedApps','Get-GuardControlText','Get-GuardBriefReport','Start-GuardViewer','Show-GuardView','Read-GuardLiveLog','Assert-GuestLogPath','New-GuardViewerAction','Register-GuardViewerTask','Remove-GuardSelectedPath','Get-GuestCompilerTempPath','Test-NativeOobeComplete','Test-GuardOobeComplete'){
     $node=$guestAst.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     if(-not $node){throw "Missing guest function: $name"}
     . ([scriptblock]::Create($node.Extent.Text))
@@ -132,6 +132,51 @@ try{
         Show-GuardView $testRoot Debug $current 0
         Assert ($shown.Count -eq 3 -and $shown[0] -match '\[END\]' -and $shown[2] -eq ('Detailed report: '+(Join-Path $testRoot 'guard-report.txt'))) 'Debug also shows the report location after its live log, in English'
         $config.Language='ru-RU'
+    }
+    # Настоящий каталог с запретом перечисления повторяет C:\Windows\TEMP для
+    # обычного пользователя: запись и чтение своего файла проходят, а csc.exe
+    # ищет исходник через каталог и не находит его.
+    & {
+        $blind=Join-Path $testRoot 'blind-temp';$null=New-Item -ItemType Directory -Path $blind
+        $me=[Security.Principal.WindowsIdentity]::GetCurrent().User
+        $acl=Get-Acl -LiteralPath $blind
+        $deny=[Security.AccessControl.FileSystemAccessRule]::new($me,'ListDirectory','None','None','Deny')
+        $acl.AddAccessRule($deny);Set-Acl -LiteralPath $blind -AclObject $acl
+        $savedTemp=$env:TEMP;$savedTmp=$env:TMP
+        try{
+            $written=Join-Path $blind 'written.tmp';[IO.File]::WriteAllText($written,'x')
+            Assert ([IO.File]::ReadAllText($written) -eq 'x') 'Фикстура повторяет C:\Windows\TEMP: свой файл пишется и читается'
+            Assert-Throws {[IO.Directory]::GetFiles($blind,'written.tmp')} 'Фикстура повторяет C:\Windows\TEMP: каталог не перечисляется'
+            $env:TEMP=$blind;$env:TMP=$blind
+            $picked=Get-GuestCompilerTempPath
+            Assert ($picked -and ([IO.Path]::GetFullPath($picked)) -ne ([IO.Path]::GetFullPath($blind)+'\')) 'Каталог без перечисления не выбирается для компиляции'
+            Assert (@([IO.Directory]::GetFiles($picked,'win11lite-*')).Count -eq 0) 'Выбранный каталог перечисляется, и проба за собой убирает'
+            Assert ((Test-NativeOobeComplete) -is [bool]) 'Состояние OOBE определяется даже при нечитаемом %TEMP%'
+            Assert ($env:TEMP -eq $blind -and $env:TMP -eq $blind) 'Probe возвращает прежние TEMP и TMP вызывающему'
+            [IO.File]::Delete($written)
+        }finally{
+            $env:TEMP=$savedTemp;$env:TMP=$savedTmp
+            $acl=Get-Acl -LiteralPath $blind;$null=$acl.RemoveAccessRule($deny);Set-Acl -LiteralPath $blind -AclObject $acl
+        }
+    }
+    & {
+        # Недоступный probe не должен молча прятать готовый отчёт.
+        $setup=@{OOBEInProgress=0;SystemSetupInProgress=0}
+        $logged=[Collections.Generic.List[string]]::new()
+        function Get-ItemProperty {param($LiteralPath,$ErrorAction)if($LiteralPath -ne 'HKLM:\SYSTEM\Setup'){throw 'Unexpected registry path'};[pscustomobject]$setup}
+        function Write-RunnerLog {param($Message)$logged.Add([string]$Message)}
+        function Test-NativeOobeComplete {throw 'probe unavailable fixture'}
+        $marker=Join-Path $testRoot 'oobe-complete'
+        Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+        Assert (-not (Test-GuardOobeComplete $testRoot)) 'Без отметки конца OOBE недоступный probe не открывает окно'
+        Set-Content -LiteralPath $marker -Value (Get-Date -Format o) -Encoding ascii
+        Assert (Test-GuardOobeComplete $testRoot) 'Отметка finalize подтверждает конец OOBE, когда probe недоступен'
+        Assert ($logged.Count -eq 2 -and @($logged|Where-Object{$_ -match 'probe unavailable fixture'}).Count -eq 2) 'Причина отказа probe каждый раз попадает в дневной журнал'
+        Assert ($logged[0] -match 'False' -and $logged[1] -match 'True') 'В журнале видно, нашлась ли отметка oobe-complete'
+        $logged.Clear();$setup.OOBEInProgress=1
+        Assert (-not (Test-GuardOobeComplete $testRoot) -and -not $logged.Count) 'Идущий OOBE закрывает окно до обращения к probe'
+        $setup.OOBEInProgress=0;$setup.SystemSetupInProgress=1
+        Assert (-not (Test-GuardOobeComplete $testRoot) -and -not $logged.Count) 'Незавершённая установка системы тоже проверяется раньше probe'
     }
     # The deletion fallback runs only on our own test files.
     # Remove-GuardSelectedPath was loaded from the embedded guest above.

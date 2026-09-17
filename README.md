@@ -4,7 +4,7 @@
 
 [![Windows 11 x64](https://img.shields.io/badge/Windows%2011-x64-0078D4.svg)](#requirements-and-supported-images)
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20%7C%207-5391FE.svg)](#requirements-and-supported-images)
-[![Tests](https://img.shields.io/badge/tests-1292%20%C3%97%202-success.svg)](#validation-status)
+[![Tests](https://img.shields.io/badge/tests-1304-success.svg)](#validation-status)
 
 **win-11-lite** builds a smaller, privacy-focused Windows 11 installation ISO from an original Microsoft x64 image. It removes selected inbox applications and components, applies privacy and OOBE settings, can integrate updates, languages and drivers, and exports one chosen Windows edition into a new bootable ISO.
 
@@ -112,6 +112,13 @@ schtasks.exe /Change /TN "\win-11-lite guard" /Enable
 ```
 
 Disabling the task does not stop a check already running and does not restore removed applications or policies. After re-enabling it, Guard runs at the next sign-in. Updating Guard itself requires rebuilding the ISO.
+
+If the report window opens and closes within a second while the report files are still being written, check `%TEMP%` for the signed-in user. Some third-party installers rewrite `HKCU\Environment` and drop its `TEMP` and `TMP` values; the session then inherits `C:\Windows\TEMP`, which standard users may write to but not enumerate, so the OOBE state check cannot compile its helper and the window closes without output. The daily log now records the reason. Restore the Windows defaults without elevation:
+
+```powershell
+reg.exe add "HKCU\Environment" /v TEMP /t REG_EXPAND_SZ /d "%USERPROFILE%\AppData\Local\Temp" /f
+reg.exe add "HKCU\Environment" /v TMP  /t REG_EXPAND_SZ /d "%USERPROFILE%\AppData\Local\Temp" /f
+```
 
 ---
 
@@ -430,7 +437,7 @@ Guest runtime files live under `C:\Windows\Setup\Scripts\Win11Lite`. For VM diag
 
 ## Validation status
 
-As of 2026-09-16, 14 suites contain **1,292 checks for each of Windows PowerShell 5.1 and PowerShell 7**. They cover parsers, safe paths, work-drive capacity, downloads/cache, WIM/ADK, languages, answer files, removal rules, Guard reports/history, log retention, OOBE networking, memory files, child processes, progress, CMD and VBS. For the memory-file and network changes, eight affected suites passed: **646 checks on each PowerShell version**; other suites were not rerun. DryRun against a real ISO passed with RU/7 and EN/5.1. The ISO-read fix passed all 151 Servicing checks on each runtime, including a real file-sharing violation with mocked ISO APIs. The latest registry fix passed MemoryFiles 72 and SingleFile 45 on each runtime (117 checks), including actual registry operations and deletion-denying ACLs inside a disposable HKCU fixture. The capability-counter change passed all 246 Main checks on each runtime, including continuing after a removal error with mocked DISM.
+As of 2026-09-17, 14 suites contain **1,304 checks**. The 1,292 checks present before the Guard report fix passed on each of Windows PowerShell 5.1 and PowerShell 7; the 12 checks added for that fix have so far run on Windows PowerShell 5.1 only, because PowerShell 7 is not installed on the machine used for it. All 14 suites passed there. They cover parsers, safe paths, work-drive capacity, downloads/cache, WIM/ADK, languages, answer files, removal rules, Guard reports/history, log retention, OOBE networking, memory files, child processes, progress, CMD and VBS. For the memory-file and network changes, eight affected suites passed: **646 checks on each PowerShell version**; other suites were not rerun. DryRun against a real ISO passed with RU/7 and EN/5.1. The ISO-read fix passed all 151 Servicing checks on each runtime, including a real file-sharing violation with mocked ISO APIs. The latest registry fix passed MemoryFiles 72 and SingleFile 45 on each runtime (117 checks), including actual registry operations and deletion-denying ACLs inside a disposable HKCU fixture. The capability-counter change passed all 246 Main checks on each runtime, including continuing after a removal error with mocked DISM.
 
 Tests that exercise Guard, OOBE, registry, services or servicing use controlled fixtures for system operations. Registry preservation tests also use the real provider inside a disposable HKCU key, with HKLM paths redirected there. They are not presented as a real VM result. Real builds and prior VM logs confirm substantial parts of the 24H2/26H1 flow; current memory-file/network changes, the newest VBS launcher, localized winget Firefox installation and current `max` exception still need a fresh installation.
 
