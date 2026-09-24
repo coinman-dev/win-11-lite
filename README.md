@@ -113,6 +113,9 @@ schtasks.exe /Change /TN "\win-11-lite guard" /Enable
 
 Disabling the task does not stop a check already running and does not restore removed applications or policies. After re-enabling it, Guard runs at the next sign-in. Updating Guard itself requires rebuilding the ISO.
 
+> [!IMPORTANT]
+> Antivirus software may block Guard as a threat. Guard runs hidden as `SYSTEM` and disables Windows security services and policies, which behavior analysis treats like malware that disables protection (for example, Avast reports `IDP.HEUR`). Do not quarantine the file: the same `Win11Lite.ps1` also performs preparation and finalization. Add `C:\Windows\Setup\Scripts\Win11Lite\Win11Lite.ps1` to your antivirus exclusions instead. Only `SYSTEM`, Administrators and TrustedInstaller can modify it. The builder repeats this warning in the build plan and in the final summary whenever Guard is enabled.
+
 If the report window opens and closes within a second while the report files are still being written, check `%TEMP%` for the signed-in user. Some third-party installers rewrite `HKCU\Environment` and drop its `TEMP` and `TMP` values; the session then inherits `C:\Windows\TEMP`, which standard users may write to but not enumerate, so the OOBE state check cannot compile its helper and the window closes without output. The daily log now records the reason. Restore the Windows defaults without elevation:
 
 ```powershell

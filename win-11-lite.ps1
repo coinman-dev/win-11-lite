@@ -4986,6 +4986,12 @@ if ($PageFileMode -eq 'custom') { Write-Note (T "Маленькая подкач
 if ($SwapFile -eq 'disabled') { Write-Note (T 'Отключение swapfile.sys требует проверки на целевой версии Windows; штатного ограничения до 16 МБ нет.' 'Disabling swapfile.sys requires validation on the target Windows version; there is no supported 16 MB size limit.') }
 if ($Hibernation -eq 'disabled') { Write-Note (T 'Гибернация и быстрый запуск будут отключены.' 'Hibernation and Fast Startup will be disabled.') }
 if ($CrashDumps -eq 'disabled') { Write-Note (T 'Аварийные и полные live-дампы не будут сохраняться для разбора сбоев.' 'Crash dumps and full live dumps will not be saved for troubleshooting.') }
+# Guard работает скрыто от SYSTEM и отключает службы и политики защиты Windows:
+# поведенческий анализ антивирусов (например, Avast IDP.HEUR) принимает это за
+# вредоносную программу. Тот же файл выполняет и финализацию, поэтому карантин
+# ломает не только Guard. Повторяется в итоговом отчёте после сборки.
+$guardAntivirusNote = T "Антивирус может заблокировать Guard как угрозу: он работает от SYSTEM и отключает службы и политики защиты Windows.`r`n  Не помещайте файл в карантин — добавьте в исключения антивируса C:\Windows\Setup\Scripts\Win11Lite\Win11Lite.ps1" "Antivirus software may block Guard as a threat: it runs as SYSTEM and disables Windows security services and policies.`r`n  Do not quarantine the file - add C:\Windows\Setup\Scripts\Win11Lite\Win11Lite.ps1 to your antivirus exclusions"
+if ($Guard -ne 'None') { Write-Note $guardAntivirusNote }
 
 if ($DryRun) {
     Write-Host ''
@@ -6136,6 +6142,7 @@ if ($Preset -eq 'balanced' -and $script:ImageAudit.RemainingRemovals.Count) {
 }
 Write-Host (T "  Объём удалённых файлов до сжатия: $(Format-Size $script:FreedBytes) (не экономия ISO; возможен повторный учёт hard links)" "  Deleted file lengths before compression: $(Format-Size $script:FreedBytes) (not ISO savings; hard links may be counted more than once)")
 if ($script:SkippedDownloads.Count) { Write-Note (T "  Сборка выполнена без: $($script:SkippedDownloads -join '; ')" "  Built without: $($script:SkippedDownloads -join '; ')") }
+if ($Guard -ne 'None') { Write-Note $guardAntivirusNote }
 if ($script:ImageAuditPath -and (Test-Path -LiteralPath $script:ImageAuditPath)) {
     $script:ImageAudit['SourceIsoBytes'] = $srcSize
     $script:ImageAudit['ResultIsoBytes'] = $dstSize
