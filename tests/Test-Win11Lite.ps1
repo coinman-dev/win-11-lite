@@ -29,7 +29,7 @@ Assert ($wizardGuard -match "else\{2\}" -and $wizardGuard -match "'Standard —"
 $buildInfoNode=$ast.Find({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$buildInfo'},$true)
 Assert ($buildInfoNode.Extent.Text -match '(?m)^\s*Guard = \$Guard\s*$' -and $buildInfoNode.Extent.Text -notmatch 'GuardMode|GuardDebug') 'Build metadata stores the single Guard value without legacy duplicates'
 # Load declarations and pure configuration only, never execute the build pipeline.
-foreach ($name in @('T','Get-GuestScript','Test-DismSuccess','ConvertFrom-DismList','Test-GroupActive','Test-Protected','Get-ProtectedPatterns','Get-WindowsRelease','Get-EditionConfig','Assert-ChildPath','Test-SafeToWipe','Get-FodSourceName','Get-UpdateTarget','Get-ElevationCommand','Invoke-RegCommand','Invoke-NativeQuiet','Set-Reg','Mount-Hive','Dismount-Hives','Remove-Reg','Add-OfflineMachinePolicy','Get-OrphanDismHives','Dismount-OrphanDismHives','Format-Size','Get-PageFileGrowthBytes','Get-RecoveryMemoryCheck','Get-RecoveryMemoryWarning','Save-ImageAudit','Write-ComponentStoreReport','Write-ServicingRemovalFailure','Get-PackageRemovalSkipReason','Get-RequestedRemovalItems','Remove-OfflineRecall','Write-RemainingRemovalReport','Get-WebViewRuntimeRoots','Assert-ImageFileState','Get-ProgressLine','Update-ProgressState','Invoke-ProgressProcess','Get-CopyPercent','Assert-ImageLanguages','Write-WindowsBatchFile','Write-DiagnosticLog','Invoke-Dism')) {
+foreach ($name in @('T','Get-GuestScript','Test-DismSuccess','ConvertFrom-DismList','Test-GroupActive','Test-Protected','Get-ProtectedPatterns','Get-WindowsRelease','Get-EditionConfig','Assert-ChildPath','Test-SafeToWipe','Get-FodSourceName','Get-UpdateTarget','Get-ElevationCommand','Invoke-RegCommand','Invoke-NativeQuiet','Set-Reg','Mount-Hive','Dismount-Hives','Remove-Reg','Add-OfflineMachinePolicy','Get-OrphanDismHives','Dismount-OrphanDismHives','Format-Size','Set-BuildPriority','Restore-BuildPriority','Get-PageFileGrowthBytes','Get-RecoveryMemoryCheck','Get-RecoveryMemoryWarning','Save-ImageAudit','Write-ComponentStoreReport','Write-ServicingRemovalFailure','Get-PackageRemovalSkipReason','Get-RequestedRemovalItems','Remove-OfflineRecall','Write-RemainingRemovalReport','Get-WebViewRuntimeRoots','Assert-ImageFileState','Get-ProgressLine','Update-ProgressState','Invoke-ProgressProcess','Get-CopyPercent','Assert-ImageLanguages','Write-WindowsBatchFile','Write-DiagnosticLog','Invoke-Dism')) {
     $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
     if (-not $node) { throw "Missing function: $name" }
     . ([scriptblock]::Create($node.Extent.Text))
@@ -814,6 +814,47 @@ try {
         $script:Lang = 'en'
         $state.Check = $null; $notes.Clear(); $state.Asked = $null; $state.Answer = 'max'
         Assert ((& $run 'recovery' $false) -eq 'recovery' -and -not $notes.Count -and $null -eq $state.Asked) 'Without a memory estimate the build proceeds unchanged'
+    }
+    # Build CPU priority: lower this test process for real and check that child
+    # processes (DISM, robocopy, oscdimg in the builder) inherit the class.
+    & {
+        $priorityParameter = @($ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Priority' })
+        Assert ($priorityParameter.Count -eq 1 -and $priorityParameter[0].DefaultValue.Extent.Text -eq "'BelowNormal'" -and $priorityParameter[0].Extent.Text -match "ValidateSet\('BelowNormal', 'Idle', 'Normal'\)") 'Priority defaults to BelowNormal and accepts BelowNormal, Idle and Normal'
+        $mainTry = $ast.Find({ param($n) $n -is [Management.Automation.Language.TryStatementAst] -and $n.Finally -and $n.Finally.Extent.Text -match '#region ── Уборка' }, $true)
+        Assert ($mainTry.Body.Statements[0].Extent.Text -eq '$script:OriginalPriority = Set-BuildPriority -Priority $Priority' -and $mainTry.Finally.Extent.Text.Contains('Restore-BuildPriority -Original $script:OriginalPriority')) 'The build lowers its priority first and restores it during cleanup'
+        Assert ([regex]::IsMatch($ast.Extent.Text, [regex]::Escape('if ($Priority -ne ''BelowNormal'') { $cmd += " -Priority $Priority" }'))) 'The wizard single-command summary carries a non-default priority'
+        $self = Get-Process -Id $PID
+        $before = $self.PriorityClass
+        $childPriority = {
+            $psi = [Diagnostics.ProcessStartInfo]::new('powershell.exe', '-NoProfile -Command "(Get-Process -Id $PID).PriorityClass"')
+            $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.CreateNoWindow = $true
+            $process = [Diagnostics.Process]::Start($psi); $text = $process.StandardOutput.ReadToEnd().Trim(); $process.WaitForExit()
+            $native = (& powershell.exe -NoProfile -Command '(Get-Process -Id $PID).PriorityClass' | Out-String).Trim()
+            "$text/$native"
+        }
+        try {
+            foreach ($level in 'BelowNormal', 'Idle') {
+                $original = Set-BuildPriority -Priority $level
+                $self.Refresh()
+                Assert ($original -eq $before -and $self.PriorityClass -eq $level) "The builder switches itself to $level and returns the previous class"
+                Assert ((& $childPriority) -eq "$level/$level") "Processes started by the builder inherit $level (Process.Start and native call)"
+                Restore-BuildPriority -Original $original
+                $self.Refresh()
+                Assert ($self.PriorityClass -eq $before) "Cleanup restores the original class after $level"
+            }
+            Assert ($null -eq (Set-BuildPriority -Priority 'Normal') -and (Get-Process -Id $PID).PriorityClass -eq $before) 'Normal leaves the priority untouched'
+        } finally { (Get-Process -Id $PID).PriorityClass = $before }
+        Restore-BuildPriority -Original $null
+        $notes = [Collections.Generic.List[string]]::new()
+        function Write-Note { param($Message) $notes.Add($Message) }
+        function Get-Process { param($Id) $locked = [pscustomobject]@{}; $locked | Add-Member -MemberType ScriptProperty -Name PriorityClass -Value { 'Normal' } -SecondValue { throw 'Access is denied' }; $locked }
+        foreach ($lang in @('ru','en')) {
+            $script:Lang = $lang; $notes.Clear()
+            Assert ($null -eq (Set-BuildPriority -Priority 'BelowNormal') -and $notes.Count -eq 1 -and $notes[0] -match $(if ($lang -eq 'ru') { 'Не удалось понизить приоритет' } else { 'Could not lower the build priority' })) "A priority that cannot be changed only warns ($lang)"
+        }
+        $script:Lang = 'en'
+        Restore-BuildPriority -Original ([Diagnostics.ProcessPriorityClass]::Normal)
+        Assert $true 'A failed priority restore does not break cleanup'
     }
     # The real wizard question: every preset asks how to compress the image,
     # recovery (best compression) is the default and a memory shortage is shown first.

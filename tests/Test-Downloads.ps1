@@ -20,7 +20,7 @@ function Assert-Throws([scriptblock]$Action, [string]$Message) {
 foreach ($name in @('T','Assert-ChildPath','Test-SavedUrl','Save-Url','Read-PreparedCache','Write-PreparedCache',
     'Confirm-SkipDownload','Remove-ForeignUpdateFiles','Save-CatalogPayload','Save-WingetPayload',
     'Save-LanguageFromCatalog','Get-LanguagePattern','Find-LanguagePackage','Get-LanguageRepairUpdate',
-    'Get-UpdateTarget','Get-LocalUpdatePayload','Search-Catalog','Get-CatalogLinks','Read-YesNo','Get-UpdateCatalogSearch')) {
+    'Get-UpdateTarget','Get-LocalUpdatePayload','Search-Catalog','Get-CatalogLinks','Read-YesNo','Get-UpdateCatalogSearch','Restore-BuildPriority')) {
     $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
     if (-not $node) { throw "Missing function: $name" }
     . ([scriptblock]::Create($node.Extent.Text))

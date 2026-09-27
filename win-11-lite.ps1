@@ -290,6 +290,12 @@ param(
     [ValidateSet('recovery', 'max')]
     [string]$Compression = 'recovery',
 
+    # Приоритет процессора на время сборки. DISM, robocopy и oscdimg наследуют его:
+    # BelowNormal уступает процессор остальным программам, Idle — работает только
+    # на простаивающем процессоре, Normal — без понижения.
+    [ValidateSet('BelowNormal', 'Idle', 'Normal')]
+    [string]$Priority = 'BelowNormal',
+
     # Папка с драйверами для интеграции (рекурсивно).
     [string]$DriversDir,
 
@@ -982,6 +988,32 @@ function Format-Size {
     if ($Bytes -ge 1GB) { return ('{0:N2} ' -f ($Bytes / 1GB)) + (T 'ГБ' 'GB') }
     if ($Bytes -ge 1MB) { return ('{0:N1} ' -f ($Bytes / 1MB)) + (T 'МБ' 'MB') }
     return ('{0:N0} ' -f ($Bytes / 1KB)) + (T 'КБ' 'KB')
+}
+
+# Сборка, особенно сжатие recovery, занимает все ядра. Процесс, запущенный из
+# процесса с классом BelowNormal или Idle, получает тот же класс (CreateProcess),
+# поэтому достаточно понизить приоритет самого сборщика: DISM и DismHost,
+# robocopy, oscdimg и reg наследуют его. Возвращается прежний класс — сценарий
+# может работать в уже открытой консоли пользователя.
+# https://learn.microsoft.com/windows/win32/procthread/process-creation-flags
+function Set-BuildPriority {
+    param([string]$Priority)
+    if ($Priority -eq 'Normal') { return $null }
+    try {
+        $self = Get-Process -Id $PID
+        $original = $self.PriorityClass
+        $self.PriorityClass = [Diagnostics.ProcessPriorityClass]$Priority
+        $original
+    } catch {
+        Write-Note (T "Не удалось понизить приоритет сборки до ${Priority}: $($_.Exception.Message)" "Could not lower the build priority to ${Priority}: $($_.Exception.Message)")
+        $null
+    }
+}
+
+function Restore-BuildPriority {
+    param($Original)
+    if ($null -eq $Original) { return }
+    try { (Get-Process -Id $PID).PriorityClass = $Original } catch { }
 }
 
 # Сжатие recovery (install.esd) — сплошное LZMS: WIMGAPI сжимает блоками по 64 МиБ
@@ -4865,6 +4897,7 @@ if ($script:WizardMode) {
     if ($AutoInstall)        { $cmd += ' -AutoInstall' }
     if ($ProductKey)         { $cmd += " -ProductKey '$($ProductKey.Replace("'","''"))'" }
     if ($Compression -ne 'recovery') { $cmd += " -Compression $Compression" }
+    if ($Priority -ne 'BelowNormal') { $cmd += " -Priority $Priority" }
     $cmd += " -PageFileMode $PageFileMode -PageFileMinMB $PageFileMinMB -PageFileMaxMB $PageFileMaxMB -SwapFile $SwapFile -Hibernation $Hibernation -CrashDumps $CrashDumps"
     $cmd += " -Guard $Guard"
     if ($script:DebugMode)   { $cmd += ' -Debug' }
@@ -5146,6 +5179,9 @@ Or download the packages automatically:
 #endregion
 
 try {
+
+# Мастер позади: дальше только тяжёлая работа, отдаём процессор другим программам.
+$script:OriginalPriority = Set-BuildPriority -Priority $Priority
 
 #region ── Стадия 1. Распаковка ISO ────────────────────────────────────────────
 
@@ -5539,6 +5575,12 @@ $vOobeNet = if ($NoOobeNetworkBlock) { T 'сеть включена  (OOBE ск�
             else { T 'сеть выключена, вернётся при первом входе' 'network off, restored at first logon' }
 Write-Host (T "  OOBE           : $vOobeNet" "  OOBE           : $vOobeNet")
 Write-Host (T "  Сжатие         : $Compression" "  Compression    : $Compression")
+$vPriority = switch ($Priority) {
+    'BelowNormal' { T 'ниже обычного — остальные программы не тормозят' 'below normal - other programs stay responsive' }
+    'Idle'        { T 'низкий — только простаивающий процессор, сборка дольше' 'idle - only spare CPU time, slower build' }
+    default       { T 'обычный — без понижения' 'normal - not lowered' }
+}
+Write-Host (T "  Приоритет CPU  : $vPriority" "  CPU priority   : $vPriority")
 $pageFilePlan = if ($PageFileMode -eq 'custom') { "$PageFileMinMB–$PageFileMaxMB MB" } else { T 'размер выбирает Windows' 'Windows managed' }
 Write-Host "  pagefile.sys   : $pageFilePlan"
 Write-Host "  swapfile.sys   : $SwapFile"
@@ -6853,6 +6895,8 @@ if ($LogFile) { Write-Host (T "  Лог: $LogFile" "  Log: $LogFile") }
             }
         }
     }
+
+    Restore-BuildPriority -Original $script:OriginalPriority
 
     if ($script:Transcribing) {
         try { Stop-Transcript | Out-Null } catch { }
