@@ -49,6 +49,7 @@ try{
     & ([scriptblock]::Create($node.Extent.Text))
     $cfg=Get-Content -LiteralPath (Join-Path $guardDir 'guard.json') -Raw | ConvertFrom-Json
     Assert ($cfg.Mode -eq 'Standard' -and $cfg.ViewerTask -and -not (Get-Member -InputObject $cfg -Name Language)) 'Guard targets are embedded with the chosen mode and no duplicate language setting'
+    Assert (-not @($cfg.Policies | Where-Object {$_ -match '\\Dsh\|'}).Count -and @($cfg.Policies | Where-Object {$_ -eq 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection|AllowTelemetry|0'}).Count) 'Guard leaves the UCPD-protected widgets policy to local Group Policy and keeps the other policies'
     Assert (@($cfg.Apps | Where-Object {'Microsoft.BingWeather' -match $_}).Count -gt 0) 'Consumer app rules reach guard'
     foreach($name in 'Microsoft.ZuneMusic','Microsoft.ZuneVideo','Microsoft.GamingApp','Microsoft.XboxGamingOverlay','Microsoft.XboxSpeechToTextOverlay','Microsoft.Todos','MicrosoftCorporationII.MicrosoftFamily'){
         Assert (@($cfg.Apps | Where-Object {$name -match $_}).Count -gt 0) "Selected app removal reaches guard: $name"

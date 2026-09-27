@@ -29,7 +29,7 @@ Assert ($wizardGuard -match "else\{2\}" -and $wizardGuard -match "'Standard —"
 $buildInfoNode=$ast.Find({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$buildInfo'},$true)
 Assert ($buildInfoNode.Extent.Text -match '(?m)^\s*Guard = \$Guard\s*$' -and $buildInfoNode.Extent.Text -notmatch 'GuardMode|GuardDebug') 'Build metadata stores the single Guard value without legacy duplicates'
 # Load declarations and pure configuration only, never execute the build pipeline.
-foreach ($name in @('T','Get-GuestScript','Test-DismSuccess','ConvertFrom-DismList','Test-GroupActive','Test-Protected','Get-ProtectedPatterns','Get-WindowsRelease','Get-EditionConfig','Assert-ChildPath','Test-SafeToWipe','Get-FodSourceName','Get-UpdateTarget','Get-ElevationCommand','Invoke-RegCommand','Invoke-NativeQuiet','Set-Reg','Mount-Hive','Dismount-Hives','Remove-Reg','Save-ImageAudit','Write-ComponentStoreReport','Write-ServicingRemovalFailure','Get-PackageRemovalSkipReason','Get-RequestedRemovalItems','Remove-OfflineRecall','Write-RemainingRemovalReport','Get-WebViewRuntimeRoots','Assert-ImageFileState','Get-ProgressLine','Update-ProgressState','Invoke-ProgressProcess','Get-CopyPercent','Assert-ImageLanguages','Write-WindowsBatchFile','Write-DiagnosticLog','Invoke-Dism')) {
+foreach ($name in @('T','Get-GuestScript','Test-DismSuccess','ConvertFrom-DismList','Test-GroupActive','Test-Protected','Get-ProtectedPatterns','Get-WindowsRelease','Get-EditionConfig','Assert-ChildPath','Test-SafeToWipe','Get-FodSourceName','Get-UpdateTarget','Get-ElevationCommand','Invoke-RegCommand','Invoke-NativeQuiet','Set-Reg','Mount-Hive','Dismount-Hives','Remove-Reg','Add-OfflineMachinePolicy','Get-OrphanDismHives','Dismount-OrphanDismHives','Format-Size','Get-PageFileGrowthBytes','Get-RecoveryMemoryCheck','Get-RecoveryMemoryWarning','Save-ImageAudit','Write-ComponentStoreReport','Write-ServicingRemovalFailure','Get-PackageRemovalSkipReason','Get-RequestedRemovalItems','Remove-OfflineRecall','Write-RemainingRemovalReport','Get-WebViewRuntimeRoots','Assert-ImageFileState','Get-ProgressLine','Update-ProgressState','Invoke-ProgressProcess','Get-CopyPercent','Assert-ImageLanguages','Write-WindowsBatchFile','Write-DiagnosticLog','Invoke-Dism')) {
     $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
     if (-not $node) { throw "Missing function: $name" }
     . ([scriptblock]::Create($node.Extent.Text))
@@ -449,17 +449,34 @@ try {
         Remove-Reg -Path ('HKCU\win-11-lite-missing-' + [guid]::NewGuid().ToString('N'))
         Assert $true 'Deleting a missing registry key is not an error'
     }
-    # Run the actual offline-registry stage. Reject the reported protected value
-    # and record the replacement policy, without loading hives or writing HKLM.
+    # Independent Registry.pol reader: 'PReg', version 1, [key;value;type;size;data].
+    function Read-TestRegistryPol([string]$Path) {
+        $pol = [IO.File]::ReadAllBytes($Path)
+        if ([BitConverter]::ToString($pol, 0, 8) -ne '50-52-65-67-01-00-00-00') { throw "Bad Registry.pol header: $Path" }
+        $i = 8; $entries = @()
+        $readText = { $start = $i; while ([BitConverter]::ToUInt16($pol, $i) -ne 0) { $i += 2 }; [Text.Encoding]::Unicode.GetString($pol, $start, $i - $start); $i += 2 }
+        $expect = { param([char]$c) if ([BitConverter]::ToChar($pol, $i) -ne $c) { throw "Expected '$c' at $i in $Path" }; $i += 2 }
+        while ($i -lt $pol.Length) {
+            . $expect '['; $key = . $readText; . $expect ';'; $name = . $readText; . $expect ';'
+            $type = [BitConverter]::ToUInt32($pol, $i); $i += 4; . $expect ';'
+            $size = [BitConverter]::ToUInt32($pol, $i); $i += 4; . $expect ';'
+            $data = if ($size -eq 4) { [BitConverter]::ToUInt32($pol, $i) } else { $null }; $i += $size; . $expect ']'
+            $entries += [pscustomobject]@{ Key = $key; Name = $name; Type = $type; Size = $size; Data = $data }
+        }
+        $entries
+    }
+    # Run the actual offline-registry stage. Reject the reported protected values
+    # (TaskbarDa and, since the 09.2026 UCPD, Dsh\AllowNewsAndInterests) and check
+    # the local Group Policy replacement, without loading hives or writing HKLM.
     & {
-        $regState = @{ Writes = @{}; FailName = 'TaskbarDa'; FailLoad = $false; FailUnload = $false }
+        $regState = @{ Writes = @{}; FailName = @('TaskbarDa', 'AllowNewsAndInterests'); FailLoad = $false; FailUnload = $false }
         $regMessages = [Collections.Generic.List[string]]::new()
         function reg.exe {
             $global:LASTEXITCODE = 0
             $op = $args[0]
             if ($op -eq 'add') {
                 $name = if ($args -contains '/v') { $args[[array]::IndexOf($args, '/v') + 1] } else { '' }
-                if ($name -eq $regState.FailName) {
+                if ($regState.FailName -contains $name) {
                     $global:LASTEXITCODE = 1
                     Write-Error 'SIMULATED: Access is denied.'
                     return
@@ -487,8 +504,14 @@ try {
         $Preset = 'balanced'; $Keep = @(); $NoBypass = $false; $imgLang = 'ru-RU'
         $region = [regex]::Match($ast.Extent.Text, '(?ms)^#region[^\r\n]*Стадия 12\. Offline-реестр.*?^#endregion').Value
         if (-not $region) { throw 'Offline-registry stage not found' }
+        $gpDir = Join-Path $mountDir 'Windows\System32\GroupPolicy'
+        $isWindows10 = $false
         & ([scriptblock]::Create($region))
-        Assert ($regState.Writes['HKLM\LITE_SOFTWARE\Policies\Microsoft\Dsh|AllowNewsAndInterests'] -eq '0') 'Offline stage disables widgets without writing protected TaskbarDa'
+        Assert (-not @($regState.Writes.Keys | Where-Object { $_ -match '\\Dsh\||TaskbarDa' }).Count) 'Offline stage writes neither UCPD-protected widgets value through reg.exe'
+        $policy = @(Read-TestRegistryPol (Join-Path $gpDir 'Machine\Registry.pol'))
+        Assert ($policy.Count -eq 1 -and $policy[0].Key -eq 'SOFTWARE\Policies\Microsoft\Dsh' -and $policy[0].Name -eq 'AllowNewsAndInterests' -and
+                $policy[0].Type -eq 4 -and $policy[0].Size -eq 4 -and $policy[0].Data -eq 0) 'Windows 11 widgets are disabled by a REG_DWORD 0 entry in the image machine Registry.pol'
+        Assert ([IO.File]::ReadAllText((Join-Path $gpDir 'gpt.ini')) -ceq "[General]`r`ngPCMachineExtensionNames=[{35378EAC-683F-11D2-A89A-00C04FBBCFA2}{D02B1F72-3407-48AE-BA88-E8213C6761F1}]`r`nVersion=1`r`n") 'The image gpt.ini enables the registry policy extension with machine version 1'
         Assert ($regState.Writes['HKLM\LITE_DEFAULT\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced|TaskbarMn'] -eq '0' -and
                 $regState.Writes['HKLM\LITE_DEFAULT\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced|Start_IrisRecommendations'] -eq '0') 'Default profile settings after the former failure are applied'
         Assert ($script:LoadedHives.Count -eq 0) 'Offline-registry stage unloads all owned hives'
@@ -503,8 +526,16 @@ try {
             Assert ($failure -match 'HKLM\\LITE_DEFAULT\\test\\TaskbarDa' -and $failure -match 'SIMULATED: Access is denied\.' -and $failure -match '1') "Registry write failures remain fatal and preserve diagnostics ($lang)"
             Assert ($failure -match $(if ($lang -eq 'ru') { 'завершился ошибкой' } else { 'failed' })) "Registry failure summary is localized ($lang)"
         }
-        $regState.FailName = 'AllowNewsAndInterests'
-        Assert-Throws { & ([scriptblock]::Create($region)) } 'Failure of the replacement machine policy aborts the stage'
+        # AllowNewsAndInterests applies to Windows 11 only: no policy files for Windows 10.
+        Remove-Item -LiteralPath $gpDir -Recurse -Force
+        $regState.Writes = @{}
+        $isWindows10 = $true
+        & ([scriptblock]::Create($region))
+        Assert (-not (Test-Path -LiteralPath $gpDir) -and -not @($regState.Writes.Keys | Where-Object { $_ -match '\\Dsh\|' }).Count -and
+                $regState.Writes['HKLM\LITE_SOFTWARE\Policies\Microsoft\Windows\DataCollection|AllowTelemetry'] -eq '0' -and $script:LoadedHives.Count -eq 0) 'Windows 10 skips the Windows 11 widgets policy and completes the stage'
+        $isWindows10 = $false
+        $regState.FailName = @('TaskbarDa', 'AllowNewsAndInterests', 'AllowTelemetry')
+        Assert-Throws { & ([scriptblock]::Create($region)) } 'Failure of an ordinary machine policy still aborts the stage'
         Dismount-Hives
         $regState.FailLoad = $true
         $failure = ''
@@ -518,6 +549,352 @@ try {
         $regState.FailUnload = $false
         Dismount-Hives
         Assert ($script:LoadedHives.Count -eq 0) 'Successful unload retry releases ownership'
+    }
+    # A customised image may already carry local policies: keep them, append ours,
+    # bump only the machine half of Version and keep the extension list sorted.
+    & {
+        $image = Join-Path $testRoot 'policy-merge'
+        $gpDir = Join-Path $image 'Windows\System32\GroupPolicy'
+        $null = New-Item -ItemType Directory -Path $gpDir -Force
+        $scriptsCse = '[{42B5FAAE-6536-11D2-AE5A-0000F87571E3}{40B6664F-4972-11D1-A7CA-0000F87571E3}]'
+        [IO.File]::WriteAllText((Join-Path $gpDir 'gpt.ini'), "[General]`r`ngPCFunctionalityVersion=2`r`ngPCMachineExtensionNames=$scriptsCse`r`nVersion=65538`r`n[Other]`r`nKeep=1`r`n", [Text.Encoding]::ASCII)
+        Add-OfflineMachinePolicy -ImageRoot $image -Key 'SOFTWARE\Policies\Test\First' -Name 'One' -Value 1
+        Add-OfflineMachinePolicy -ImageRoot $image -Key 'SOFTWARE\Policies\Microsoft\Dsh' -Name 'AllowNewsAndInterests' -Value 0
+        $policy = @(Read-TestRegistryPol (Join-Path $gpDir 'Machine\Registry.pol'))
+        Assert ($policy.Count -eq 2 -and $policy[0].Key -eq 'SOFTWARE\Policies\Test\First' -and $policy[0].Data -eq 1 -and
+                $policy[1].Name -eq 'AllowNewsAndInterests' -and $policy[1].Data -eq 0) 'Existing Registry.pol entries are kept and new policies are appended'
+        $ini = @(Get-Content -LiteralPath (Join-Path $gpDir 'gpt.ini'))
+        Assert ($ini -contains 'Version=65540' -and $ini -contains 'gPCFunctionalityVersion=2' -and $ini[-2] -eq '[Other]' -and $ini[-1] -eq 'Keep=1') 'gpt.ini keeps user version and other settings while the machine version grows'
+        Assert ($ini -contains "gPCMachineExtensionNames=[{35378EAC-683F-11D2-A89A-00C04FBBCFA2}{D02B1F72-3407-48AE-BA88-E8213C6761F1}]$scriptsCse") 'The registry extension is added once and the extension list stays sorted'
+        [IO.File]::WriteAllText((Join-Path $gpDir 'gpt.ini'), "[General]`r`nVersion=131071`r`n", [Text.Encoding]::ASCII)
+        Add-OfflineMachinePolicy -ImageRoot $image -Key 'SOFTWARE\Policies\Test\Wrap' -Name 'Two' -Value 2
+        Assert (@(Get-Content -LiteralPath (Join-Path $gpDir 'gpt.ini')) -contains 'Version=65537') 'Machine version wraps to 1 without touching the user version'
+        [IO.File]::WriteAllBytes((Join-Path $gpDir 'Machine\Registry.pol'), [byte[]](1, 2, 3, 4, 5, 6, 7, 8))
+        foreach ($lang in @('ru','en')) {
+            $script:Lang = $lang
+            $failure = ''
+            try { Add-OfflineMachinePolicy -ImageRoot $image -Key 'SOFTWARE\Policies\Test' -Name 'Bad' -Value 0 } catch { $failure = $_.Exception.Message }
+            Assert ($failure -match $(if ($lang -eq 'ru') { 'Неизвестный формат' } else { 'Unknown format' }) -and
+                    [BitConverter]::ToString([IO.File]::ReadAllBytes((Join-Path $gpDir 'Machine\Registry.pol'))) -eq '01-02-03-04-05-06-07-08') "An unknown Registry.pol is rejected and left untouched ($lang)"
+        }
+        $script:Lang = 'en'
+    }
+    # A DISM process interrupted by Ctrl+C leaves its image hives loaded as
+    # HKLM\{GUID}E:/.../mount/...; they lock the mount and /Unmount-Image fails
+    # with 0xc1420117. Names below are the ones seen on a real host.
+    & {
+        $work = 'E:\Temp\win-11-lite-work'
+        $prefix = '{bf1a281b-ad7b-4476-ac95-f47682990ce7}'
+        $ours = @('Users/Default/ntuser.dat','Windows/System32/config/SOFTWARE','Windows/System32/config/SYSTEM','Windows/system32/smi/store/Machine/schema.dat' | ForEach-Object { "${prefix}E:/Temp/win-11-lite-work/mount/$_" }) +
+                @("${prefix}E:/Temp/win-11-lite-work/bootmount/Windows/System32/config/SOFTWARE")
+        $foreign = @('SOFTWARE', 'LITE_SOFTWARE', "${prefix}E:/Temp/win-11-lite-work/mount2/Windows/System32/config/SOFTWARE",
+                     "${prefix}C:/Other/mount/Windows/System32/config/SYSTEM", '{not-a-guid}E:/Temp/win-11-lite-work/mount/Windows/System32/config/SAM')
+        $found = @(Get-OrphanDismHives -MountDirs @("$work\mount", "$work\bootmount\") -KeyNames ($ours + $foreign))
+        Assert ($found.Count -eq 5 -and -not @(Compare-Object @($found.Name) $ours).Count -and $found[3].File -eq "$work\mount\Windows\system32\smi\store\Machine\schema.dat") 'Only DISM hives inside this build mount points are detected, including a trailing backslash and mixed case'
+        Assert (-not @(Get-OrphanDismHives -MountDirs @("$work\moun", $null) -KeyNames $ours).Count) 'A mount folder name prefix does not match another folder'
+
+        $realOrphans = ${function:Get-OrphanDismHives}
+        $state = @{ Names = [Collections.Generic.List[string]]::new(); Running = 0; Unloaded = [Collections.Generic.List[string]]::new(); FailName = ''; Sleeps = 0 }
+        $messages = [Collections.Generic.List[string]]::new()
+        function Get-OrphanDismHives { param($MountDirs) & $realOrphans -MountDirs $MountDirs -KeyNames @($state.Names) }
+        function Get-Process { param($Name, $ErrorAction) if ($state.Running -gt 0) { $state.Running--; [pscustomobject]@{ Name = 'DismHost' } } }
+        function Start-Sleep { param($Seconds) $state.Sleeps++ }
+        function Write-Note { param($Message) $messages.Add("NOTE:$Message") }
+        function Write-Fail { param($Message) $messages.Add("FAIL:$Message") }
+        function reg.exe {
+            $global:LASTEXITCODE = 0
+            $name = $args[1].Substring(5)
+            if ($args[0] -eq 'unload' -and $name -eq $state.FailName) { $global:LASTEXITCODE = 1; Write-Error 'SIMULATED: Access is denied.'; return }
+            $state.Unloaded.Add($name); $null = $state.Names.Remove($name)
+            'The operation completed successfully.'
+        }
+        $ours + $foreign | ForEach-Object { $state.Names.Add($_) }
+        Dismount-OrphanDismHives -MountDirs @("$work\mount", "$work\bootmount")
+        Assert ($state.Unloaded.Count -eq 5 -and -not @(Compare-Object @($state.Unloaded) $ours).Count -and $state.Names.Count -eq $foreign.Count) 'Orphaned DISM hives of this build are unloaded and foreign hives stay loaded'
+        Assert ($messages.Count -eq 5 -and $messages[0] -match '^NOTE:.*interrupted DISM: E:\\Temp\\win-11-lite-work\\mount\\Users\\Default\\ntuser\.dat$') 'Each unloaded hive is reported with its file path'
+
+        $messages.Clear(); $state.Unloaded.Clear()
+        Dismount-OrphanDismHives -MountDirs @("$work\mount", "$work\bootmount")
+        Assert (-not $state.Unloaded.Count -and -not $messages.Count -and -not $state.Sleeps) 'Without orphaned hives nothing is unloaded and nothing waits for DISM'
+
+        # DISM still finishing: wait for it and let it unload its own hives.
+        $state.Names.Add($ours[0]); $state.Running = 2
+        $realGet = $realOrphans
+        $calls = @{ N = 0 }
+        function Get-OrphanDismHives { param($MountDirs) $calls.N++; if ($calls.N -gt 1) { $state.Names.Clear() }; & $realGet -MountDirs $MountDirs -KeyNames @($state.Names) }
+        Dismount-OrphanDismHives -MountDirs @("$work\mount")
+        Assert (-not $state.Unloaded.Count -and $state.Sleeps -eq 2 -and -not $messages.Count) 'A running DISM is awaited and its own unload is not duplicated'
+
+        function Get-OrphanDismHives { param($MountDirs) & $realOrphans -MountDirs $MountDirs -KeyNames @($state.Names) }
+        foreach ($lang in @('ru','en')) {
+            $script:Lang = $lang
+            $state.Names.Clear(); $state.Names.Add($ours[1]); $state.Running = 1000; $messages.Clear()
+            Dismount-OrphanDismHives -MountDirs @("$work\mount") -WaitSeconds 0
+            Assert (-not $state.Unloaded.Count -and $messages.Count -eq 1 -and $messages[0] -match $(if ($lang -eq 'ru') { '^FAIL:DISM всё ещё работает' } else { '^FAIL:DISM is still running' })) "Hives are not pulled from under a DISM that keeps running ($lang)"
+            $state.Running = 0; $state.FailName = $ours[1]; $messages.Clear()
+            Dismount-OrphanDismHives -MountDirs @("$work\mount")
+            Assert ($messages.Count -eq 1 -and $messages[0] -match '^FAIL:.*SOFTWARE.*SIMULATED: Access is denied\.' -and $state.Names.Contains($ours[1])) "A failed hive unload keeps diagnostics ($lang)"
+            $state.FailName = ''
+        }
+        $script:Lang = 'en'
+    }
+    # The real leftover-mount block of the ISO stage: orphaned hives go first,
+    # even when DISM no longer lists the partially unmounted folder.
+    & {
+        $WorkDir = Join-Path $testRoot 'stale-work'
+        $mountDir = Join-Path $WorkDir 'mount'; $bootMountDir = Join-Path $WorkDir 'bootmount'
+        $null = New-Item -ItemType Directory -Path $mountDir -Force
+        $script:WorkDirMarker = '.win-11-lite-workdir'
+        $isAdmin = $true; $DryRun = $false
+        $events = [Collections.Generic.List[string]]::new()
+        $dismState = @{ Listed = @(); DiscardCode = 0 }
+        function Dismount-OrphanDismHives { param($MountDirs) $events.Add('orphans:' + ($MountDirs -join ',')) }
+        function Invoke-Dism {
+            param($Arguments, [switch]$AllowFail, [switch]$Quiet)
+            $events.Add('dism:' + $Arguments[0])
+            if ($Arguments[0] -eq '/Get-MountedImageInfo') { return [pscustomobject]@{ ExitCode = 0; Output = @('Mounted images:', '') + @($dismState.Listed | ForEach-Object { "Mount Dir : $_" }) } }
+            [pscustomobject]@{ ExitCode = $dismState.DiscardCode; Output = @('Error: 0xc1420117', '', 'The directory could not be completely unmounted.') }
+        }
+        function Write-Note { param($Message) $events.Add("note:$Message") }
+        function Write-Ok { param($Message) }
+        $block = $ast.Find({ param($n) $n -is [Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item1.Extent.Text -eq '$isAdmin -and -not $DryRun' -and $n.Extent.Text -match 'Get-MountedImageInfo' }, $true)
+        if (-not $block) { throw 'Leftover-mount block not found' }
+        $staleBlock = [scriptblock]::Create($block.Extent.Text)
+
+        Set-Content -LiteralPath (Join-Path $WorkDir $script:WorkDirMarker) -Value 'test'
+        & $staleBlock
+        Assert ($events.Count -eq 2 -and $events[0] -eq "orphans:$mountDir,$bootMountDir" -and $events[1] -eq 'dism:/Get-MountedImageInfo') 'Orphaned hives are unloaded even when DISM no longer lists the owned mount'
+
+        $events.Clear(); $dismState.Listed = @($mountDir)
+        & $staleBlock
+        Assert ($events[0] -like 'orphans:*' -and $events[-1] -eq 'dism:/Unmount-Image' -and @($events | Where-Object { $_ -like 'note:*' }).Count -eq 1) 'A listed owned mount is discarded after its hives are released'
+
+        $dismState.DiscardCode = -1052638953
+        foreach ($lang in @('ru','en')) {
+            $script:Lang = $lang
+            $failure = ''
+            try { & $staleBlock } catch { $failure = $_.Exception.Message }
+            Assert ($failure -match '-1052638953' -and $failure -match 'dism /Cleanup-Mountpoints' -and $failure -match '0xc1420117' -and
+                    $failure -match $(if ($lang -eq 'ru') { 'Не удалось отцепить' } else { 'Could not discard' })) "A failed discard explains how to recover and keeps the DISM error ($lang)"
+        }
+        $script:Lang = 'en'
+
+        Remove-Item -LiteralPath (Join-Path $WorkDir $script:WorkDirMarker)
+        $events.Clear(); $dismState.DiscardCode = 0
+        Assert-Throws { & $staleBlock } 'A listed mount in an unowned work folder is refused'
+        Assert (-not @($events | Where-Object { $_ -like 'orphans:*' -or $_ -eq 'dism:/Unmount-Image' }).Count) 'Unowned work folders get neither hive unloading nor a discard'
+    }
+    # The real cleanup region after an interrupted run releases DISM hives
+    # of the mounted images before discarding them.
+    & {
+        $events = [Collections.Generic.List[string]]::new()
+        $mountDir = 'E:\work\mount'; $bootMountDir = 'E:\work\bootmount'
+        $savedState = @{}
+        foreach ($name in 'Dism','IsoMounted','LangIso','WorkPrepared','Transcribing','Mounted','BootMounted','LoadedHives') { $savedState[$name] = Get-Variable -Scope Script -Name $name -ValueOnly -ErrorAction SilentlyContinue }
+        $script:Dism = $sourcePath; $script:IsoMounted = $null; $script:LangIso = $null; $script:WorkPrepared = $false; $script:Transcribing = $false
+        $DryRun = $false; $script:LoadedHives = @()
+        function Dismount-Hives { $events.Add('hives') }
+        function Dismount-OrphanDismHives { param($MountDirs) $events.Add('orphans:' + ($MountDirs -join ',')) }
+        function Invoke-Dism { param($Arguments, [switch]$AllowFail, [switch]$Quiet) $events.Add('dism:' + ($Arguments -join ' ')); [pscustomobject]@{ ExitCode = 0; Output = @() } }
+        function Write-Host { }
+        function Write-Note { param($Message) }
+        function Wait-BeforeExit { }
+        $cleanup = [regex]::Match($ast.Extent.Text, '(?ms)^    #region ── Уборка.*?^    #endregion').Value
+        if (-not $cleanup) { throw 'Cleanup region not found' }
+        $script:Mounted = $true; $script:BootMounted = $false
+        & ([scriptblock]::Create($cleanup))
+        Assert ($events.Count -eq 3 -and $events[0] -eq 'hives' -and $events[1] -eq "orphans:$mountDir" -and $events[2] -eq "dism:/Unmount-Image /MountDir:$mountDir /Discard" -and -not $script:Mounted) 'Cleanup releases orphaned DISM hives of the mounted image before discarding it'
+        $events.Clear(); $script:Mounted = $true; $script:BootMounted = $true
+        & ([scriptblock]::Create($cleanup))
+        Assert ($events[1] -eq "orphans:$mountDir,$bootMountDir" -and @($events | Where-Object { $_ -like 'dism:/Unmount-Image*' }).Count -eq 2) 'Cleanup covers both install and boot mounts'
+        $events.Clear(); $script:Mounted = $false; $script:BootMounted = $false
+        & ([scriptblock]::Create($cleanup))
+        Assert ($events.Count -eq 1 -and $events[0] -eq 'hives') 'Cleanup without mounted images does not look for DISM hives'
+        foreach ($name in @($savedState.Keys)) { Set-Variable -Scope Script -Name $name -Value $savedState[$name] }
+    }
+    # Recovery (LZMS) export memory: a real build failed at the last stage with
+    # DISM 8 while WSL held 16 GB and 12 threads had ~5.6 GB of free commit.
+    & {
+        # Host state at the failure: 128-4096 MB page file currently at 1034 MB.
+        $cim = @{ Fail = $false; FailPaging = $false; FreeKB = [int64](5.6 * 1MB); LimitKB = [int64](32.95 * 1MB); PhysKB = [int64](31.9 * 1MB)
+                  Allocated = 1034; Max = 4096; Auto = $false; DiskSize = 500GB; DiskFree = 100GB; Usage = $true; Filters = [Collections.Generic.List[string]]::new() }
+        $procs = @(
+            [pscustomobject]@{ ProcessName = 'Zed'; PrivateMemorySize64 = [int64](2.97 * 1GB) },
+            [pscustomobject]@{ ProcessName = 'vmmemWSL'; PrivateMemorySize64 = [int64](15.99 * 1GB) },
+            [pscustomobject]@{ ProcessName = 'explorer'; PrivateMemorySize64 = [int64](0.51 * 1GB) }
+        )
+        function Get-CimInstance {
+            param($ClassName, $Filter, $ErrorAction)
+            if ($cim.Fail) { throw 'WMI unavailable' }
+            if ($ClassName -ne 'Win32_OperatingSystem' -and $cim.FailPaging) { throw 'WMI class unavailable' }
+            switch ($ClassName) {
+                'Win32_OperatingSystem' { [pscustomobject]@{ FreeVirtualMemory = $cim.FreeKB; TotalVirtualMemorySize = $cim.LimitKB; TotalVisibleMemorySize = $cim.PhysKB } }
+                'Win32_PageFileUsage' { if ($cim.Usage) { [pscustomobject]@{ Name = 'C:\pagefile.sys'; AllocatedBaseSize = [uint32]$cim.Allocated } } }
+                'Win32_PageFileSetting' { if ($null -ne $cim.Max) { [pscustomobject]@{ Name = 'c:\pagefile.sys'; InitialSize = [uint32]128; MaximumSize = [uint32]$cim.Max } } }
+                'Win32_ComputerSystem' { [pscustomobject]@{ AutomaticManagedPagefile = $cim.Auto } }
+                'Win32_LogicalDisk' { $cim.Filters.Add($Filter); [pscustomobject]@{ DeviceID = 'C:'; Size = [uint64]$cim.DiskSize; FreeSpace = [uint64]$cim.DiskFree } }
+            }
+        }
+        function Get-Process { param($ErrorAction) $procs }
+        $check = Get-RecoveryMemoryCheck -Threads 12
+        Assert ($check.NeedBytes -eq 12GB -and $check.FreeCommitBytes -eq $cim.FreeKB * 1KB -and $check.PageFileGrowthBytes -eq (4096 - 1034) * 1MB -and
+                $check.AvailableBytes -eq $check.FreeCommitBytes + $check.PageFileGrowthBytes -and $check.CommitLimitBytes -eq $cim.LimitKB * 1KB -and -not $check.Enough) 'Twelve LZMS threads need about 12 GB, more than free commit plus page file growth to 4096 MB'
+        Assert ($cim.Filters[0] -eq "DeviceID='C:'") 'Page file growth is checked against the volume that holds it'
+        $cim.DiskFree = 1GB
+        Assert ((Get-PageFileGrowthBytes -PhysicalBytes ($cim.PhysKB * 1KB)) -eq 1GB) 'Page file growth is limited by free space on its volume'
+        $cim.DiskFree = 100GB; $cim.Allocated = 4096
+        Assert ((Get-PageFileGrowthBytes -PhysicalBytes ($cim.PhysKB * 1KB)) -eq 0) 'A page file at its maximum cannot add commit'
+        $cim.Allocated = 1034; $cim.Auto = $true
+        Assert ((Get-PageFileGrowthBytes -PhysicalBytes ($cim.PhysKB * 1KB)) -eq [int64](500GB / 8) - 1034MB) 'A system-managed page file may grow to 3 x RAM, limited to one eighth of its volume'
+        Assert ((Get-RecoveryMemoryCheck -Threads 12).Enough) 'A growable system-managed page file covers the LZMS need'
+        $cim.Auto = $false; $cim.Max = 0; $cim.DiskSize = 2000GB
+        Assert ((Get-PageFileGrowthBytes -PhysicalBytes 1GB) -eq 4GB - 1034MB) 'A zero maximum is system-managed with at least 4 GB'
+        $cim.Max = 4096; $cim.DiskSize = 500GB; $cim.Usage = $false
+        Assert ((Get-PageFileGrowthBytes -PhysicalBytes ($cim.PhysKB * 1KB)) -eq 0) 'Without a page file there is no growth'
+        $cim.Usage = $true; $cim.FailPaging = $true
+        Assert ((Get-PageFileGrowthBytes -PhysicalBytes ($cim.PhysKB * 1KB)) -eq 0 -and $null -ne (Get-RecoveryMemoryCheck -Threads 12)) 'Unreadable page file data counts no growth but keeps the estimate'
+        $cim.FailPaging = $false
+        Assert (@($check.Consumers).Count -eq 2 -and $check.Consumers[0].Name -eq 'vmmemWSL' -and $check.Consumers[1].Name -eq 'Zed') 'Only processes holding at least 1 GB are listed, largest first'
+        Assert ((Get-RecoveryMemoryCheck -Threads 4).Enough) 'Four threads fit into 5.6 GB of free commit'
+        Assert ((Get-RecoveryMemoryCheck).Threads -eq [Environment]::ProcessorCount) 'The thread estimate defaults to the logical processor count'
+        foreach ($lang in @('ru','en')) {
+            $script:Lang = $lang
+            $warning = Get-RecoveryMemoryWarning -Check $check
+            Assert ($warning.Contains((Format-Size 12GB)) -and $warning.Contains((Format-Size $check.FreeCommitBytes)) -and $warning.Contains((Format-Size $check.AvailableBytes)) -and
+                    $warning.Contains((Format-Size $check.PageFileGrowthBytes)) -and $warning.Contains((Format-Size ($check.CommitLimitBytes - $check.PhysicalBytes))) -and
+                    $warning.Contains('vmmemWSL') -and $warning.Contains('wsl --shutdown') -and $warning.Contains('-Compression max') -and $warning -match 'DISM (error )?8') "The memory warning shows need, free commit, page file, top users and remedies ($lang)"
+            Assert ($warning -match $(if ($lang -eq 'ru') { 'выделяемой памяти' } else { 'commit memory' })) "The memory warning is localized ($lang)"
+        }
+        $script:Lang = 'en'
+        $noVm = $check.PSObject.Copy(); $noVm.Consumers = @([pscustomobject]@{ Name = 'Zed'; Bytes = 3GB })
+        Assert (-not (Get-RecoveryMemoryWarning -Check $noVm).Contains('wsl --shutdown')) 'The WSL hint appears only when a vmmem process holds the memory'
+        $cim.Fail = $true
+        Assert ($null -eq (Get-RecoveryMemoryCheck -Threads 12)) 'An unavailable WMI skips the estimate instead of failing the build'
+    }
+    # The real pre-start block: warn, and let an interactive user keep recovery
+    # (the better compression, default), switch to max or cancel before any image work.
+    & {
+        $preflight = [regex]::Match($ast.Extent.Text, '(?ms)^# Нехватка памяти для recovery видна только.*?(?=^if \(\$DryRun\) \{)').Value
+        if (-not $preflight) { throw 'Recovery memory pre-check not found' }
+        $script:CompressionAsked = $null
+        $state = @{ Check = $null; Calls = 0; CanPrompt = $true; Answer = 'max'; Asked = $null }
+        $notes = [Collections.Generic.List[string]]::new()
+        function Get-RecoveryMemoryCheck { $state.Calls++; $state.Check }
+        function Test-CanPrompt { $state.CanPrompt }
+        function Read-Option { param($Question, $Items, $Values, $Default) $state.Asked = @{ Values = $Values; Default = $Default; Items = $Items }; $state.Answer }
+        function Write-Note { param($Message) $notes.Add($Message) }
+        function Write-Ok { param($Message) }
+        $short = [pscustomobject]@{ Threads = 12; NeedBytes = 12GB; FreeCommitBytes = 5GB; PageFileGrowthBytes = 3GB; AvailableBytes = 8GB; CommitLimitBytes = 36GB; PhysicalBytes = 32GB; Consumers = @(); Enough = $false }
+        # Dot-source: in the builder this block runs in the script scope and reassigns $Compression.
+        $run = { param($Compression, $DryRun) . ([scriptblock]::Create($preflight)); $Compression }
+
+        $state.Check = $short
+        Assert ((& $run 'max' $false) -eq 'max' -and $state.Calls -eq 0 -and -not $notes.Count) 'max compression skips the memory estimate'
+        $state.Check = [pscustomobject]@{ Threads = 12; NeedBytes = 12GB; FreeCommitBytes = 20GB; CommitLimitBytes = 36GB; PhysicalBytes = 32GB; Consumers = @(); Enough = $true }
+        Assert ((& $run 'recovery' $false) -eq 'recovery' -and -not $notes.Count -and $null -eq $state.Asked) 'Enough memory neither warns nor asks'
+        $state.Check = $short
+        Assert ((& $run 'recovery' $true) -eq 'recovery' -and $notes.Count -eq 1 -and $null -eq $state.Asked) 'DryRun shows the memory warning without asking'
+        $notes.Clear(); $state.CanPrompt = $false
+        Assert ((& $run 'recovery' $false) -eq 'recovery' -and $notes.Count -eq 1 -and $null -eq $state.Asked) 'A non-interactive build warns and keeps the requested compression'
+        $notes.Clear(); $state.CanPrompt = $true
+        Assert ((& $run 'recovery' $false) -eq 'max' -and $notes.Count -eq 1 -and $state.Asked.Default -eq 1 -and ($state.Asked.Values -join ',') -eq 'recovery,max,cancel') 'An interactive build offers recovery by default, then max or cancel, and applies max when chosen'
+        $state.Answer = 'recovery'
+        Assert ((& $run 'recovery' $false) -eq 'recovery') 'The user can keep recovery after freeing memory'
+        # After the wizard question (which showed the same estimate) there is no second prompt.
+        $script:CompressionAsked = $true; $notes.Clear(); $state.Asked = $null; $state.Answer = 'max'
+        Assert ((& $run 'recovery' $false) -eq 'recovery' -and $notes.Count -eq 1 -and $null -eq $state.Asked) 'A wizard compression answer is not asked again; the plan still warns'
+        $script:CompressionAsked = $null
+        $state.Answer = 'cancel'
+        foreach ($lang in @('ru','en')) {
+            $script:Lang = $lang
+            $failure = ''
+            try { & $run 'recovery' $false } catch { $failure = $_.Exception.Message }
+            Assert ($failure -match $(if ($lang -eq 'ru') { 'Сборка отменена до обработки образа' } else { 'Build cancelled before image processing' })) "Cancel stops the build before any image work ($lang)"
+        }
+        $script:Lang = 'en'
+        $state.Check = $null; $notes.Clear(); $state.Asked = $null; $state.Answer = 'max'
+        Assert ((& $run 'recovery' $false) -eq 'recovery' -and -not $notes.Count -and $null -eq $state.Asked) 'Without a memory estimate the build proceeds unchanged'
+    }
+    # The real wizard question: every preset asks how to compress the image,
+    # recovery (best compression) is the default and a memory shortage is shown first.
+    & {
+        $question = [regex]::Match($ast.Extent.Text, '(?ms)^    # 9a\. Сжатие итогового образа.*?(?=^    # Файлы памяти установленной Windows)').Value
+        if (-not $question) { throw 'Wizard compression question not found' }
+        Assert ($question -notmatch '\$Preset') 'The compression question is asked for every preset'
+        Assert ([regex]::IsMatch($ast.Extent.Text, [regex]::Escape('if ($Compression -ne ''recovery'') { $cmd += " -Compression $Compression" }'))) 'The wizard single-command summary carries a non-default compression'
+        $state = @{ Check = $null; Answer = 'recovery'; Asked = $null }
+        $notes = [Collections.Generic.List[string]]::new(); $hints = [Collections.Generic.List[string]]::new()
+        function Get-RecoveryMemoryCheck { $state.Check }
+        function Read-Option { param($Question, $Items, $Values, $Default) $state.Asked = @{ Question = $Question; Values = $Values; Default = $Default; Items = $Items }; $state.Answer }
+        function Write-Note { param($Message) $notes.Add($Message) }
+        function Write-Host { param($Object, $ForegroundColor) $hints.Add([string]$Object) }
+        $ask = { param($Compression) $script:CompressionAsked = $null; . ([scriptblock]::Create($question)); $Compression }
+        $enough = [pscustomobject]@{ Threads = 12; NeedBytes = 12GB; FreeCommitBytes = 20GB; PageFileGrowthBytes = 3GB; AvailableBytes = 23GB; CommitLimitBytes = 36GB; PhysicalBytes = 32GB; Consumers = @(); Enough = $true }
+        $short = [pscustomobject]@{ Threads = 12; NeedBytes = 12GB; FreeCommitBytes = 5GB; PageFileGrowthBytes = 3GB; AvailableBytes = 8GB; CommitLimitBytes = 36GB; PhysicalBytes = 32GB; Consumers = @(); Enough = $false }
+
+        $state.Check = $enough
+        Assert ((& $ask 'recovery') -eq 'recovery' -and $state.Asked.Default -eq 1 -and ($state.Asked.Values -join ',') -eq 'recovery,max' -and -not $notes.Count -and $script:CompressionAsked) 'The wizard defaults to recovery, asks without a warning when memory suffices and records the answer'
+        Assert (($hints -join ' ').Contains((Format-Size 12GB))) 'The wizard explains how much memory recovery needs'
+        $state.Answer = 'max'
+        Assert ((& $ask 'recovery') -eq 'max') 'Choosing max in the wizard switches the export to install.wim'
+        Assert ((& $ask 'max') -eq 'max' -and $state.Asked.Default -eq 2) 'A command-line max stays the wizard default'
+        $state.Check = $short; $state.Answer = 'recovery'
+        Assert ((& $ask 'recovery') -eq 'recovery' -and $notes.Count -eq 1 -and $state.Asked.Default -eq 1) 'A memory shortage is shown before the question while recovery stays the default'
+        $state.Check = $null; $notes.Clear(); $hints.Clear()
+        Assert ((& $ask 'recovery') -eq 'recovery' -and -not $notes.Count -and ($hints -join ' ').Contains((Format-Size ([int64][Environment]::ProcessorCount * 1GB)))) 'Without WMI data the wizard still asks and estimates by processor count'
+        foreach ($lang in @('ru','en')) {
+            $script:Lang = $lang
+            $null = & $ask 'recovery'
+            Assert ($state.Asked.Items[0] -match '^recovery .*install\.esd' -and $state.Asked.Items[1] -match '^max .*install\.wim' -and
+                    $state.Asked.Question -match $(if ($lang -eq 'ru') { 'Как сжимать' } else { 'How should' })) "Wizard compression choices are localized and name the files ($lang)"
+        }
+        $script:Lang = 'en'; $script:CompressionAsked = $null
+    }
+    # The real export stage: re-check memory before LZMS and turn DISM 8 into
+    # an explanation instead of a bare exit code.
+    & {
+        $exportStage = [regex]::Match($ast.Extent.Text, '(?ms)^#region ── Стадия 15\. Экспорт итогового образа.*?(?=^# --- урезание sources ---)').Value
+        if (-not $exportStage) { throw 'Export stage not found' }
+        $root = Join-Path $testRoot 'export-stage'
+        $isoDir = Join-Path $root 'iso'; $null = New-Item -ItemType Directory -Path (Join-Path $isoDir 'sources') -Force
+        $wimPath = Join-Path $root 'install.wim'
+        $state = @{ Code = 0; Args = $null; Check = $null }
+        $notes = [Collections.Generic.List[string]]::new()
+        function Write-Stage { param($Message) }
+        function Write-Ok { param($Message) }
+        function Write-Note { param($Message) $notes.Add($Message) }
+        function Get-RecoveryMemoryCheck { $state.Check }
+        function Invoke-Dism {
+            param($Arguments, [switch]$AllowFail, [switch]$Quiet, $Activity)
+            $state.Args = $Arguments; $state.AllowFail = [bool]$AllowFail
+            if ($state.Code -eq 0) { Set-Content -LiteralPath ($Arguments[3] -replace '^/DestinationImageFile:', '') -Value 'esd' }
+            [pscustomobject]@{ ExitCode = $state.Code; Output = @('Exporting image', "Error: $($state.Code)", 'Not enough memory resources are available to process this command.') }
+        }
+        $short = [pscustomobject]@{ Threads = 12; NeedBytes = 12GB; FreeCommitBytes = 5GB; PageFileGrowthBytes = 3GB; AvailableBytes = 8GB; CommitLimitBytes = 36GB; PhysicalBytes = 32GB; Consumers = @([pscustomobject]@{ Name = 'vmmemWSL'; Bytes = 16GB }); Enough = $false }
+
+        Set-Content -LiteralPath $wimPath -Value 'wim'
+        $Compression = 'recovery'; $state.Check = $short
+        & ([scriptblock]::Create($exportStage))
+        Assert ($state.Args -contains '/Compress:recovery' -and $state.AllowFail -and $notes.Count -eq 1 -and $notes[0].Contains('wsl --shutdown') -and
+                (Test-Path -LiteralPath (Join-Path $isoDir 'sources\install.esd')) -and -not (Test-Path -LiteralPath $wimPath)) 'The export stage re-checks memory before recovery compression and completes'
+
+        foreach ($lang in @('ru','en')) {
+            $script:Lang = $lang
+            Set-Content -LiteralPath $wimPath -Value 'wim'; $notes.Clear(); $state.Code = 8
+            $failure = ''
+            try { & ([scriptblock]::Create($exportStage)) } catch { $failure = $_.Exception.Message }
+            Assert ($failure -match $(if ($lang -eq 'ru') { 'DISM не хватило памяти для сжатия recovery \(код 8\)' } else { 'DISM ran out of memory for recovery compression \(code 8\)' }) -and
+                    $failure.Contains('wsl --shutdown') -and $failure.Contains('-Compression max') -and $failure.Contains('Not enough memory resources') -and (Test-Path -LiteralPath $wimPath)) "DISM 8 during recovery export explains the memory shortage and keeps the source WIM ($lang)"
+        }
+        $script:Lang = 'en'
+        $Compression = 'max'; $state.Code = 8; $notes.Clear(); $state.Check = $short
+        $failure = ''
+        try { & ([scriptblock]::Create($exportStage)) } catch { $failure = $_.Exception.Message }
+        Assert ($state.Args -contains '/Compress:max' -and -not $notes.Count -and $failure -match '^DISM exited with code 8' -and $failure -notmatch 'recovery') 'max export neither estimates LZMS memory nor blames it for failures'
+        $Compression = 'recovery'; $state.Code = 5
+        $failure = ''
+        try { & ([scriptblock]::Create($exportStage)) } catch { $failure = $_.Exception.Message }
+        Assert ($failure -match '^DISM exited with code 5' -and $failure -notmatch 'ran out of memory') 'Other DISM export failures keep the plain exit-code message'
     }
 
     & {

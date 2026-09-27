@@ -22,7 +22,7 @@
       * на общий рабочий стол кладётся ярлык Install-Firefox;
       * встраивается обход проверок TPM 2.0 и Secure Boot;
       * обновления отключаются на время установки и включаются сразу после неё;
-      * подкачка ограничивается 128–1024 МБ; swap, гибернация и дампы отключаются
+      * подкачка ограничивается 128–4096 МБ; swap, гибернация и дампы отключаются
         (PageFileMode/MinMB/MaxMB, SwapFile, Hibernation, CrashDumps меняют выбор);
       * итоговый ISO собирается через oscdimg.
 
@@ -201,7 +201,7 @@ param(
     [ValidateRange(16, 1048576)]
     [int]$PageFileMinMB = 128,
     [ValidateRange(16, 1048576)]
-    [int]$PageFileMaxMB = 1024,
+    [int]$PageFileMaxMB = 4096,
 
     # У swapfile.sys нет штатного параметра фиксированного размера.
     # disabled использует SwapfileControl=0; результат проверять на целевой Windows.
@@ -982,6 +982,79 @@ function Format-Size {
     if ($Bytes -ge 1GB) { return ('{0:N2} ' -f ($Bytes / 1GB)) + (T 'ГБ' 'GB') }
     if ($Bytes -ge 1MB) { return ('{0:N1} ' -f ($Bytes / 1MB)) + (T 'МБ' 'MB') }
     return ('{0:N0} ' -f ($Bytes / 1KB)) + (T 'КБ' 'KB')
+}
+
+# Сжатие recovery (install.esd) — сплошное LZMS: WIMGAPI сжимает блоками по 64 МиБ
+# во всех потоках. По словам автора wimlib, LZMS с блоками 32 МиБ требует около
+# 480 МиБ на поток, поэтому для DISM закладываем ~1 ГБ на логический процессор.
+# Не хватит выделяемой памяти (RAM + подкачка) — DISM после всей сборки падает
+# с кодом 8 «Not enough memory resources» в InitLZMSCompression.
+# https://sourceforge.net/p/wimlib/discussion/general/thread/6db5f7bf/
+# Предел выделения растёт вместе с подкачкой: при заполнении больше 90% Windows
+# увеличивает файл до максимума — заданного или, для автоматической подкачки,
+# 3 × RAM либо 4 ГБ (что больше), но не больше 1/8 тома; рост ограничен и
+# свободным местом на томе.
+# https://learn.microsoft.com/troubleshoot/windows-client/performance/how-to-determine-the-appropriate-page-file-size-for-64-bit-versions-of-windows
+function Get-PageFileGrowthBytes {
+    param([int64]$PhysicalBytes)
+    try {
+        $usage = @(Get-CimInstance -ClassName Win32_PageFileUsage -ErrorAction Stop)
+        $settings = @(Get-CimInstance -ClassName Win32_PageFileSetting -ErrorAction Stop)
+        $automatic = [bool](Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).AutomaticManagedPagefile
+    } catch { return [int64]0 }
+    $growth = [int64]0
+    foreach ($file in $usage) {
+        $allocated = [int64]$file.AllocatedBaseSize * 1MB
+        $drive = Split-Path -Path $file.Name -Qualifier
+        $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='$drive'" -ErrorAction SilentlyContinue
+        $setting = @($settings | Where-Object { $_.Name -eq $file.Name }) | Select-Object -First 1
+        $maximum = if ($automatic -or -not $setting -or [int64]$setting.MaximumSize -eq 0) {
+            $systemMax = [math]::Max(3 * $PhysicalBytes, [int64]4GB)
+            if ($disk -and $disk.Size) { [math]::Min($systemMax, [int64]([int64]$disk.Size / 8)) } else { $systemMax }
+        } else { [int64]$setting.MaximumSize * 1MB }
+        $room = [math]::Max([int64]0, [int64]($maximum - $allocated))
+        if ($disk) { $room = [math]::Min($room, [int64]$disk.FreeSpace) }
+        $growth += $room
+    }
+    $growth
+}
+
+function Get-RecoveryMemoryCheck {
+    param([int]$Threads = [Environment]::ProcessorCount)
+    try { $os = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop } catch { return $null }
+    $need = [int64]$Threads * 1GB
+    $free = [int64]$os.FreeVirtualMemory * 1KB
+    $physical = [int64]$os.TotalVisibleMemorySize * 1KB
+    $growth = Get-PageFileGrowthBytes -PhysicalBytes $physical
+    $consumers = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.PrivateMemorySize64 -ge 1GB } |
+        Sort-Object PrivateMemorySize64 -Descending | Select-Object -First 3 |
+        ForEach-Object { [pscustomobject]@{ Name = $_.ProcessName; Bytes = [int64]$_.PrivateMemorySize64 } })
+    [pscustomobject]@{
+        Threads = $Threads
+        NeedBytes = $need
+        FreeCommitBytes = $free
+        PageFileGrowthBytes = $growth
+        AvailableBytes = $free + $growth
+        CommitLimitBytes = [int64]$os.TotalVirtualMemorySize * 1KB
+        PhysicalBytes = $physical
+        Consumers = $consumers
+        Enough = ($free + $growth) -ge $need
+    }
+}
+
+function Get-RecoveryMemoryWarning {
+    param($Check)
+    $pageFile = [math]::Max([int64]0, [int64]($Check.CommitLimitBytes - $Check.PhysicalBytes))
+    $text = T "Для сжатия recovery (install.esd) DISM нужно около $(Format-Size $Check.NeedBytes) выделяемой памяти ($($Check.Threads) потоков по ~1 ГБ), а доступно $(Format-Size $Check.AvailableBytes):`r`n  свободно $(Format-Size $Check.FreeCommitBytes) из $(Format-Size $Check.CommitLimitBytes) (RAM $(Format-Size $Check.PhysicalBytes) + подкачка $(Format-Size $pageFile)), подкачка может вырасти ещё на $(Format-Size $Check.PageFileGrowthBytes).`r`n  Иначе экспорт на последней стадии завершится ошибкой DISM 8 «Not enough memory resources»." `
+              "Recovery compression (install.esd) needs about $(Format-Size $Check.NeedBytes) of commit memory for DISM ($($Check.Threads) threads at ~1 GB), but only $(Format-Size $Check.AvailableBytes) is available:`r`n  $(Format-Size $Check.FreeCommitBytes) free of $(Format-Size $Check.CommitLimitBytes) (RAM $(Format-Size $Check.PhysicalBytes) + page file $(Format-Size $pageFile)), and the page file can grow by $(Format-Size $Check.PageFileGrowthBytes).`r`n  Otherwise the export at the last stage fails with DISM error 8 'Not enough memory resources'."
+    if (@($Check.Consumers).Count) {
+        $list = (@($Check.Consumers) | ForEach-Object { "$($_.Name) $(Format-Size $_.Bytes)" }) -join ', '
+        $text += T "`r`n  Больше всего памяти занимают: $list." "`r`n  Largest memory users: $list."
+    }
+    if (@($Check.Consumers | Where-Object { $_.Name -like 'vmmem*' }).Count) {
+        $text += T "`r`n  vmmem — виртуальная машина WSL или Hyper-V: wsl --shutdown или остановка VM освободит её память." "`r`n  vmmem is a WSL or Hyper-V virtual machine: wsl --shutdown or stopping the VM frees its memory."
+    }
+    $text + (T "`r`n  Закройте лишние программы, увеличьте файл подкачки или выберите -Compression max (install.wim, ISO больше)." "`r`n  Close unneeded programs, enlarge the page file or choose -Compression max (install.wim, larger ISO).")
 }
 
 # Полосу рисуем только в настоящей консоли: при перенаправлении вывода
@@ -2521,7 +2594,7 @@ function Get-MemoryFilePolicy {
     param(
         [ValidateSet('custom','system')][string]$PageFileMode = 'custom',
         [ValidateRange(16,1048576)][int]$PageFileMinMB = 128,
-        [ValidateRange(16,1048576)][int]$PageFileMaxMB = 1024,
+        [ValidateRange(16,1048576)][int]$PageFileMaxMB = 4096,
         [ValidateSet('disabled','system')][string]$SwapFile = 'disabled',
         [ValidateSet('disabled','system')][string]$Hibernation = 'disabled',
         [ValidateSet('disabled','system')][string]$CrashDumps = 'disabled'
@@ -4397,6 +4470,50 @@ function Dismount-Hives {
     }
 }
 
+# DISM подключает кусты образа как HKLM\{GUID}E:/путь/mount/Windows/System32/config/SOFTWARE
+# и сам их выгружает. Если его процесс прерван (Ctrl+C), кусты остаются загруженными,
+# держат файлы образа, и /Unmount-Image завершается 0xc1420117. Ищем только кусты
+# из переданных точек монтирования этой сборки.
+function Get-OrphanDismHives {
+    param([string[]]$MountDirs, [string[]]$KeyNames = [Microsoft.Win32.Registry]::LocalMachine.GetSubKeyNames())
+    $roots = @($MountDirs | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') + '\' })
+    foreach ($name in $KeyNames) {
+        if ($name -notmatch '^\{[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}(.+)$') { continue }
+        $file = $Matches[2].Replace('/', '\')
+        foreach ($root in $roots) {
+            if ($file.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+                [pscustomobject]@{ Name = $name; File = $file }
+                break
+            }
+        }
+    }
+}
+
+function Dismount-OrphanDismHives {
+    param([string[]]$MountDirs, [int]$WaitSeconds = 30)
+    if (-not @(Get-OrphanDismHives -MountDirs $MountDirs).Count) { return }
+    # Работающий DISM может ещё выгрузить их сам; чужой куст из-под него не выдёргиваем.
+    $deadline = (Get-Date).AddSeconds($WaitSeconds)
+    while (@(Get-Process -Name 'dism', 'DismHost' -ErrorAction SilentlyContinue).Count -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 1
+    }
+    $orphans = @(Get-OrphanDismHives -MountDirs $MountDirs)
+    if (-not $orphans.Count) { return }
+    if (@(Get-Process -Name 'dism', 'DismHost' -ErrorAction SilentlyContinue).Count) {
+        Write-Fail (T "DISM всё ещё работает; кусты образа ($($orphans.Count)) не выгружены" "DISM is still running; image hives ($($orphans.Count)) were not unloaded")
+        return
+    }
+    [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+    foreach ($orphan in $orphans) {
+        $result = Invoke-RegCommand -Arguments @('unload', "HKLM\$($orphan.Name)")
+        if ($result.ExitCode -eq 0) {
+            Write-Note (T "Выгружен куст, оставленный прерванным DISM: $($orphan.File)" "Unloaded a hive left by an interrupted DISM: $($orphan.File)")
+        } else {
+            Write-Fail (T "Не удалось выгрузить куст $($orphan.File) (код $($result.ExitCode)): $($result.Output)" "Failed to unload hive $($orphan.File) (code $($result.ExitCode)): $($result.Output)")
+        }
+    }
+}
+
 function Set-Reg {
     param([string]$Path, [string]$Name, [string]$Type, $Value)
     $regArgs = @('add', $Path, '/f')
@@ -4412,6 +4529,67 @@ function Set-Reg {
 function Remove-Reg {
     param([string]$Path)
     $null = Invoke-RegCommand -Arguments @('delete', $Path, '/f')
+}
+
+# UCPD хоста (драйвер защиты пользовательского выбора) не даёт reg.exe и
+# PowerShell записать часть значений, в том числе Dsh\AllowNewsAndInterests,
+# даже в смонтированный куст образа. Такие политики кладутся в локальную
+# групповую политику образа: её применяет служба групповой политики уже в
+# установленной Windows. Формат Registry.pol: 'PReg', версия 1, затем записи
+# [key;value;type;size;data] в UTF-16LE.
+# https://learn.microsoft.com/previous-versions/windows/desktop/policy/registry-policy-file-format
+function Add-OfflineMachinePolicy {
+    param([string]$ImageRoot, [string]$Key, [string]$Name, [int]$Value)
+    $gpDir = Join-Path $ImageRoot 'Windows\System32\GroupPolicy'
+    $machineDir = Join-Path $gpDir 'Machine'
+    $null = New-Item -ItemType Directory -Path $machineDir -Force
+    $polPath = Join-Path $machineDir 'Registry.pol'
+    [byte[]]$header = 0x50, 0x52, 0x65, 0x67, 1, 0, 0, 0
+    $bytes = [Collections.Generic.List[byte]]::new()
+    if (Test-Path -LiteralPath $polPath) {
+        $existing = [IO.File]::ReadAllBytes($polPath)
+        if ($existing.Length -lt 8 -or [BitConverter]::ToString($existing, 0, 8) -ne [BitConverter]::ToString($header)) {
+            throw (T "Неизвестный формат локальной политики образа: $polPath" "Unknown format of the image local policy: $polPath")
+        }
+        $bytes.AddRange($existing)
+    } else {
+        $bytes.AddRange($header)
+    }
+    $unicode = [Text.Encoding]::Unicode
+    $bytes.AddRange($unicode.GetBytes("[$Key`0;$Name`0;"))
+    $bytes.AddRange([BitConverter]::GetBytes([uint32]4))   # REG_DWORD
+    $bytes.AddRange($unicode.GetBytes(';'))
+    $bytes.AddRange([BitConverter]::GetBytes([uint32]4))
+    $bytes.AddRange($unicode.GetBytes(';'))
+    $bytes.AddRange([BitConverter]::GetBytes([uint32]$Value))
+    $bytes.AddRange($unicode.GetBytes(']'))
+    [IO.File]::WriteAllBytes($polPath, $bytes.ToArray())
+
+    # gpt.ini: Version > 0 и расширение реестра в списке, иначе политика не
+    # применяется. Младшее слово Version — политики компьютера.
+    $iniPath = Join-Path $gpDir 'gpt.ini'
+    $lines = if (Test-Path -LiteralPath $iniPath) { @(Get-Content -LiteralPath $iniPath) } else { @() }
+    $version = [int64]0
+    $extensions = ''
+    foreach ($line in $lines) {
+        if ($line -match '^\s*Version\s*=\s*(\d+)\s*$') { $version = [int64]$Matches[1] }
+        elseif ($line -match '^\s*gPCMachineExtensionNames\s*=(.*)$') { $extensions = $Matches[1].Trim() }
+    }
+    $machineVersion = ($version -band 0xFFFF) + 1
+    if ($machineVersion -gt 0xFFFF) { $machineVersion = 1 }
+    $version = $version - ($version -band 0xFFFF) + $machineVersion
+    $registryCse = '{35378EAC-683F-11D2-A89A-00C04FBBCFA2}'
+    $groups = @([regex]::Matches($extensions, '\[[^\]]*\]') | ForEach-Object { $_.Value })
+    if (-not @($groups | Where-Object { $_.StartsWith("[$registryCse", [StringComparison]::OrdinalIgnoreCase) }).Count) {
+        $groups += "[$registryCse{D02B1F72-3407-48AE-BA88-E8213C6761F1}]"
+    }
+    $lines = @($lines | Where-Object { $_ -notmatch '^\s*(Version|gPCMachineExtensionNames)\s*=' })
+    $general = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^\s*\[General\]\s*$') { $general = $i; break } }
+    if ($general -lt 0) { $lines = @('[General]') + $lines; $general = 0 }
+    $settings = @("gPCMachineExtensionNames=$(($groups | Sort-Object) -join '')", "Version=$version")
+    $lines = @($lines[0..$general]) + $settings + @($lines | Select-Object -Skip ($general + 1))
+    [IO.File]::WriteAllLines($iniPath, [string[]]$lines, [Text.Encoding]::ASCII)
 }
 
 #endregion
@@ -4621,6 +4799,21 @@ if ($script:WizardMode) {
         Write-Note (T 'Включён классический установщик: без него установка без winre.wim падает с 0x80070003' 'Classic setup enabled: without it, installing without winre.wim fails with 0x80070003')
     }
 
+    # 9a. Сжатие итогового образа — для любого пресета. По умолчанию recovery:
+    # оно сжимает лучше всего. Нехватку памяти для него показываем тут же.
+    $wizardMemory = Get-RecoveryMemoryCheck
+    $recoveryNeed = if ($wizardMemory) { Format-Size $wizardMemory.NeedBytes } else { Format-Size ([int64][Environment]::ProcessorCount * 1GB) }
+    Write-Host ''
+    Write-Host (T "  recovery сжимает лучше (ISO меньше), но экспорт дольше и DISM нужно около $recoveryNeed памяти;" "  recovery compresses best (smaller ISO), but the export is slower and DISM needs about $recoveryNeed of memory;") -ForegroundColor DarkGray
+    Write-Host (T '  max даёт ISO больше, зато экспорт быстрее и почти без затрат памяти.' '  max gives a larger ISO, but the export is faster and needs little memory.') -ForegroundColor DarkGray
+    if ($wizardMemory -and -not $wizardMemory.Enough) { Write-Note (Get-RecoveryMemoryWarning -Check $wizardMemory) }
+    $Compression = Read-Option -Question (T 'Как сжимать итоговый образ?' 'How should the final image be compressed?') -Items @(
+        (T 'recovery — install.esd, лучшее сжатие' 'recovery - install.esd, best compression'),
+        (T 'max — install.wim, ISO больше' 'max - install.wim, larger ISO')
+    ) -Values @('recovery', 'max') -Default $(if ($Compression -eq 'max') { 2 } else { 1 })
+    # Ответ уже дан с учётом памяти: перед сборкой повторно не спрашиваем.
+    $script:CompressionAsked = $true
+
     # Файлы памяти установленной Windows — независимо от размера ISO.
     $PageFileMode = Read-Option -Question (T 'Файл подкачки pagefile.sys' 'Paging file pagefile.sys') -Items @(
         (T "Заданный диапазон: $PageFileMinMB–$PageFileMaxMB МБ" "Custom range: $PageFileMinMB–$PageFileMaxMB MB"),
@@ -4671,6 +4864,7 @@ if ($script:WizardMode) {
     if ($RemoveVirtualization) { $cmd += ' -RemoveVirtualization' }
     if ($AutoInstall)        { $cmd += ' -AutoInstall' }
     if ($ProductKey)         { $cmd += " -ProductKey '$($ProductKey.Replace("'","''"))'" }
+    if ($Compression -ne 'recovery') { $cmd += " -Compression $Compression" }
     $cmd += " -PageFileMode $PageFileMode -PageFileMinMB $PageFileMinMB -PageFileMaxMB $PageFileMaxMB -SwapFile $SwapFile -Hibernation $Hibernation -CrashDumps $CrashDumps"
     $cmd += " -Guard $Guard"
     if ($script:DebugMode)   { $cmd += ' -Debug' }
@@ -5368,6 +5562,23 @@ if ($AutoInstall) {
     Write-Note $autoInstallNote
     if (-not $LocalUserName) { Write-Note (T 'Под встроенным Администратором приложения Microsoft Store (UWP) по умолчанию не запускаются; для них задайте -LocalUserName.' 'Microsoft Store (UWP) apps do not start under the built-in Administrator by default; use -LocalUserName for them.') }
 }
+# Нехватка памяти для recovery видна только на последней стадии, поэтому
+# проверяем и спрашиваем до начала работы с образом.
+$recoveryMemory = if ($Compression -eq 'recovery') { Get-RecoveryMemoryCheck } else { $null }
+if ($recoveryMemory -and -not $recoveryMemory.Enough) {
+    Write-Note (Get-RecoveryMemoryWarning -Check $recoveryMemory)
+    # Мастер уже спросил о сжатии, показав эту же оценку, — не переспрашиваем.
+    if (-not $DryRun -and -not $script:CompressionAsked -and (Test-CanPrompt)) {
+        $memoryChoice = Read-Option -Question (T 'Как сжимать итоговый образ?' 'How should the final image be compressed?') -Items @(
+            (T 'recovery — install.esd, лучшее сжатие: освобожу память до стадии экспорта' 'recovery - install.esd, best compression: I will free memory before the export stage'),
+            (T 'max — install.wim: ISO больше, столько памяти не нужно' 'max - install.wim: larger ISO, no such memory demand'),
+            (T 'Отменить сборку' 'Cancel the build')
+        ) -Values @('recovery', 'max', 'cancel') -Default 1
+        if ($memoryChoice -eq 'cancel') { throw (T 'Сборка отменена до обработки образа' 'Build cancelled before image processing') }
+        $Compression = $memoryChoice
+        Write-Ok (T "Сжатие: $Compression" "Compression: $Compression")
+    }
+}
 
 if ($DryRun) {
     Write-Host ''
@@ -5380,14 +5591,23 @@ Ensure-WimMountDriver
 Write-Stage (T 'Распаковка исходного ISO' 'Extracting the source ISO')
 # --- висящие точки монтирования ---
 if ($isAdmin -and -not $DryRun) {
+    $ownedWorkDir = Test-Path -LiteralPath (Join-Path $WorkDir $script:WorkDirMarker)
+    # Кусты прерванного DISM держат файлы образа, даже когда DISM уже не
+    # числит каталог смонтированным, поэтому выгружаем их до всех проверок.
+    if ($ownedWorkDir) { Dismount-OrphanDismHives -MountDirs @($mountDir, $bootMountDir) }
     $mountInfo = Invoke-Dism -Arguments @('/Get-MountedImageInfo') -AllowFail -Quiet
     $stale = @($mountInfo.Output | Select-String -Pattern '^\s*Mount Dir\s*:\s*(.+?)\s*$' |
                ForEach-Object { $_.Matches[0].Groups[1].Value })
     foreach ($dir in $stale) {
         if ($dir -notin @($mountDir, $bootMountDir)) { continue }
-        if (-not (Test-Path -LiteralPath (Join-Path $WorkDir $script:WorkDirMarker))) { throw (T "Чужая точка монтирования: $dir" "Unowned mount: $dir") }
+        if (-not $ownedWorkDir) { throw (T "Чужая точка монтирования: $dir" "Unowned mount: $dir") }
         Write-Note (T "Отцепляю оставшийся с прошлого раза образ: $dir" "Discarding image left over from a previous run: $dir")
-        Invoke-Dism -Arguments @('/Unmount-Image', "/MountDir:$dir", '/Discard') -Quiet | Out-Null
+        $discard = Invoke-Dism -Arguments @('/Unmount-Image', "/MountDir:$dir", '/Discard') -AllowFail -Quiet
+        if (-not (Test-DismSuccess $discard.ExitCode)) {
+            $tail = (@($discard.Output) | Select-Object -Last 6) -join "`n"
+            throw (T "Не удалось отцепить $dir (код DISM $($discard.ExitCode)). Закройте окна Проводника и программы, открытые в этой папке, и запустите сборку снова; если не поможет — выполните от администратора: dism /Cleanup-Mountpoints`n$tail" `
+                     "Could not discard $dir (DISM code $($discard.ExitCode)). Close Explorer windows and programs open in this folder and run the build again; if that does not help, run as administrator: dism /Cleanup-Mountpoints`n$tail")
+        }
     }
     Write-Ok (T 'Проверены точки монтирования этой сборки' 'Checked mount points belonging to this build')
 }
@@ -5892,11 +6112,15 @@ Set-Reg -Path $cc -Name 'DisableCloudOptimizedContent'    -Type REG_DWORD -Value
 Set-Reg -Path $cc -Name 'DisableConsumerAccountStateContent' -Type REG_DWORD -Value 1
 
 # --- виджеты ---
-# Запись TaskbarDa в NTUSER.DAT может блокироваться защитой Windows хоста.
-# Документированная политика действует на все профили, включая IoT LTSC.
+# Запись TaskbarDa в NTUSER.DAT блокирует UCPD хоста. Документированная политика
+# действует на все профили, включая IoT LTSC, но только в Windows 11. С обновления
+# UCPD 09.2026 reg.exe не может записать и её, поэтому она идёт через локальную
+# групповую политику образа (Add-OfflineMachinePolicy).
 # https://learn.microsoft.com/windows/client-management/mdm/policy-csp-newsandinterests#allownewsandinterests
-Set-Reg -Path 'HKLM\LITE_SOFTWARE\Policies\Microsoft\Dsh' -Name 'AllowNewsAndInterests' -Type REG_DWORD -Value 0
-Write-Ok (T 'Виджеты отключены политикой' 'Widgets disabled by policy')
+if (-not $isWindows10) {
+    Add-OfflineMachinePolicy -ImageRoot $mountDir -Key 'SOFTWARE\Policies\Microsoft\Dsh' -Name 'AllowNewsAndInterests' -Value 0
+    Write-Ok (T 'Виджеты отключены локальной групповой политикой' 'Widgets disabled by local Group Policy')
+}
 
 # --- Recall, Click to Do, Copilot ---
 # AllowRecallEnablement=0 не просто прячет Recall: по документации Microsoft
@@ -6098,7 +6322,8 @@ if ($Guard -ne 'None') {
         'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection|AllowTelemetry|0'
         'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent|DisableWindowsConsumerFeatures|1'
         'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent|DisableCloudOptimizedContent|1'
-        'HKLM:\SOFTWARE\Policies\Microsoft\Dsh|AllowNewsAndInterests|0'
+        # Dsh\AllowNewsAndInterests не проверяется: UCPD запрещает PowerShell её
+        # записывать, а локальная групповая политика образа восстанавливает её сама.
     )
     if (-not (Test-GroupActive -RulePreset 'balanced' -Group 'AI')) {
         $guardPolicies = @($guardPolicies | Where-Object { $_ -notmatch 'WindowsAI|WindowsCopilot' })
@@ -6307,15 +6532,30 @@ Write-Stage (T 'Экспорт итогового образа' 'Exporting the f
 $destName = if ($Compression -eq 'recovery') { 'install.esd' } else { 'install.wim' }
 $destPath = Join-Path $isoDir "sources\$destName"
 $compressArg = if ($Compression -eq 'recovery') { '/Compress:recovery' } else { '/Compress:max' }
+# За время сборки память могли занять другие программы: проверяем ещё раз.
+if ($Compression -eq 'recovery') {
+    $recoveryMemory = Get-RecoveryMemoryCheck
+    if ($recoveryMemory -and -not $recoveryMemory.Enough) { Write-Note (Get-RecoveryMemoryWarning -Check $recoveryMemory) }
+}
 
-Invoke-Dism -Arguments @(
+$export = Invoke-Dism -Arguments @(
     '/Export-Image'
     "/SourceImageFile:$wimPath"
     '/SourceIndex:1'
     "/DestinationImageFile:$destPath"
     $compressArg
     '/CheckIntegrity'
-) -Activity (T "Сжатие образа ($Compression)" "Compressing the image ($Compression)") | Out-Null
+) -Activity (T "Сжатие образа ($Compression)" "Compressing the image ($Compression)") -AllowFail
+if (-not (Test-DismSuccess $export.ExitCode)) {
+    $tail = (@($export.Output) | Select-Object -Last 12) -join "`n"
+    # 8 — ERROR_NOT_ENOUGH_MEMORY, 14 — ERROR_OUTOFMEMORY
+    if ($Compression -eq 'recovery' -and $export.ExitCode -in @(8, 14)) {
+        $recoveryMemory = Get-RecoveryMemoryCheck
+        $advice = if ($recoveryMemory) { Get-RecoveryMemoryWarning -Check $recoveryMemory } else { T 'Освободите память или выберите -Compression max.' 'Free memory or choose -Compression max.' }
+        throw (T "DISM не хватило памяти для сжатия recovery (код $($export.ExitCode)).`r`n  $advice`n$tail" "DISM ran out of memory for recovery compression (code $($export.ExitCode)).`r`n  $advice`n$tail")
+    }
+    throw (T "DISM завершился с кодом $($export.ExitCode)`n$tail" "DISM exited with code $($export.ExitCode)`n$tail")
+}
 Remove-Item -LiteralPath $wimPath -Force
 Write-Ok "$destName : $(Format-Size (Get-Item -LiteralPath $destPath).Length)"
 
@@ -6578,6 +6818,9 @@ if ($LogFile) { Write-Host (T "  Лог: $LogFile" "  Log: $LogFile") }
     Dismount-Hives
 
     if ($script:Dism -and (Test-Path $script:Dism)) {
+        # После Ctrl+C во время операции DISM его кусты остаются загруженными.
+        $mountedDirs = @(if ($script:Mounted) { $mountDir }) + @(if ($script:BootMounted) { $bootMountDir })
+        if ($mountedDirs.Count) { Dismount-OrphanDismHives -MountDirs $mountedDirs }
         if ($script:Mounted) {
             Write-Note (T 'Отцепляю образ без сохранения изменений' 'Discarding the image without saving changes')
             $discardResult = Invoke-Dism -Arguments @('/Unmount-Image', "/MountDir:$mountDir", '/Discard') -AllowFail -Quiet

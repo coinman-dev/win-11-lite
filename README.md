@@ -4,7 +4,7 @@
 
 [![Windows 11 x64](https://img.shields.io/badge/Windows%2011-x64-0078D4.svg)](#requirements-and-supported-images)
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20%7C%207-5391FE.svg)](#requirements-and-supported-images)
-[![Tests](https://img.shields.io/badge/tests-1430-success.svg)](#validation-status)
+[![Tests](https://img.shields.io/badge/tests-1503-success.svg)](#validation-status)
 
 **win-11-lite** builds a smaller, privacy-focused Windows 11 installation ISO from an original Microsoft x64 image. Windows 10 images based on build 19041 (2004–22H2, including LTSC 2021) are also supported, with [some differences](#windows-10). It removes selected inbox applications and components, applies privacy and OOBE settings, can integrate updates, languages and drivers, and exports one chosen Windows edition into a new bootable ISO.
 
@@ -161,6 +161,8 @@ For `balanced` and `max`, the wizard asks separately whether to remove the built
 
 The wizard then asks whether to remove the virtualization features: Hyper-V with Hyper-V Manager, WSL2 and the Virtual Machine Platform, Windows Hypervisor Platform, Windows Sandbox and containers. The default is no, except in `max`, where it is yes. The warning says to remove them only if you will not use virtualization, because WSL, Docker Desktop, Hyper-V virtual machines and Sandbox stop working and cannot be enabled again without the source image. Yes in `safe` or `balanced` is `-RemoveVirtualization`; no in `max` is `-Keep Virtualization`. The features are removed with `DISM /Disable-Feature /Remove`. The Hyper-V guest integration services that let this Windows run inside a VM belong to the core system and stay. The hypervisor used by virtualization-based security also belongs to the core system: Windows Home has no Hyper-V features and still runs VBS. Guard does not monitor these features.
 
+On Windows 11, widgets are disabled by the documented `Allow widgets` policy (`SOFTWARE\Policies\Microsoft\Dsh\AllowNewsAndInterests=0`). Since the September 2026 update, the host's User Choice Protection Driver (UCPD) denies `reg.exe` and PowerShell writes to this value even in a mounted image hive, so the build puts it in the image's local Group Policy (`Windows\System32\GroupPolicy\Machine\Registry.pol` and `gpt.ini`). The Group Policy service applies it in the installed Windows and restores it if it is removed, so Guard does not monitor it. The policy is visible and can be changed in `gpedit.msc` under Computer Configuration > Administrative Templates > Windows Components > Widgets. Windows 10 does not have this policy, so it is not written there.
+
 Selected consumer Appx targets include Clipchamp, Bing News/Weather, Get Help/Get Started, Office Hub, Solitaire, Feedback Hub, Phone Link, new Outlook, Teams, Xbox/Game Bar, Family and Microsoft To Do. Exact matches depend on what the source image contains.
 
 The capability-removal stage reports the total inventory separately from the capabilities selected for removal and retained by the build rules. Its final summary counts successful removals, failures and operations deferred because servicing is pending. A DISM removal error is recorded and processing continues with the next selected capability.
@@ -296,15 +298,17 @@ Hardware requirement bypasses for TPM, Secure Boot, CPU, RAM and storage are inc
 
 WinRE is the installed Windows Recovery Environment. It is different from WinPE in `boot.wim`, which continues to boot and run Windows Setup.
 
+`recovery` compression is memory-hungry: DISM compresses 64 MiB solid LZMS chunks on every logical processor. The builder assumes about 1 GB of commit memory (RAM plus page file) per logical processor; this estimate is derived from the wimlib author's figure of about 480 MiB per thread for 32 MiB chunks. It compares that with free commit plus the room the page file can still grow: up to its maximum, or, for a system-managed page file, up to 3 × RAM or 4 GB (whichever is larger), limited to one eighth of the volume and the free space. If memory is short, the numbers, the largest memory users (for example `vmmemWSL`, the WSL virtual machine; `wsl --shutdown` frees it) and the remedies are shown. For every preset, the wizard asks how to compress the final image: `recovery` (`install.esd`, best compression, the default) or `max` (`install.wim`, larger ISO). The memory need and any shortage warning appear right before that question, so the build does not ask again. A command-line build in an interactive console shows the warning in the plan and asks, before any image work, whether to keep `recovery` (default) after freeing memory, switch to `max` or cancel. DryRun and non-interactive builds only warn. Memory is checked again right before the export, and a DISM error 8 during `recovery` compression is reported as a memory shortage with the same advice.
+
 ### Memory files in installed Windows
 
-New builds default to a **128–1024 MB paging file**, with `swapfile.sys`, hibernation/Fast Startup and crash dumps disabled. These choices are independent of the preset and ISO compression. The wizard offers separate choices, `-DryRun` displays the selections, and build metadata stores them in `MemoryFiles`.
+New builds default to a **128–4096 MB paging file**, with `swapfile.sys`, hibernation/Fast Startup and crash dumps disabled. These choices are independent of the preset and ISO compression. The wizard offers separate choices, `-DryRun` displays the selections, and build metadata stores them in `MemoryFiles`.
 
 | Parameter | Default and effect |
 | --- | --- |
 | `-PageFileMode custom|system` | `custom`: use the configured range; `system`: let Windows size the paging file. |
 | `-PageFileMinMB <MB>` | `128`: initial size of `pagefile.sys`. |
-| `-PageFileMaxMB <MB>` | `1024`: growth limit. For a fixed 128 MB file, use `-PageFileMaxMB 128`. |
+| `-PageFileMaxMB <MB>` | `4096`: growth limit. For a fixed 128 MB file, use `-PageFileMaxMB 128`. |
 | `-SwapFile disabled|system` | `disabled`: request disabling through `SwapfileControl=0`; `system`: remove the override and let Windows manage swap. |
 | `-Hibernation disabled|system` | `disabled`: disable hibernation, Fast Startup and `hiberfil.sys`; `system`: keep source image settings. |
 | `-CrashDumps disabled|system` | `disabled`: disable crash dumps (`MEMORY.DMP`/Minidump), full live dumps, DumpStack logging and dedicated dump file configuration; `system`: keep source settings. |
@@ -361,8 +365,9 @@ Older branches such as 17763 (LTSC 2019) are rejected. Differences from Windows 
 - Languages are not added. `-AddLanguage`, `-DownloadLanguage`, and a `-SetupLanguage` different from the image language stop the build before any download. Use an ISO in the required language.
 - `-WithUpdates` downloads the `Cumulative Update for Windows 10 Version 21H2/22H2 for x64-based Systems` (about 0.9 GB; the servicing stack is included) and, unless `-IncludeDotNetUpdate $false` is set, the `.NET Framework 3.5 and 4.8` update that matches the in-box .NET 4.8. Windows 10 updates use their own cache folders (`lcu-win10-21H2`), separate from Windows 11 21H2.
 - The removal rules are the same as for Windows 11. In `balanced` this also removes Internet Explorer 11, which is still a working browser in Windows 10, and classic Paint, the only Paint in LTSC. Keep them with `-Keep IE` or `-Keep Misc`. Windows 10 has no Recall or Windows 11 AI components; the Copilot policies are still written.
+- The widgets policy (`AllowNewsAndInterests`) exists only in Windows 11 and is not written.
 
-A real Windows 10 LTSC 2021 ISO passed DryRun, and the update selection was checked against the live Microsoft Update Catalog. A full Windows 10 build and installation in a VM have not been performed yet.
+A real Windows 10 LTSC 2021 ISO passed DryRun, and the update selection was checked against the live Microsoft Update Catalog. A real build reached the offline-registry stage, where the host's UCPD rejected the widgets policy; that is fixed, but the build has not been rerun yet. A full Windows 10 build and installation in a VM have not been performed yet.
 
 ---
 
@@ -419,7 +424,7 @@ The table covers every user-facing parameter. Run `Get-Help .\win-11-lite.ps1 -F
 | `-CompactOS` | Install Windows in CompactOS mode. |
 | `-PageFileMode custom|system` | Use a custom paging range or Windows management; default custom. |
 | `-PageFileMinMB <MB>` | Initial paging file size; default 128 MB. |
-| `-PageFileMaxMB <MB>` | Maximum paging file size; default 1024 MB, at least the initial size. |
+| `-PageFileMaxMB <MB>` | Maximum paging file size; default 4096 MB, at least the initial size. |
 | `-SwapFile disabled|system` | Disable swap through an override or let Windows manage it; default disabled. |
 | `-Hibernation disabled|system` | Disable hibernation/Fast Startup or keep source settings; default disabled. |
 | `-CrashDumps disabled|system` | Disable crash/full live dumps and DumpStack or keep source settings; default disabled. |
@@ -480,13 +485,15 @@ Builder logging creates a main `.log`, a `.details.log` for commands/technical d
 
 Every builder progress bar switches to a moving `...` indicator after five minutes without a change in the displayed whole percentage, while the elapsed timer keeps running. Hidden changes such as 1.1% to 1.9%, both displayed as 1%, do not reset that interval. A new displayed value automatically restores the percentage bar; this can repeat during the same operation. The rule applies to DISM operations, file copying and ISO creation. A reported 100% while the process is still running continues to show the existing completion-wait indicator.
 
+If a build is interrupted (for example with Ctrl+C during a DISM operation), cleanup discards the mounted image, and the work folder is kept if that fails. DISM loads the image registry hives as `HKLM\{GUID}<drive>:/.../mount/...`; an interrupted DISM leaves them loaded, and they keep the image locked (`0xc1420117`, "The directory could not be completely unmounted"). Cleanup and the next run unload such hives, but only those inside this build's own mount folders and only when no DISM process is running, then discard the leftover image. If the discard still fails, close Explorer windows and programs open in the work folder; as a last resort, run `dism /Cleanup-Mountpoints` as administrator.
+
 Guest runtime files live under `C:\Windows\Setup\Scripts\Win11Lite`. For VM diagnostics, use the relevant daily files under `Logs` and the latest `guard-report.txt/json`. Entries identify `prepare`, `finalize`, `launcher`, `vbs-launcher` or a Guard run ID. Host build logs cannot show what happened after Windows booted.
 
 ---
 
 ## Validation status
 
-As of 2026-09-27, 14 suites contain **1,430 checks**. The 1,292 checks present before the Guard report fix passed on each of Windows PowerShell 5.1 and PowerShell 7. The 138 checks added since then (12 for the Guard report window, 27 for Windows 10, 36 for `-AutoInstall`, 6 for the wizard antivirus question, 39 for virtualization removal, 12 for choosing an ISO and single-edition images, 6 for preparing `oscdimg` without the ADK) have run on Windows PowerShell 5.1 only, because PowerShell 7 is not installed on the machine used for them. All 14 suites passed there. They cover parsers, safe paths, work-drive capacity, downloads/cache, WIM/ADK, languages, answer files, removal rules, Guard reports/history, log retention, OOBE networking, memory files, child processes, progress, CMD and VBS. For the memory-file and network changes, eight affected suites passed: **646 checks on each PowerShell version**; other suites were not rerun. DryRun against a real ISO passed with RU/7 and EN/5.1. The ISO-read fix passed all 151 Servicing checks on each runtime, including a real file-sharing violation with mocked ISO APIs. The latest registry fix passed MemoryFiles 72 and SingleFile 45 on each runtime (117 checks), including actual registry operations and deletion-denying ACLs inside a disposable HKCU fixture. The capability-counter change passed all 246 Main checks on each runtime, including continuing after a removal error with mocked DISM.
+As of 2026-09-27, 14 suites contain **1,503 checks**. The 1,292 checks present before the Guard report fix passed on each of Windows PowerShell 5.1 and PowerShell 7. The 211 checks added since then (12 for the Guard report window, 27 for Windows 10, 36 for `-AutoInstall`, 6 for the wizard antivirus question, 39 for virtualization removal, 12 for choosing an ISO and single-edition images, 6 for preparing `oscdimg` without the ADK, 10 for the widgets policy in local Group Policy, 19 for hives left by an interrupted DISM, 1 for the 128–4096 MB paging default, 43 for the `recovery` memory check and the wizard compression question) have run on Windows PowerShell 5.1 only, because PowerShell 7 is not installed on the machine used for them. All 14 suites passed there. They cover parsers, safe paths, work-drive capacity, downloads/cache, WIM/ADK, languages, answer files, removal rules, Guard reports/history, log retention, OOBE networking, memory files, child processes, progress, CMD and VBS. For the memory-file and network changes, eight affected suites passed: **646 checks on each PowerShell version**; other suites were not rerun. DryRun against a real ISO passed with RU/7 and EN/5.1. The ISO-read fix passed all 151 Servicing checks on each runtime, including a real file-sharing violation with mocked ISO APIs. The latest registry fix passed MemoryFiles 72 and SingleFile 45 on each runtime (117 checks), including actual registry operations and deletion-denying ACLs inside a disposable HKCU fixture. The capability-counter change passed all 246 Main checks on each runtime, including continuing after a removal error with mocked DISM.
 
 Tests that exercise Guard, OOBE, registry, services or servicing use controlled fixtures for system operations. Registry preservation tests also use the real provider inside a disposable HKCU key, with HKLM paths redirected there. They are not presented as a real VM result. Real builds and prior VM logs confirm substantial parts of the 24H2/26H1 flow; current memory-file/network changes, the newest VBS launcher, localized winget Firefox installation and current `max` exception still need a fresh installation.
 

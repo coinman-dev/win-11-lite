@@ -23,7 +23,9 @@ foreach($name in 'Set-GuestMemoryFilePolicy','Write-MemoryFileReport'){
     . ([scriptblock]::Create($node.Extent.Text))
 }
 $policy=Get-MemoryFilePolicy
-Assert ($policy.PageFileMode -eq 'custom' -and $policy.PageFileMinMB -eq 128 -and $policy.PageFileMaxMB -eq 1024) 'Default paging matches the requested 128 MB initial / 1024 MB maximum'
+Assert ($policy.PageFileMode -eq 'custom' -and $policy.PageFileMinMB -eq 128 -and $policy.PageFileMaxMB -eq 4096) 'Default paging matches the requested 128 MB initial / 4096 MB maximum'
+$pagingDefaults=@{};foreach($parameter in @($ast.ParamBlock.Parameters|Where-Object{$_.Name.VariablePath.UserPath -in @('PageFileMinMB','PageFileMaxMB')})){$pagingDefaults[$parameter.Name.VariablePath.UserPath]=$parameter.DefaultValue.Extent.Text}
+Assert ($pagingDefaults.PageFileMinMB -eq '128' -and $pagingDefaults.PageFileMaxMB -eq '4096') 'Command-line and wizard defaults use the same 128-4096 MB range'
 Assert ($policy.SwapFile -eq 'disabled' -and $policy.Hibernation -eq 'disabled' -and $policy.CrashDumps -eq 'disabled') 'Compact defaults explicitly disable swap, hibernation and dumps'
 Assert-Throws {Get-MemoryFilePolicy -PageFileMinMB 1024 -PageFileMaxMB 128} 'An inverted custom range fails'
 Assert-Throws {Get-MemoryFilePolicy -PageFileMinMB 0} 'Zero cannot accidentally request system-managed paging'
@@ -40,7 +42,7 @@ $script:StartedAt=[datetime]'2026-09-15T12:00:00';$memoryFilePolicy=$policy
 $metadata=$ast.Find({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$buildInfo'},$true)
 . ([scriptblock]::Create($metadata.Extent.Text))
 $savedMetadata=$buildInfo|ConvertFrom-Json
-Assert ($savedMetadata.MemoryFiles.Registry.Count -eq 10 -and ($savedMetadata.MemoryFiles.Registry|Where-Object Name -eq 'PagingFiles').Value[0] -eq '?:\pagefile.sys 128 1024') 'The actual build manifest preserves nested registry entries and paging strings'
+Assert ($savedMetadata.MemoryFiles.Registry.Count -eq 10 -and ($savedMetadata.MemoryFiles.Registry|Where-Object Name -eq 'PagingFiles').Value[0] -eq '?:\pagefile.sys 128 4096') 'The actual build manifest preserves nested registry entries and paging strings'
 foreach($name in 'PageFileMode','PageFileMinMB','PageFileMaxMB','SwapFile','Hibernation','CrashDumps'){
     Assert ($name -in @($ast.ParamBlock.Parameters|ForEach-Object{$_.Name.VariablePath.UserPath})) "Public parameter $name exists"
     foreach($readme in 'README.md','README.ru_RU.md'){
@@ -61,7 +63,7 @@ $script:existing=@{DedicatedDumpFile=1;DumpFileSize=1}
 Set-OfflineMemoryFilePolicy -Policy $policy
 Assert ($script:writes.Count -eq 16 -and $script:deletes.Count -eq 4) 'Both mounted control sets receive the policy and dedicated dump allocation is removed'
 Assert (-not @($script:writes|Where-Object{$_.Path -notlike 'HKLM:\LITE_SYSTEM\*'}).Count -and $script:powerCalls -eq 0) 'Offline policy never targets the host or calls powercfg'
-Assert (@($script:writes|Where-Object{$_.Name -eq 'PagingFiles' -and $_.Type -eq 'MultiString' -and $_.Value[0] -eq '?:\pagefile.sys 128 1024'}).Count -eq 2) 'Offline paging uses REG_MULTI_SZ and a target-drive placeholder'
+Assert (@($script:writes|Where-Object{$_.Name -eq 'PagingFiles' -and $_.Type -eq 'MultiString' -and $_.Value[0] -eq '?:\pagefile.sys 128 4096'}).Count -eq 2) 'Offline paging uses REG_MULTI_SZ and a target-drive placeholder'
 Assert (@($script:writes|Where-Object{$_.Name -in @('CrashDumpEnabled','EnableLogFile','FullLiveReportsMax') -and $_.Value -eq 0}).Count -eq 6) 'Crash dumps, DumpStack logging and full live dumps are disabled in each control set'
 $script:sets=@('Select')
 Assert-Throws {Set-OfflineMemoryFilePolicy -Policy $policy} 'A missing image control set fails instead of reporting success'
@@ -76,7 +78,7 @@ try{
     # Exercise the exact JSON round trip used by build-info.json.
     $script:BuildInfo=$savedMetadata
     Set-GuestMemoryFilePolicy
-    Assert (($script:writes|Where-Object Name -eq 'PagingFiles').Value[0] -eq 'W:\pagefile.sys 128 1024') 'Guest paging uses the installed drive, not the builder C drive'
+    Assert (($script:writes|Where-Object Name -eq 'PagingFiles').Value[0] -eq 'W:\pagefile.sys 128 4096') 'Guest paging uses the installed drive, not the builder C drive'
     Assert ($script:powerCalls -eq 1 -and @($script:writes|Where-Object{$_.Path -notlike 'HKLM:\SYSTEM\CurrentControlSet\*'}).Count -eq 0) 'Guest changes the active control set and disables hibernation through powercfg'
     Assert (($script:writes|Where-Object Name -eq 'SwapfileControl').Value -eq 0) 'Disabled swap writes its override independently of paging'
     $script:failWrite=$true
@@ -106,7 +108,7 @@ Write-MemoryFileReport
 Assert (($script:report.Files|Where-Object Path -like '*pagefile.sys').Bytes -eq 134217728) 'Report records observed file size, not a promised target'
 Assert ($null -eq ($script:report.Files|Where-Object Path -like '*swapfile.sys').Exists -and ($script:report.Files|Where-Object Path -like '*swapfile.sys').Error) 'An unreadable file is unknown, not falsely absent'
 Assert (-not ($script:report.Files|Where-Object Path -like '*hiberfil.sys').Exists) 'Missing files are reported as absent'
-Assert ($script:report.Requested.PageFileMaxMB -eq 1024 -and $script:report.Note -match 'restart') 'Report retains requested limits and states the restart limitation'
+Assert ($script:report.Requested.PageFileMaxMB -eq 4096 -and $script:report.Note -match 'restart') 'Report retains requested limits and states the restart limitation'
 
 & {
     # Production HKLM paths are translated only here; no host system settings are
@@ -199,7 +201,7 @@ Assert ($script:report.Requested.PageFileMaxMB -eq 1024 -and $script:report.Note
         Set-GuestMemoryFilePolicy
         Assert ($state.Created -eq 3 -and $state.PowerCalls -eq 1) 'Only three missing FullLiveKernelReports keys are created; powercfg remains mocked'
         foreach($branch in $branches){
-            $expectedPage=if($branch -eq 'Guest'){'W:\pagefile.sys 128 1024'}else{'?:\pagefile.sys 128 1024'}
+            $expectedPage=if($branch -eq 'Guest'){'W:\pagefile.sys 128 4096'}else{'?:\pagefile.sys 128 4096'}
             Assert ((Read-FixtureValue $branch $paths[0] 'PagingFiles') -eq $expectedPage -and (Read-FixtureValue $branch $paths[0] 'SwapfileControl') -eq 0) "PagingFiles survives the subsequent swap write in $branch"
             Assert ((Read-FixtureValue $branch $paths[1] 'HibernateEnabled') -eq 0 -and (Read-FixtureValue $branch $paths[1] 'HibernateEnabledDefault') -eq 0) "Both power values survive in $branch"
             Assert ((Read-FixtureValue $branch $paths[3] 'CrashDumpEnabled') -eq 0 -and (Read-FixtureValue $branch $paths[3] 'EnableLogFile') -eq 0 -and $null -eq (Read-FixtureValue $branch $paths[3] 'DedicatedDumpFile')) "Dump writes and targeted deletion preserve each other in $branch"
