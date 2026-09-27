@@ -7,7 +7,7 @@ $repo=Split-Path $PSScriptRoot -Parent
 $t=$null;$e=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'win-11-lite.ps1'),[ref]$t,[ref]$e)
 if($e.Count){throw ($e|Out-String)}
-foreach($name in 'T','Get-AdkSourceHash','Confirm-MicrosoftSignature','Read-MsiTable','Get-MsiDirectoryPath','Get-MsiFileMap','Save-AdkInstallers','Get-AdkCatalog','Get-WimImageList','Get-IsoEditions','Get-NativeToolVersion','Save-DeploymentTools','Initialize-DeploymentTools','Ensure-WimMountDriver','Read-PreparedCache','Write-PreparedCache','Assert-ChildPath','Invoke-NativeQuiet','Test-DismSuccess','Resolve-AccountMode','Assert-LocalUserName','Test-SecureStringEqual','Read-ConfirmedLocalAccountPassword','Read-LocalAccountOptions','Get-LocalAccountXml','Get-ImageInstallXml','Get-ProductKeyUiMode','Get-ElevationCommand'){
+foreach($name in 'T','Get-AdkSourceHash','Confirm-MicrosoftSignature','Read-MsiTable','Get-MsiDirectoryPath','Get-MsiFileMap','Save-AdkInstallers','Get-AdkCatalog','Get-WimImageList','Get-IsoEditions','Get-NativeToolVersion','Save-DeploymentTools','Initialize-DeploymentTools','Ensure-WimMountDriver','Read-PreparedCache','Write-PreparedCache','Assert-ChildPath','Invoke-NativeQuiet','Test-DismSuccess','Resolve-AccountMode','Assert-LocalUserName','Test-SecureStringEqual','Read-ConfirmedLocalAccountPassword','Read-LocalAccountOptions','Get-LocalAccountXml','Get-ImageInstallXml','Get-ProductKeyUiMode','Get-ElevationCommand','Get-AutoLogonXml','Get-AutoInstallDiskXml','Get-AutoInstallDiskScripts','Write-AutoInstallMediaFiles','Resolve-InputIsoPath','Select-InputIso','Get-NormalizedDirectory','Get-IsoFilesInDirectory','Write-IsoList','Format-Size'){
     $node=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name},$false)
     if(-not $node){throw "Missing function: $name"}
     . ([scriptblock]::Create($node.Extent.Text))
@@ -127,6 +127,32 @@ try{
         Assert ($state.Downloads -eq 0) 'Preview does not download or install tools'
         $custom=Join-Path $root 'custom.exe';[IO.File]::WriteAllText($custom,'fixture')
         Assert-Throws {Initialize-DeploymentTools -Build 28000 -Directory $root -ExplicitDism $custom} 'An explicitly selected old DISM is rejected before servicing'
+    }
+    # Хост без ADK: системный DISM подходит, oscdimg нет (случай пользователя с Windows 10 LTSC 2021).
+    & {
+        $state=@{Downloads=0;Builds=@();Notes=0;Installs=0}
+        function Get-NativeToolVersion {param($Path)if($Path -like '*System32*'){[version]'10.0.26100.8875'}elseif($Path -like '*fresh*'){[version]'10.0.28000.1'}else{$null}}
+        function Test-Path {param($LiteralPath,$Path,[switch]$PathType)$false}
+        function Save-DeploymentTools {param($Directory,$Build)$state.Downloads++;$state.Builds+=$Build;[pscustomobject]@{Dism='C:\fresh\dism.exe';Oscdimg='C:\fresh\oscdimg.exe'}}
+        function Write-Note {param($Message)$state.Notes++}
+        function Save-Url {param($Url,$Destination)$state.Installs++;throw 'ADK installer path reached'}
+        $script:Dism=$null;$script:Oscdimg=$null;$SkipIso=$false
+        Initialize-DeploymentTools -Build 19041 -Directory $root
+        Assert ($state.Downloads -eq 1 -and $state.Builds[0] -eq 28000 -and $script:Oscdimg -eq 'C:\fresh\oscdimg.exe' -and $script:Dism -like '*System32\dism.exe') 'A host without ADK gets only oscdimg from the pinned packages and keeps its own DISM'
+        $state.Downloads=0;$script:Dism=$null;$script:Oscdimg=$null
+        Initialize-DeploymentTools -Build 19041 -Directory $root -Preview
+        Assert ($state.Downloads -eq 0 -and $state.Notes -eq 1) 'DryRun only announces the oscdimg preparation'
+        $script:Dism=$null;$script:Oscdimg=$null
+        Assert-Throws {Initialize-DeploymentTools -Build 19041 -Directory $root -Install} 'Explicit -InstallAdk still installs Deployment Tools instead of the light path'
+        Assert ($state.Downloads -eq 0 -and $state.Installs -eq 1) 'With -InstallAdk the pinned oscdimg is not substituted'
+        $script:Dism=$null;$script:Oscdimg=$null;$SkipIso=$true
+        Initialize-DeploymentTools -Build 19041 -Directory $root
+        Assert ($state.Downloads -eq 0 -and -not $script:Oscdimg) '-SkipIso needs no oscdimg at all'
+        $SkipIso=$false
+        function Save-DeploymentTools {param($Directory,$Build)throw 'catalog unavailable'}
+        $script:Dism=$null;$script:Oscdimg=$null;$failure=''
+        try{Initialize-DeploymentTools -Build 19041 -Directory $root}catch{$failure=$_.Exception.Message}
+        Assert ($failure -match 'catalog unavailable' -and $failure -match '-InstallAdk') 'A failed oscdimg preparation keeps the reason and suggests -InstallAdk'
     }
     & {
         $payload=Join-Path $root 'payload.bin';[IO.File]::WriteAllText($payload,'inert tool fixture')
@@ -410,6 +436,165 @@ try{
         Assert ($xml.SelectSingleNode('//u:OSImage/u:Compact',$ns).InnerText -eq 'true' -and -not $xml.SelectSingleNode('//u:AutoLogon',$ns)) 'CompactOS is preserved without adding automatic logon'
     }
     Assert ((Get-LocalAccountXml -Name '') -eq '' -and (Get-ImageInstallXml -Compact $false) -notmatch '<Compact>') 'Unrequested account creation and compression remain absent'
+    Assert ($unattendXml -notmatch 'InstallToAvailablePartition|AdministratorPassword|win11lite\\disk\.cmd') 'Without -AutoInstall Setup still asks for the disk and no built-in Administrator is enabled'
+
+    # Регрессия: ISO с одной редакцией (Windows 10 IoT LTSC 2021) мастер считал
+    # en-US Windows 11 — одиночный PSCustomObject в PS 5.1 не имеет Count.
+    & {
+        $editionStep=[regex]::Match($ast.Extent.Text,'(?ms)^    # @\(\): одна редакция.*?^    \$wizardWindows10 = [^\r\n]+').Value
+        if(-not $editionStep){throw 'Wizard edition step not found'}
+        function Write-Host {param($Object,$ForegroundColor)}
+        $InputIso='fixture.iso';$script:Lang='ru'
+        function Get-IsoEditions {param($Path) [pscustomobject]@{Index=1;Name='Windows 10 Enterprise LTSC 2021';EditionId='IoTEnterpriseS';Languages='ru-RU';Version='10.0.19041.1288'}}
+        $Index=0;. ([scriptblock]::Create($editionStep))
+        Assert ($Index -eq 1 -and $wizardLang -eq 'ru-RU' -and $wizardWindows10 -and $wizardImage.EditionId -eq 'IoTEnterpriseS') 'A single-edition ISO selects its index, language and Windows 10 family instead of en-US Windows 11'
+        function Get-IsoEditions {param($Path) @([pscustomobject]@{Index=1;Name='Enterprise LTSC';EditionId='EnterpriseS';Languages='en-US';Version='10.0.26100.1742'},[pscustomobject]@{Index=2;Name='IoT Enterprise LTSC';EditionId='IoTEnterpriseS';Languages='en-US';Version='10.0.26100.1742'})}
+        function Read-Option {param($Question,$Items,$Values,$Default)$Values[$Default-1]}
+        $Index=0;. ([scriptblock]::Create($editionStep))
+        Assert ($Index -eq 2 -and $wizardLang -eq 'en-US' -and -not $wizardWindows10) 'Multi-edition ISOs keep the edition menu and Windows 11 detection'
+        $script:Lang='en'
+    }
+
+    # Выбор ISO: папка вместо файла показывает все ISO из неё (случай пользователя:
+    # «Указать свой файл» → «F:\OS\Windows\»).
+    & {
+        $isoRoot=Join-Path $root 'iso choice';$folder=Join-Path $isoRoot 'OS\Windows';$emptyFolder=Join-Path $isoRoot 'empty'
+        $null=New-Item -ItemType Directory -Path $folder,$emptyFolder,(Join-Path $folder 'nested') -Force
+        foreach($name in 'b-win10.iso','a-win11.ISO','notes.txt','nested\deep.iso'){[IO.File]::WriteAllText((Join-Path $folder $name),'fixture')}
+        $shown=[Collections.Generic.List[string]]::new();$answers=[Collections.Queue]::new()
+        function Write-Host {param($Object,$ForegroundColor)$shown.Add([string]$Object)}
+        function Read-Host {param($Prompt)if(-not $answers.Count){throw 'Unexpected extra prompt'};$answers.Dequeue()}
+        function Test-CanPrompt {$true}
+        $savedRoot=$script:ScriptRoot;$script:ScriptRoot=$emptyFolder;$script:Lang='ru'
+        Push-Location -LiteralPath $emptyFolder
+        try{
+            foreach($answer in '1',"$folder\",'2'){$answers.Enqueue($answer)}
+            $picked=Select-InputIso
+            $text=$shown -join "`n"
+            Assert ($picked -eq (Join-Path $folder 'b-win10.iso') -and -not $answers.Count) 'A folder entered for "own file" lists its ISO files and the chosen number returns that ISO'
+            Assert ($text -match 'Рядом со скриптом ISO-файлов не найдено' -and $text.Contains("ISO-файлы в папке ${folder}:") -and $text -match '1\. a-win11\.ISO' -and $text -match '2\. b-win10\.iso') 'The folder list is shown with numbers, sorted by name, including an upper-case .ISO'
+            Assert ($text -notmatch 'notes\.txt|deep\.iso') 'Other files and ISO files in subfolders are not listed'
+            Assert ((Get-NormalizedDirectory 'F:\OS\Windows\') -eq 'F:\OS\Windows' -and (Get-NormalizedDirectory 'F:\') -eq 'F:\') 'A trailing backslash is dropped except for a drive root'
+            $shown.Clear();foreach($answer in "`"$folder`"",'1'){$answers.Enqueue($answer)}
+            Assert ((Select-InputIso) -eq (Join-Path $folder 'a-win11.ISO')) 'A quoted folder path typed instead of a number also opens the folder list'
+            $shown.Clear();foreach($answer in '1',$emptyFolder,(Join-Path $folder 'notes.txt'),'C:\no-such-folder\x.iso','7',(Join-Path $folder 'b-win10.iso')){$answers.Enqueue($answer)}
+            $picked=Select-InputIso;$text=$shown -join "`n"
+            Assert ($picked -eq (Join-Path $folder 'b-win10.iso') -and $text -match 'ISO-файлов нет' -and $text -match 'Это не ISO-файл' -and $text -match 'Путь не найден' -and $text -match 'Введите число от 1 до 1') 'An empty folder, a non-ISO file, a missing path and a wrong number are explained and asked again'
+            $shown.Clear();$answers.Enqueue('2')
+            Assert ((Resolve-InputIsoPath -Path $folder) -eq (Join-Path $folder 'b-win10.iso') -and ($shown -join "`n").Contains("ISO-файлы в папке ${folder}:")) '-InputIso with a folder opens the same folder list in the interactive wizard'
+            Assert ((Resolve-InputIsoPath -Path (Join-Path $folder 'a-win11.ISO')) -eq (Join-Path $folder 'a-win11.ISO')) 'A direct ISO path is accepted as before'
+            Assert-Throws {Resolve-InputIsoPath -Path (Join-Path $folder 'notes.txt')} 'A non-ISO file passed to -InputIso stops before mounting'
+            function Test-CanPrompt {$false}
+            $failure='';try{Resolve-InputIsoPath -Path $folder|Out-Null}catch{$failure=$_.Exception.Message}
+            Assert ($failure -match 'указывает на папку' -and $failure.Contains($folder)) 'A folder without interactive input stops with a clear message naming the folder'
+        }finally{Pop-Location;$script:ScriptRoot=$savedRoot;$script:Lang='en'}
+    }
+
+    # -AutoInstall: учётная запись без вопросов.
+    & {
+        function Test-CanPrompt {$true}
+        function Read-Option {param($Question,$Items,$Values,$Default) throw 'AutoInstall must not ask where to configure the account'}
+        function Read-Host {param($Prompt,[switch]$AsSecureString) throw 'AutoInstall must not prompt'}
+        $Unattend=''
+        $admin=Read-LocalAccountOptions -Build 19041 -EditionId IoTEnterpriseS -Mode auto -AutoInstall
+        Assert (-not $admin.Name -and $admin.Mode -eq 'auto' -and $null -eq $admin.Password) 'AutoInstall without a name selects the built-in Administrator without any prompt'
+        $named=Read-LocalAccountOptions -Build 26100 -EditionId IoTEnterpriseS -Mode auto -Name 'Tester' -AutoInstall
+        Assert ($named.Mode -eq 'image' -and $named.Name -eq 'Tester') 'AutoInstall with -LocalUserName creates that account instead'
+        Assert-Throws {Read-LocalAccountOptions -Build 26100 -EditionId IoTEnterpriseS -Mode setup -AutoInstall} 'AutoInstall rejects -AccountMode setup, which would ask in OOBE'
+        Assert-Throws {Read-LocalAccountOptions -Build 26100 -EditionId IoTEnterpriseS -Mode auto -Password (ConvertTo-SecureString 'x' -AsPlainText -Force) -AutoInstall} 'A password without an account name is rejected'
+    }
+    # -AutoInstall: настоящие выражения answer-файла, затем разбор XML.
+    $answerNames='prepareCommand','registerCommand','finalizeCommand','setupInputLocale','compactBlock','localAccountXml','autoInstallPeXml','autoLogonXml','productKeyUi','escapedProductKey','productKeyValue','oobeNetBlock','unattendXml'
+    $buildAnswer={
+        foreach($name in $answerNames){
+            $node=$ast.Find({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq ('$'+$name)},$true)
+            if(-not $node){throw "Missing answer-file assignment: $name"}
+            . ([scriptblock]::Create($node.Extent.Text))
+        }
+        [xml]$doc=$unattendXml;$doc
+    }
+    $AutoInstall=$true;$useVbsLauncher=$true;$selected=[pscustomobject]@{EditionId='IoTEnterpriseS'};$LocalUserName='';$LocalUserPassword=$null;$CompactOS=$false;$ProductKey=''
+    $xml=. $buildAnswer;$ns=[Xml.XmlNamespaceManager]::new($xml.NameTable);$ns.AddNamespace('u','urn:schemas-microsoft-com:unattend')
+    $peSetup=$xml.SelectSingleNode('//u:settings[@pass="windowsPE"]/u:component[@name="Microsoft-Windows-Setup"]',$ns)
+    $order=@($peSetup.ChildNodes|Where-Object NodeType -eq 'Element'|ForEach-Object LocalName)
+    Assert (($order -join ',') -eq 'ImageInstall,RunSynchronous,UserData') 'Disk partitioning sits between ImageInstall and UserData, as the strict schema order requires'
+    Assert ($peSetup.SelectSingleNode('u:ImageInstall/u:OSImage/u:InstallToAvailablePartition',$ns).InnerText -eq 'true' -and -not $peSetup.SelectSingleNode('u:ImageInstall/u:OSImage/u:InstallTo',$ns)) 'Setup picks the Windows partition itself; InstallTo is never combined with it'
+    $diskCommand=$peSetup.SelectSingleNode('u:RunSynchronous/u:RunSynchronousCommand/u:Path',$ns).InnerText
+    Assert ($diskCommand -match '\\win11lite\\disk\.cmd' -and $diskCommand -match ' & exit /b\)$' -and $diskCommand -notmatch '\bX\b') 'WinPE searches every media letter except the X: RAM disk for the partitioning script'
+    $shell=$xml.SelectSingleNode('//u:settings[@pass="oobeSystem"]/u:component[@name="Microsoft-Windows-Shell-Setup"]',$ns)
+    $autoLogon=$shell.SelectSingleNode('u:AutoLogon',$ns)
+    Assert ($autoLogon -and $shell.FirstChild.LocalName -eq 'AutoLogon' -and $autoLogon.Username -eq 'Administrator' -and $autoLogon.Enabled -eq 'true' -and [int]$autoLogon.LogonCount -ge 1000000) 'The English name Administrator enables the built-in account and signs in automatically'
+    Assert ($autoLogon.Password.Value -eq '' -and $autoLogon.Password.PlainText -eq 'true') 'Automatic sign-in uses the documented empty password'
+    Assert ($shell.SelectSingleNode('u:UserAccounts/u:AdministratorPassword/u:Value',$ns).InnerText -eq '' -and -not $shell.SelectSingleNode('u:UserAccounts/u:LocalAccounts',$ns)) 'The built-in Administrator gets a blank password and no extra account is created'
+    Assert ($shell.SelectSingleNode('u:FirstLogonCommands/u:SynchronousCommand/u:CommandLine',$ns).InnerText -eq $finalizeCommand -and $xml.SelectSingleNode('//u:settings[@pass="specialize"]//u:RunSynchronousCommand/u:Path',$ns).InnerText -eq $prepareCommand) 'Preparation and finalization still run with automatic installation'
+    $LocalUserName='Tester';$LocalUserPassword=ConvertTo-SecureString 'Auto pw & 1' -AsPlainText -Force
+    $xml=. $buildAnswer;$ns=[Xml.XmlNamespaceManager]::new($xml.NameTable);$ns.AddNamespace('u','urn:schemas-microsoft-com:unattend')
+    $autoLogon=$xml.SelectSingleNode('//u:AutoLogon',$ns)
+    Assert ($autoLogon.Username -eq 'Tester' -and $autoLogon.Password.PlainText -eq 'false' -and [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($autoLogon.Password.Value)) -eq 'Auto pw & 1Password') 'A named account signs in with its own encoded password'
+    Assert ($xml.SelectSingleNode('//u:LocalAccount/u:Name',$ns).InnerText -eq 'Tester' -and -not $xml.SelectSingleNode('//u:AdministratorPassword',$ns) -and $unattendXml -notmatch 'Auto pw') 'A named account replaces the built-in Administrator and its password stays encoded'
+    $LocalUserName='';$LocalUserPassword=$null;$AutoInstall=$false
+
+    # Сценарии разметки: содержимое и запуск настоящим cmd.exe той же командой,
+    # что в answer-файле. reg/diskpart подменены, а на «носителе» — безвредные
+    # сценарии-заглушки: случайный вызов настоящего diskpart ничего не сотрёт.
+    $scripts=Get-AutoInstallDiskScripts
+    foreach($layout in 'uefi','bios'){
+        $lines=@($scripts["disk-$layout.txt"] -split "`r`n")
+        Assert ($lines[0] -eq 'select disk 0' -and $lines[1] -eq 'clean' -and $lines[-1] -eq 'exit') "The $layout layout wipes only disk 0"
+    }
+    Assert ($scripts['disk-uefi.txt'] -match 'convert gpt' -and $scripts['disk-uefi.txt'] -match 'create partition efi' -and $scripts['disk-uefi.txt'] -match 'create partition msr size=16') 'UEFI gets the GPT layout with ESP and MSR'
+    Assert ($scripts['disk-bios.txt'] -match 'convert mbr' -and $scripts['disk-bios.txt'] -match '(?m)^active\r?$') 'BIOS gets the MBR layout with an active system partition'
+    $media=Join-Path $root 'autoinstall-media'
+    Write-AutoInstallMediaFiles -Distribution $media
+    $written=Join-Path $media 'win11lite'
+    foreach($file in 'disk.cmd','disk-uefi.txt','disk-bios.txt'){
+        $bytes=[IO.File]::ReadAllBytes((Join-Path $written $file))
+        Assert ($bytes.Length -gt 0 -and $bytes[0] -ne 0xEF -and ([Text.Encoding]::ASCII.GetString($bytes) -replace "`r`n",'') -notmatch "`n") "$file is written as ASCII with CRLF"
+    }
+    foreach($layout in 'uefi','bios'){[IO.File]::WriteAllText((Join-Path $written "disk-$layout.txt"),"rem harmless $layout fixture`r`n",[Text.Encoding]::ASCII)}
+    $fakeBin=Join-Path $root 'autoinstall-bin';$null=New-Item -ItemType Directory -Path $fakeBin
+    $diskLog=Join-Path $root 'diskpart.log'
+    [IO.File]::WriteAllText((Join-Path $fakeBin 'reg.cmd'),"@echo off`r`nif defined FIXTURE_FIRMWARE echo     PEFirmwareType    REG_DWORD    %FIXTURE_FIRMWARE%`r`n",[Text.Encoding]::ASCII)
+    [IO.File]::WriteAllText((Join-Path $fakeBin 'diskpart.cmd'),"@echo off`r`n>>`"$diskLog`" echo %*`r`nexit /b 0`r`n",[Text.Encoding]::ASCII)
+    $letter=@('W','V','U','T','S','R','Q','P')|Where-Object{-not (Test-Path "$($_):\")}|Select-Object -First 1
+    if(-not $letter){throw 'No free drive letter for the subst fixture'}
+    $savedPath=$env:PATH;$savedFirmware=$env:FIXTURE_FIRMWARE
+    try{
+        & subst.exe "$($letter):" $media
+        if($LASTEXITCODE -ne 0){throw "subst failed with $LASTEXITCODE"}
+        $env:PATH="$fakeBin;$savedPath"
+        $resolved=@(& cmd.exe /d /c where diskpart)
+        if($resolved[0] -ne (Join-Path $fakeBin 'diskpart.cmd')){throw "Unsafe fixture: diskpart resolves to $($resolved[0])"}
+        foreach($case in @(@{Firmware='0x2';Layout='uefi'},@{Firmware='0x1';Layout='bios'},@{Firmware=$null;Layout='bios'})){
+            Remove-Item -LiteralPath $diskLog -ErrorAction SilentlyContinue
+            $env:FIXTURE_FIRMWARE=$case.Firmware
+            # Setup запускает Path напрямую (CreateProcess), без внешнего cmd /c,
+            # который разрезал бы строку по «&» раньше времени.
+            $start=[Diagnostics.ProcessStartInfo]::new('cmd.exe',($diskCommand -replace '^cmd\.exe\s+',''))
+            $start.UseShellExecute=$false;$start.CreateNoWindow=$true
+            $process=[Diagnostics.Process]::Start($start);$process.WaitForExit();$process.Dispose()
+            $calls=@(Get-Content -LiteralPath $diskLog -ErrorAction SilentlyContinue)
+            Assert ($calls.Count -eq 1 -and $calls[0] -match ('/s "?'+[regex]::Escape("$($letter):\win11lite\disk-$($case.Layout).txt"))) "The real command line finds the media, detects firmware $($case.Firmware) and runs diskpart once with the $($case.Layout) layout"
+        }
+    }finally{
+        $env:PATH=$savedPath;$env:FIXTURE_FIRMWARE=$savedFirmware
+        & subst.exe "$($letter):" /d | Out-Null
+    }
+
+    # Загрузочный образ UEFI без «Press any key» — только для -AutoInstall.
+    $bootRegion=[regex]::Match($ast.Extent.Text,'(?ms)^\s*\$efiBootImage = .*?^\s*\$bootData = [^\r\n]+').Value
+    if(-not $bootRegion){throw 'ISO boot-image selection not found'}
+    $isoDir=Join-Path $root 'iso-boot';$null=New-Item -ItemType Directory -Path (Join-Path $isoDir 'efi\microsoft\boot') -Force
+    $bootNotes=[Collections.Generic.List[string]]::new()
+    function Write-Note {param($Message)$bootNotes.Add($Message)}
+    $AutoInstall=$true;. ([scriptblock]::Create($bootRegion))
+    Assert ($bootData -match 'efisys\.bin$' -and $bootNotes.Count -eq 1) 'Media without efisys_noprompt.bin keep the prompt and say so'
+    [IO.File]::WriteAllBytes((Join-Path $isoDir 'efi\microsoft\boot\efisys_noprompt.bin'),[byte[]](1,2,3))
+    . ([scriptblock]::Create($bootRegion))
+    Assert ($bootData -eq '2#p0,e,bboot\etfsboot.com#pEF,e,befi\microsoft\boot\efisys_noprompt.bin') 'AutoInstall media boot UEFI without waiting for a key press'
+    $AutoInstall=$false;. ([scriptblock]::Create($bootRegion))
+    Assert ($bootData -eq '2#p0,e,bboot\etfsboot.com#pEF,e,befi\microsoft\boot\efisys.bin') 'Ordinary media keep the Press any key prompt'
+    function Write-Note {param($Message)}
     Write-Host "PASS: $script:checks servicing checks; PowerShell $($PSVersionTable.PSVersion)"
 }finally{
     $full=[IO.Path]::GetFullPath($root);$base=[IO.Path]::GetFullPath((Join-Path $repo 'tmp')).TrimEnd('\')+'\servicing-tests-'

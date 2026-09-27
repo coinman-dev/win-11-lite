@@ -4,9 +4,9 @@
 
 [![Windows 11 x64](https://img.shields.io/badge/Windows%2011-x64-0078D4.svg)](#requirements-and-supported-images)
 [![PowerShell](https://img.shields.io/badge/PowerShell-5.1%20%7C%207-5391FE.svg)](#requirements-and-supported-images)
-[![Tests](https://img.shields.io/badge/tests-1304-success.svg)](#validation-status)
+[![Tests](https://img.shields.io/badge/tests-1430-success.svg)](#validation-status)
 
-**win-11-lite** builds a smaller, privacy-focused Windows 11 installation ISO from an original Microsoft x64 image. It removes selected inbox applications and components, applies privacy and OOBE settings, can integrate updates, languages and drivers, and exports one chosen Windows edition into a new bootable ISO.
+**win-11-lite** builds a smaller, privacy-focused Windows 11 installation ISO from an original Microsoft x64 image. Windows 10 images based on build 19041 (2004–22H2, including LTSC 2021) are also supported, with [some differences](#windows-10). It removes selected inbox applications and components, applies privacy and OOBE settings, can integrate updates, languages and drivers, and exports one chosen Windows edition into a new bootable ISO.
 
 The builder is a single PowerShell file. Download [`win-11-lite.ps1`](win-11-lite.ps1); no `data`, `tools`, generator, custom executable, Git, or GitHub CLI is required at runtime.
 
@@ -22,7 +22,7 @@ Invoke-WebRequest https://raw.githubusercontent.com/coinman-dev/win-11-lite/main
 .\win-11-lite.ps1
 ```
 
-Running without parameters opens the interactive wizard. It finds nearby ISO files, asks which edition and preset to use, and requests administrator rights when the build starts.
+Running without parameters opens the interactive wizard. It finds nearby ISO files, asks which edition and preset to use, and requests administrator rights when the build starts. Instead of a file you can enter a folder, for example `F:\OS\Windows\`: the wizard lists the ISO files in it and lets you pick one by number. The same happens when `-InputIso` points to a folder; without interactive input, a folder or a non-ISO file stops the build with a clear message.
 
 If the selected ISO is locked by another process, inaccessible or contains no readable Windows image, the wizard stops immediately with the ISO path and the original error. It does not ask for a work folder or continue to later steps.
 
@@ -154,8 +154,12 @@ Presets are cumulative. `balanced` includes `safe`; `max` includes both and adds
 | Preset | Intended use | Main actions |
 | --- | --- | --- |
 | `safe` | Small privacy cleanup while keeping Defender and normal app compatibility | Removes the Edge browser and shortcuts while keeping WebView2; disables telemetry services/policies, advertising, suggestions and widgets; applies setup/OOBE privacy settings. |
-| `balanced` | Default lite desktop | Adds Defender/Windows Security removal, speech/handwriting/OCR/Text-to-Speech, Recall/Copilot/AI components, classic and modern Media Player, IE stub, classic Paint, Steps Recorder, diagnostics, CJK fonts/IME where safe, OneDrive installers, NGEN cache, Xbox/Game Bar, Family, To Do and selected consumer apps. Keeps Store/MSIX, App Installer/winget, WebView2, servicing, Hyper-V and WSL. |
-| `max` | Deliberately aggressive image reduction | Adds WebView2/Edge Update, component backups, PowerShell ISE, WMIC, Hello Face, formula recognition, fax/scan and extra FoD removal. Application compatibility and future servicing may break. VBScript remains as an explicit dependency of the hidden setup launcher. |
+| `balanced` | Default lite desktop | Adds Defender/Windows Security removal, speech/handwriting/OCR/Text-to-Speech, Recall/Copilot/AI components, classic and modern Media Player, IE stub, classic Paint, Steps Recorder, diagnostics, CJK fonts/IME where safe, OneDrive installers, NGEN cache, Xbox/Game Bar, Family, To Do and selected consumer apps. Keeps Store/MSIX, App Installer/winget, WebView2, servicing, Hyper-V and WSL (removed only with `-RemoveVirtualization`). |
+| `max` | Deliberately aggressive image reduction | Adds WebView2/Edge Update, component backups, PowerShell ISE, WMIC, Hello Face, formula recognition, fax/scan and extra FoD removal, and the virtualization features with their files: Hyper-V with Hyper-V Manager, WSL and Virtual Machine Platform, Windows Hypervisor Platform, Windows Sandbox and containers (keep them with `-Keep Virtualization`). Application compatibility and future servicing may break. VBScript remains as an explicit dependency of the hidden setup launcher. |
+
+For `balanced` and `max`, the wizard asks separately whether to remove the built-in antivirus (Microsoft Defender and Windows Security). The default is yes, with a warning to remove it only if another antivirus will be installed, because otherwise Windows is left without malware protection. Answering no is the same as `-Keep Defender`: Defender, its services and policies stay, and Guard does not touch them.
+
+The wizard then asks whether to remove the virtualization features: Hyper-V with Hyper-V Manager, WSL2 and the Virtual Machine Platform, Windows Hypervisor Platform, Windows Sandbox and containers. The default is no, except in `max`, where it is yes. The warning says to remove them only if you will not use virtualization, because WSL, Docker Desktop, Hyper-V virtual machines and Sandbox stop working and cannot be enabled again without the source image. Yes in `safe` or `balanced` is `-RemoveVirtualization`; no in `max` is `-Keep Virtualization`. The features are removed with `DISM /Disable-Feature /Remove`. The Hyper-V guest integration services that let this Windows run inside a VM belong to the core system and stay. The hypervisor used by virtualization-based security also belongs to the core system: Windows Home has no Hyper-V features and still runs VBS. Guard does not monitor these features.
 
 Selected consumer Appx targets include Clipchamp, Bing News/Weather, Get Help/Get Started, Office Hub, Solitaire, Feedback Hub, Phone Link, new Outlook, Teams, Xbox/Game Bar, Family and Microsoft To Do. Exact matches depend on what the source image contains.
 
@@ -167,7 +171,7 @@ The capability-removal stage reports the total inventory separately from the cap
 - an existing winget installation and Store/MSIX licensing/deployment services;
 - VCLibs, UI.Xaml, .NET Native and Windows App Runtime frameworks;
 - WebView2 and Edge Update components required by ordinary applications;
-- Hyper-V, WSL, containers, networking and Windows Update servicing;
+- Hyper-V, WSL, containers (unless `-RemoveVirtualization`), networking and Windows Update servicing;
 - Notepad, the basic photo viewer, language-basic resources and required network capabilities;
 - Windows Script Host/VBScript for the hidden setup launcher.
 
@@ -175,10 +179,10 @@ The capability-removal stage reports the total inventory separately from the cap
 
 ```text
 Defender, WinRE, Edge, Fonts, Speech, WMP, IE, Sandbox, AI,
-Apps, Family, ToDo, OneDrive, NativeImages
+Apps, Family, ToDo, OneDrive, NativeImages, Virtualization
 ```
 
-Examples: `-Keep Edge,Defender`, `-Keep Family,ToDo`, or `-Keep Apps`. `Apps` also protects Family and To Do. `Sandbox` is accepted as a compatibility selector; the current removal tables do not target Windows Sandbox.
+Examples: `-Keep Edge,Defender`, `-Keep Family,ToDo`, or `-Keep Apps`. `Apps` also protects Family and To Do. `Sandbox` is accepted as a compatibility selector and has no effect: Windows Sandbox is removed only together with the other virtualization features, so keep it with `-Keep Virtualization`.
 
 > [!CAUTION]
 > `balanced` removes Microsoft Defender, SmartScreen policy protection and the Windows Security application. Use `safe` or `-Keep Defender` if this machine should retain the built-in antivirus.
@@ -251,9 +255,28 @@ For every supported Windows edition, `-AccountMode auto` offers:
 1. create/configure the user during Windows Setup — the default;
 2. enter a local account now and place it in the generated answer file.
 
-For non-interactive builds use `-AccountMode setup`, or supply `-LocalUserName` (and optionally a SecureString `-LocalUserPassword`) to select image-time account creation. No automatic logon is configured. A password embedded in an answer file is recoverable; Windows answer-file encoding is not encryption.
+For non-interactive builds use `-AccountMode setup`, or supply `-LocalUserName` (and optionally a SecureString `-LocalUserPassword`) to select image-time account creation. Without `-AutoInstall`, no automatic logon is configured. A password embedded in an answer file is recoverable; Windows answer-file encoding is not encryption.
 
 `-Unattend <file>` gives control to a custom answer file. `-Unattend none` prevents the builder from adding one. With a custom/disabled answer file, the user is responsible for OOBE, account and first-logon behavior.
+
+### Automatic installation (`-AutoInstall`)
+
+`-AutoInstall` produces media that install Windows without a single question and then sign in automatically. The wizard asks for it right after the edition; the default is no.
+
+```powershell
+.\win-11-lite.ps1 -InputIso .\iso\ltsc.iso -Index 1 -AutoInstall -Guard Standard
+```
+
+> [!CAUTION]
+> **Disk 0 is erased without confirmation.** Use it in VMs or on PCs where disk 0 is the system disk. When installing from USB, the flash drive itself may be disk 0.
+
+- **Boot:** UEFI boots from the ISO without *Press any key* (`efisys_noprompt.bin`). The BIOS prompt appears only once a bootable disk exists, that is, after installation. Remove the ISO after installation if the firmware would boot it first again.
+- **Disk:** `win11lite\disk.cmd` on the media reads `PEFirmwareType` in WinPE and wipes disk 0 with `diskpart`. UEFI gets GPT with a 300 MB ESP, a 16 MB MSR and the Windows partition; BIOS gets MBR with a 300 MB active *System Reserved* partition and the Windows partition. Setup then uses `InstallToAvailablePartition`, because the Windows partition number differs between the two layouts.
+- **Account:** by default the built-in Administrator is enabled with a blank password and signs in automatically. The answer file uses the language-neutral name `Administrator`, as Microsoft documents, so this also works on localized images such as ru-RU, where the account is shown as *Администратор*. With `-LocalUserName` (and optionally `-LocalUserPassword`) that local administrator is created and signs in instead. Microsoft Store (UWP) apps do not start under the built-in Administrator by default; use `-LocalUserName` if you need them.
+- **Keys:** Enterprise, Education and LTSC editions need no key. Home and Pro require `-ProductKey`, otherwise the build stops before any download, because Setup would ask for the key.
+- **Conflicts:** `-AutoInstall` cannot be combined with `-Unattend` or `-AccountMode setup`.
+
+The builder prints the disk warning in the build plan and again in the final summary. The answer file, the partitioning scripts and the actual command line were checked in tests, including the real `cmd.exe` with substituted `reg`/`diskpart`. A real unattended installation in a VM has not been performed yet.
 
 Hardware requirement bypasses for TPM, Secure Boot, CPU, RAM and storage are included by default. Use `-NoBypass` to omit them. The builder also prevents automatic device encryption and disables reserved storage for new installations.
 
@@ -266,9 +289,9 @@ Hardware requirement bypasses for TPM, Secure Boot, CPU, RAM and storage are inc
 | `-Compression recovery` | Export `install.esd` with solid LZMS compression; smallest default output. |
 | `-Compression max` | Export `install.wim` with maximum WIM compression; generally faster to install but larger. |
 | `-CompactOS` | Request CompactOS/LZX for the installed system; saves installed disk space at a CPU cost. |
-| `-LegacySetup` | Boot the classic Setup path through `winpeshl.ini`. |
-| `-TrimSources` | Keep only files needed for boot installation; running `setup.exe` from an existing Windows installation is no longer supported. Requires classic Setup. |
-| `-RemoveWinRE` | Remove `Windows\System32\Recovery\Winre.wim`; requires classic Setup unless protected with `-Keep WinRE`. |
+| `-LegacySetup` | Boot the classic Setup path through `winpeshl.ini`. Windows 11 only; ignored for Windows 10, whose Setup is already classic. |
+| `-TrimSources` | Keep only files needed for boot installation; running `setup.exe` from an existing Windows installation is no longer supported. Requires classic Setup on Windows 11. |
+| `-RemoveWinRE` | Remove `Windows\System32\Recovery\Winre.wim`; on Windows 11 requires classic Setup unless protected with `-Keep WinRE`. |
 | `-SaveWinRE` | Copy the removed recovery image beside the output ISO as `*_winre.wim`. It is not stored inside the ISO. |
 
 WinRE is the installed Windows Recovery Environment. It is different from WinPE in `boot.wim`, which continues to boot and run Windows Setup.
@@ -300,9 +323,9 @@ VMDK size, ISO size and used space on C: are different measurements. Compare use
 
 - Windows host with Windows PowerShell 5.1 or PowerShell 7;
 - administrator rights for a real build (requested automatically);
-- an original Windows 11 x64 ISO;
+- an original Windows 11 x64 ISO, or a Windows 10 x64 ISO based on build 19041 (versions 2004–22H2, including LTSC 2021);
 - about 30 GB free space, or about 45 GB with current updates;
-- Windows ADK Deployment Tools, or network/cache access that lets the script prepare compatible tools;
+- Windows ADK Deployment Tools, or network/cache access that lets the script prepare compatible tools. When the built-in DISM is new enough and only `oscdimg` is missing, the builder prepares `oscdimg` from pinned Microsoft ADK packages (about 8.6 MiB, archive SHA256, signature, cache) without installing the ADK; `-InstallAdk` still installs Deployment Tools instead;
 - internet only for selected items that are not already cached.
 
 Before preparing downloads or work files, the builder requires at least **30 GB free on the work drive, or 45 GB with updates**. If the selected location has insufficient or unmeasurable free space, it asks for another work directory and repeats validation until a suitable path is entered. Without interactive input, the build stops with an error; pass a different `-WorkDir`. `-DryRun` can still display the plan. Automatic drive selection applies only when no work path was explicitly chosen and selects a disk meeting the full requirement.
@@ -320,6 +343,27 @@ Recognized Windows 11 branches:
 
 Unknown branches stop instead of borrowing updates or servicing tools from another release. For build 28000, the builder can prepare pinned x64 DISM 10.0.28000.1 and oscdimg files from Microsoft ADK packages without replacing the installed ADK. See the [26H1 Home/Pro and Store/MSIX compatibility audit](COMPATIBILITY.md).
 
+### Windows 10
+
+Windows 10 media for versions 2004–22H2 store the shared base build 19041 in the WIM metadata; the version is set by an enablement package. LTSC 2021 media, for example, report `10.0.19041.1288`.
+
+| Build in the WIM | Edition | Release label for updates |
+| ---: | --- | --- |
+| 19041 | `EnterpriseS`, `IoTEnterpriseS` (LTSC 2021) | 21H2 |
+| 19041 | other editions | 22H2 |
+| 19044 | any | 21H2 |
+| 19045 | any | 22H2 |
+
+Older branches such as 17763 (LTSC 2019) are rejected. Differences from Windows 11:
+
+- Windows 10 Setup is already the classic one. `-LegacySetup` is accepted and ignored, because `setup.exe /legacy` exists only in Windows 11. `-TrimSources` and `-RemoveWinRE` do not require it, and `boot.wim` is left unchanged.
+- The TPM, Secure Boot, CPU, RAM and storage bypasses are Windows 11 checks and are not added.
+- Languages are not added. `-AddLanguage`, `-DownloadLanguage`, and a `-SetupLanguage` different from the image language stop the build before any download. Use an ISO in the required language.
+- `-WithUpdates` downloads the `Cumulative Update for Windows 10 Version 21H2/22H2 for x64-based Systems` (about 0.9 GB; the servicing stack is included) and, unless `-IncludeDotNetUpdate $false` is set, the `.NET Framework 3.5 and 4.8` update that matches the in-box .NET 4.8. Windows 10 updates use their own cache folders (`lcu-win10-21H2`), separate from Windows 11 21H2.
+- The removal rules are the same as for Windows 11. In `balanced` this also removes Internet Explorer 11, which is still a working browser in Windows 10, and classic Paint, the only Paint in LTSC. Keep them with `-Keep IE` or `-Keep Misc`. Windows 10 has no Recall or Windows 11 AI components; the Copilot policies are still written.
+
+A real Windows 10 LTSC 2021 ISO passed DryRun, and the update selection was checked against the live Microsoft Update Catalog. A full Windows 10 build and installation in a VM have not been performed yet.
+
 ---
 
 ## Command-line reference
@@ -336,6 +380,7 @@ The table covers every user-facing parameter. Run `Get-Help .\win-11-lite.ps1 -F
 | `-Edition <EditionID>` | Select by EditionID, for example `Professional` or `IoTEnterpriseS`. |
 | `-Preset safe|balanced|max` | Removal depth; default `balanced`. |
 | `-Keep <groups[]>` | Preserve selected groups against the preset. |
+| `-RemoveVirtualization` | Remove the virtualization features with their files in any preset: Hyper-V with Hyper-V Manager, WSL and Virtual Machine Platform, Windows Hypervisor Platform, Windows Sandbox, containers and Application Guard. `max` does this by default; keep them there with `-Keep Virtualization`. |
 | `-RemoveExtra <regex[]>` | Additional capability/package identity regular expressions. Advanced and potentially destructive. |
 | `-WorkDir <directory>` | Working directory. Insufficient space requires a replacement path in the dialog or stops a non-interactive build. The builder only wipes a directory bearing its ownership marker. |
 | `-UpdatesDir <directory>` | Persistent download/update cache. |
@@ -367,7 +412,7 @@ The table covers every user-facing parameter. Run `Get-Help .\win-11-lite.ps1 -F
 | `-Guard None|Standard|Debug|Silent` | Disable Guard or select its report mode. CLI default `None`; wizard default `Standard`. |
 | `-NoBypass` | Do not add TPM/Secure Boot/CPU/RAM/storage bypasses. |
 | `-NoOobeNetworkBlock` | Keep networking available during OOBE. |
-| `-LegacySetup` | Use classic Windows Setup. |
+| `-LegacySetup` | Use classic Windows Setup (Windows 11). |
 | `-RemoveWinRE` | Remove the installed recovery image. |
 | `-SaveWinRE` | Save a copy of the removed `winre.wim` beside the ISO. |
 | `-TrimSources` | Remove setup files not required for boot installation. |
@@ -385,6 +430,7 @@ The table covers every user-facing parameter. Run `Get-Help .\win-11-lite.ps1 -F
 | `-LocalUserName <name>` | Local administrator name for answer-file creation. |
 | `-LocalUserPassword <SecureString>` | Optional local-user password. |
 | `-Unattend <file|none>` | Supply a custom answer file or disable generated `autounattend.xml`. |
+| `-AutoInstall` | Install without any question and sign in automatically: **erases disk 0**, boots UEFI without *Press any key*, uses the built-in Administrator without a password unless `-LocalUserName` is given. Home/Pro need `-ProductKey`. |
 
 ### Tools, diagnostics and automation
 
@@ -440,7 +486,7 @@ Guest runtime files live under `C:\Windows\Setup\Scripts\Win11Lite`. For VM diag
 
 ## Validation status
 
-As of 2026-09-17, 14 suites contain **1,304 checks**. The 1,292 checks present before the Guard report fix passed on each of Windows PowerShell 5.1 and PowerShell 7; the 12 checks added for that fix have so far run on Windows PowerShell 5.1 only, because PowerShell 7 is not installed on the machine used for it. All 14 suites passed there. They cover parsers, safe paths, work-drive capacity, downloads/cache, WIM/ADK, languages, answer files, removal rules, Guard reports/history, log retention, OOBE networking, memory files, child processes, progress, CMD and VBS. For the memory-file and network changes, eight affected suites passed: **646 checks on each PowerShell version**; other suites were not rerun. DryRun against a real ISO passed with RU/7 and EN/5.1. The ISO-read fix passed all 151 Servicing checks on each runtime, including a real file-sharing violation with mocked ISO APIs. The latest registry fix passed MemoryFiles 72 and SingleFile 45 on each runtime (117 checks), including actual registry operations and deletion-denying ACLs inside a disposable HKCU fixture. The capability-counter change passed all 246 Main checks on each runtime, including continuing after a removal error with mocked DISM.
+As of 2026-09-27, 14 suites contain **1,430 checks**. The 1,292 checks present before the Guard report fix passed on each of Windows PowerShell 5.1 and PowerShell 7. The 138 checks added since then (12 for the Guard report window, 27 for Windows 10, 36 for `-AutoInstall`, 6 for the wizard antivirus question, 39 for virtualization removal, 12 for choosing an ISO and single-edition images, 6 for preparing `oscdimg` without the ADK) have run on Windows PowerShell 5.1 only, because PowerShell 7 is not installed on the machine used for them. All 14 suites passed there. They cover parsers, safe paths, work-drive capacity, downloads/cache, WIM/ADK, languages, answer files, removal rules, Guard reports/history, log retention, OOBE networking, memory files, child processes, progress, CMD and VBS. For the memory-file and network changes, eight affected suites passed: **646 checks on each PowerShell version**; other suites were not rerun. DryRun against a real ISO passed with RU/7 and EN/5.1. The ISO-read fix passed all 151 Servicing checks on each runtime, including a real file-sharing violation with mocked ISO APIs. The latest registry fix passed MemoryFiles 72 and SingleFile 45 on each runtime (117 checks), including actual registry operations and deletion-denying ACLs inside a disposable HKCU fixture. The capability-counter change passed all 246 Main checks on each runtime, including continuing after a removal error with mocked DISM.
 
 Tests that exercise Guard, OOBE, registry, services or servicing use controlled fixtures for system operations. Registry preservation tests also use the real provider inside a disposable HKCU key, with HKLM paths redirected there. They are not presented as a real VM result. Real builds and prior VM logs confirm substantial parts of the 24H2/26H1 flow; current memory-file/network changes, the newest VBS launcher, localized winget Firefox installation and current `max` exception still need a fresh installation.
 

@@ -20,7 +20,7 @@ function Assert-Throws([scriptblock]$Action, [string]$Message) {
 foreach ($name in @('T','Assert-ChildPath','Test-SavedUrl','Save-Url','Read-PreparedCache','Write-PreparedCache',
     'Confirm-SkipDownload','Remove-ForeignUpdateFiles','Save-CatalogPayload','Save-WingetPayload',
     'Save-LanguageFromCatalog','Get-LanguagePattern','Find-LanguagePackage','Get-LanguageRepairUpdate',
-    'Get-UpdateTarget','Get-LocalUpdatePayload','Search-Catalog','Get-CatalogLinks','Read-YesNo')) {
+    'Get-UpdateTarget','Get-LocalUpdatePayload','Search-Catalog','Get-CatalogLinks','Read-YesNo','Get-UpdateCatalogSearch')) {
     $node = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $name }, $false)
     if (-not $node) { throw "Missing function: $name" }
     . ([scriptblock]::Create($node.Extent.Text))
@@ -115,6 +115,51 @@ try {
         $calls = $catalog.Calls; $catalog.Fail = $true
         Assert ((Get-LanguageRepairUpdate -Revision '26100.1742' -Destination $testRoot) -eq $repair -and $catalog.Calls -eq $calls) 'Cached language repair LCU requires no catalog request'
         Assert-Throws { Get-LanguageRepairUpdate -Revision '26100.9999' -Destination $testRoot } 'Unknown language repair revision never guesses an LCU'
+    }
+    # Названия взяты из реального ответа каталога от 2026-09. Варианты .NET 4.8.1
+    # датированы позже, чтобы выбор зависел от шаблона, а не от даты.
+    & {
+        $rows = @(
+            @{ Id = 'lcu10'; Date = '2026-09-14'; Title = '2026-09 Cumulative Update for Windows 10 Version 21H2 for x64-based Systems (KB5129236)' }
+            @{ Id = 'dyn10'; Date = '2026-09-15'; Title = '2026-09 Dynamic Cumulative Update for Windows 10 Version 21H2 for x64-based Systems (KB5122878)' }
+            @{ Id = 'arm10'; Date = '2026-09-16'; Title = '2026-09 Cumulative Update for Windows 10 Version 21H2 for ARM64-based Systems (KB5129236)' }
+            @{ Id = 'srv21'; Date = '2026-09-16'; Title = '2026-09 Cumulative Update for Microsoft server operating system version 21H2 for x64-based Systems (KB5129000)' }
+            @{ Id = 'net48'; Date = '2026-09-08'; Title = '2026-09 Cumulative Update for .NET Framework 3.5 and 4.8 for Windows 10 Version 21H2 for x64 (KB5126046)' }
+            @{ Id = 'net481'; Date = '2026-09-10'; Title = '2026-09 Cumulative Update for .NET Framework 3.5 and 4.8.1 for Windows 10 Version 21H2 for x64 (KB5126421)' }
+            @{ Id = 'netall'; Date = '2026-09-11'; Title = '2026-09 Cumulative Update for .NET Framework 3.5, 4.8 and 4.8.1 for Windows 10 Version 21H2 for x64 (KB5126145)' }
+            @{ Id = 'lcu11'; Date = '2026-09-09'; Title = '2026-09 Cumulative Update for Windows 11, version 24H2 for x64-based Systems (KB5129195) (26100.9457)' }
+            @{ Id = 'net11'; Date = '2026-09-09'; Title = '2026-09 Cumulative Update for .NET Framework 3.5 and 4.8.1 for Windows 11, version 24H2 for x64 (KB5126052)' }
+        ) | ForEach-Object { [pscustomobject]@{ Id = $_.Id; Title = $_.Title; Date = [datetime]$_.Date } }
+        $queries = [Collections.Generic.List[string]]::new()
+        # Каталог отбирает строки по словам запроса; «лишние» ARM64 и Server 21H2
+        # оставлены в выдаче Windows 10 намеренно, чтобы их отсёк шаблон названия.
+        function Search-Catalog {
+            param($Query)
+            $queries.Add($Query)
+            if ($Query -match 'Windows 11') { $rows | Where-Object Title -match 'Windows 11' } else { $rows | Where-Object Title -notmatch 'Windows 11' }
+        }
+        function Get-CatalogLinks {
+            param($UpdateId)
+            $row = $rows | Where-Object Id -eq $UpdateId
+            if ($row.Title -notmatch '\((KB\d+)\)') { throw 'fixture row without KB' }
+            "https://fixture/windows10.0-$($matches[1].ToLowerInvariant())-x64_fixture.msu"
+        }
+        function Save-Url { param($Url,$Destination) [IO.File]::WriteAllText($Destination, "complete $Url") }
+        $pick = {
+            param($Build, $Release, $Kind)
+            $search = Get-UpdateCatalogSearch -Build $Build -Release $Release -Kind $Kind
+            $target = Save-CatalogPayload -Query $search.Query -TitlePattern $search.TitlePattern -Directory (Join-Path $testRoot "catalog-$Build-$Kind")
+            (Read-PreparedCache -Directory (Split-Path $target -Parent) -Key 'update').Data.Title
+        }
+        $lcu10 = & $pick 19041 '21H2' lcu
+        Assert ($lcu10 -match 'KB5129236' -and $lcu10 -match 'x64-based' -and $lcu10 -notmatch 'Dynamic') 'Windows 10 LCU is the x64 cumulative update, not Dynamic, ARM64 or Server 21H2'
+        Assert ($queries[-1] -eq 'Cumulative Update for Windows 10 Version 21H2 x64') 'Windows 10 LCU query names the Windows 10 product and release'
+        $net10 = & $pick 19041 '21H2' dotnet
+        Assert ($net10 -match 'KB5126046') 'Windows 10 .NET picks 3.5 and 4.8 for the in-box .NET 4.8, even when 4.8.1 variants are newer'
+        $lcu11 = & $pick 26100 '24H2' lcu
+        $net11 = & $pick 26100 '24H2' dotnet
+        Assert ($lcu11 -match 'KB5129195' -and $net11 -match 'KB5126052') 'Windows 11 LCU and .NET selection is unchanged'
+        Assert ($queries -contains 'Cumulative Update for Windows 11 version 24H2 x64' -and $queries -contains 'Cumulative Update for .NET Framework Windows 11 version 24H2 x64') 'Windows 11 catalog queries are unchanged'
     }
     & {
         $dir = Join-Path $testRoot 'manual-updates'

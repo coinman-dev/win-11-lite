@@ -1,10 +1,12 @@
 ﻿<#
 .SYNOPSIS
-    Собирает облегчённый (lite) ISO из оригинального образа Windows 11.
+    Собирает облегчённый (lite) ISO из оригинального образа Windows 11 или Windows 10.
 
 .DESCRIPTION
-    Универсальный сборщик: работает с любым оригинальным ISO Windows 11 — редакция,
-    язык и версия определяются из самого образа.
+    Универсальный сборщик: работает с оригинальными ISO Windows 11 и Windows 10
+    на базе 19041 (2004–22H2, в том числе LTSC 2021) — редакция, язык и версия
+    определяются из самого образа. Для Windows 10 обход TPM и -LegacySetup не
+    нужны (установщик уже классический), а языки не добавляются.
     Для запуска достаточно этого PS1: каталоги загрузок и служебные сценарии
     встроены в файл. Скачивать папки data или tools рядом со сборщиком не требуется.
 
@@ -15,7 +17,8 @@
       * вырезаются Recall, Copilot, AI Fabric и прочие AI-компоненты — файлами
         и политиками сразу;
       * отключаются телеметрия, реклама и «рекомендации» в offline-реестре;
-      * остаются нетронутыми Hyper-V, WSL, контейнеры и рабочий Windows Update;
+      * остаются нетронутыми Hyper-V, WSL, контейнеры (их удаляют только max
+        и -RemoveVirtualization) и рабочий Windows Update;
       * на общий рабочий стол кладётся ярлык Install-Firefox;
       * встраивается обход проверок TPM 2.0 и Secure Boot;
       * обновления отключаются на время установки и включаются сразу после неё;
@@ -29,7 +32,8 @@
 
     Только по явным ключам: обновления (-WithUpdates), winget (-WithWinget),
     языки (-DownloadLanguage), классический установщик (-LegacySetup),
-    удаление WinRE (-RemoveWinRE), урезание sources (-TrimSources).
+    удаление WinRE (-RemoveWinRE), урезание sources (-TrimSources),
+    автоматическая установка без вопросов со стиранием диска 0 (-AutoInstall).
 
     Запуск без параметров открывает диалог с вопросами и сам запрашивает права
     администратора. Справка: Get-Help .\win-11-lite.ps1 -Full
@@ -50,6 +54,13 @@
 
     Самый компактный образ (примерно на 650 МБ меньше). Классический установщик
     позволяет обойтись без winre.wim; ставится только загрузкой с носителя.
+
+.EXAMPLE
+    .\win-11-lite.ps1 -InputIso .\iso\ltsc.iso -Index 1 -AutoInstall -Guard Standard
+
+    ISO для тестовых VM: загружается без нажатия клавиши, стирает диск 0,
+    ставит Windows без вопросов и входит под встроенным Администратором
+    без пароля.
 
 .EXAMPLE
     .\win-11-lite.ps1 -InputIso .\iso\en-us.iso -Index 2 -DownloadLanguage ru-RU
@@ -116,8 +127,14 @@ param(
     [string]$Preset = 'balanced',
 
     # Что оставить вопреки пресету.
-    [ValidateSet('Defender', 'WinRE', 'Edge', 'Fonts', 'Speech', 'WMP', 'IE', 'Sandbox', 'AI', 'Apps', 'Family', 'ToDo', 'OneDrive', 'NativeImages')]
+    [ValidateSet('Defender', 'WinRE', 'Edge', 'Fonts', 'Speech', 'WMP', 'IE', 'Sandbox', 'AI', 'Apps', 'Family', 'ToDo', 'OneDrive', 'NativeImages', 'Virtualization')]
     [string[]]$Keep = @(),
+
+    # Удалить компоненты виртуализации вместе с файлами: Hyper-V с Диспетчером
+    # Hyper-V, WSL и платформу виртуальных машин (WSL2), Windows Hypervisor
+    # Platform, песочницу Windows и контейнеры. В max удаляются и без ключа;
+    # сохранить их там — -Keep Virtualization.
+    [switch]$RemoveVirtualization,
 
     # Дополнительные regex для удаления пакетов и возможностей.
     [string[]]$RemoveExtra = @(),
@@ -154,7 +171,8 @@ param(
     # В boot.wim кладётся winpeshl.ini с вызовом sources\setup.exe /legacy.
     # Новый установщик 24H2 обязательно извлекает winre.wim в SafeOS —
     # классический этого не делает, поэтому только с этим флагом имеет смысл
-    # -RemoveWinRE и -TrimSources.
+    # -RemoveWinRE и -TrimSources. Windows 10 уже ставится классическим
+    # установщиком: там ключ не нужен и игнорируется.
     [Alias('Legacy')]
     [switch]$LegacySetup,
 
@@ -260,6 +278,13 @@ param(
 
     # Свой autounattend.xml, либо 'none' чтобы не класть его вовсе.
     [string]$Unattend,
+
+    # Полностью автоматическая установка: ни установщик, ни OOBE ничего не
+    # спрашивают, после установки выполняется автовход. ВНИМАНИЕ: диск 0
+    # стирается и размечается без подтверждения (GPT для UEFI, MBR для BIOS).
+    # Вход — встроенный Администратор без пароля, либо -LocalUserName.
+    # Для Home/Pro нужен -ProductKey. ISO грузится без «Press any key».
+    [switch]$AutoInstall,
 
     # Сжатие итогового образа: recovery = install.esd (меньше), max = install.wim (быстрее ставится).
     [ValidateSet('recovery', 'max')]
@@ -611,61 +636,133 @@ function Read-WingetOption {
 
 # Выбор исходного ISO, когда параметр не задан: показываем всё, что лежит
 # рядом со скриптом, вместо безликого запроса PowerShell «InputIso:»
-function Select-InputIso {
-    $roots = @($script:ScriptRoot)
-    $roots += @(Get-ChildItem -LiteralPath $script:ScriptRoot -Directory -Force -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -notmatch '^(\.ai|\.git|tmp|out|log)$' } |   # out — результаты, log — журналы
-                Select-Object -ExpandProperty FullName)
-    $cwd = (Get-Location).Path
-    if ($cwd -ne $script:ScriptRoot -and (Test-Path -LiteralPath $cwd)) { $roots += $cwd }
+# Resolve-Path сохраняет завершающую «\» (F:\OS\Windows\); у корня диска она
+# нужна — «F:» означает текущий каталог диска F.
+function Get-NormalizedDirectory {
+    param([Parameter(Mandatory)][string]$Path)
+    $trimmed = $Path.TrimEnd('\')
+    if ($trimmed -match '^[A-Za-z]:$') { $trimmed += '\' }
+    $trimmed
+}
 
-    $found = @()
-    foreach ($root in ($roots | Sort-Object -Unique)) {
-        $found += @(Get-ChildItem -LiteralPath $root -Filter *.iso -File -ErrorAction SilentlyContinue)
-    }
-    $found = @($found | Sort-Object FullName -Unique | Sort-Object Length -Descending)
+function Get-IsoFilesInDirectory {
+    param([Parameter(Mandatory)][string]$Directory)
+    @(Get-ChildItem -LiteralPath $Directory -Filter *.iso -File -ErrorAction SilentlyContinue | Sort-Object Name)
+}
 
-    Write-Host ''
-    if ($found.Count -gt 0) {
-        Write-Host (T "  ISO-файлы рядом со скриптом ($script:ScriptRoot):" "  ISO files next to the script ($script:ScriptRoot):") -ForegroundColor White
-        Write-Host ''
-        for ($i = 0; $i -lt $found.Count; $i++) {
-            $rel = $found[$i].FullName
-            if ($rel.StartsWith($script:ScriptRoot, [StringComparison]::OrdinalIgnoreCase)) {
-                $rel = $rel.Substring($script:ScriptRoot.Length).TrimStart('\')
-            }
-            Write-Host ("   {0,2}. {1,-70} {2,8}" -f ($i + 1), $rel, (Format-Size $found[$i].Length))
+function Write-IsoList {
+    param([IO.FileInfo[]]$Files, [string]$Base)
+    for ($i = 0; $i -lt $Files.Count; $i++) {
+        $rel = $Files[$i].FullName
+        if ($Base -and $rel.StartsWith($Base.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            $rel = $rel.Substring($Base.TrimEnd('\').Length).TrimStart('\')
         }
-    } else {
-        Write-Host (T '  Рядом со скриптом ISO-файлов не найдено.' '  No ISO files found next to the script.') -ForegroundColor Yellow
+        Write-Host ("   {0,2}. {1,-70} {2,8}" -f ($i + 1), $rel, (Format-Size $Files[$i].Length))
     }
-    $ownOption = $found.Count + 1
-    Write-Host ((T "   {0,2}. Указать свой файл" "   {0,2}. Choose another file") -f $ownOption)
-    Write-Host ''
+}
+
+# Проверяет -InputIso до чтения образа. Папка в интерактивном режиме
+# превращается в выбор ISO из неё, иначе сборка останавливается с понятной
+# причиной, а не ошибкой подключения образа.
+function Resolve-InputIsoPath {
+    param([string]$Path)
+    if (-not $Path) { return Select-InputIso }
+    if (-not (Test-Path -LiteralPath $Path)) { throw (T "Файл не найден: $Path" "File not found: $Path") }
+    $resolved = (Resolve-Path -LiteralPath $Path).Path
+    if ([IO.Directory]::Exists($resolved)) {
+        $resolved = Get-NormalizedDirectory $resolved
+        if (-not (Test-CanPrompt)) { throw (T "-InputIso указывает на папку ${resolved}: укажите сам файл .iso" "-InputIso points to the folder ${resolved}: specify the .iso file itself") }
+        return Select-InputIso -Directory $resolved
+    }
+    if ([IO.Path]::GetExtension($resolved) -ne '.iso') { throw (T "Это не ISO-файл: $resolved" "This is not an ISO file: $resolved") }
+    $resolved
+}
+
+function Select-InputIso {
+    # -Directory: сразу показать ISO из указанной папки (например, когда папку
+    # передали в -InputIso). Иначе — всё, что лежит рядом со скриптом.
+    param([string]$Directory)
+    if ($Directory) {
+        $base = Get-NormalizedDirectory (Resolve-Path -LiteralPath $Directory).Path
+        $found = @(Get-IsoFilesInDirectory -Directory $base)
+        $heading = T "  ISO-файлы в папке ${base}:" "  ISO files in ${base}:"
+        $empty = T "  В папке $base ISO-файлов нет." "  There are no ISO files in $base."
+    } else {
+        $base = $script:ScriptRoot
+        $roots = @($script:ScriptRoot)
+        $roots += @(Get-ChildItem -LiteralPath $script:ScriptRoot -Directory -Force -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -notmatch '^(\.ai|\.git|tmp|out|log)$' } |   # out — результаты, log — журналы
+                    Select-Object -ExpandProperty FullName)
+        $cwd = (Get-Location).Path
+        if ($cwd -ne $script:ScriptRoot -and (Test-Path -LiteralPath $cwd)) { $roots += $cwd }
+        $found = @()
+        foreach ($root in ($roots | Sort-Object -Unique)) {
+            $found += @(Get-ChildItem -LiteralPath $root -Filter *.iso -File -ErrorAction SilentlyContinue)
+        }
+        $found = @($found | Sort-Object FullName -Unique | Sort-Object Length -Descending)
+        $heading = T "  ISO-файлы рядом со скриптом ($script:ScriptRoot):" "  ISO files next to the script ($script:ScriptRoot):"
+        $empty = T '  Рядом со скриптом ISO-файлов не найдено.' '  No ISO files found next to the script.'
+    }
 
     # IsInputRedirected надёжнее UserInteractive: при запуске из планировщика или
     # через пайп второй остаётся True, и Read-Host просто зависает
-    if ([Console]::IsInputRedirected -or -not [Environment]::UserInteractive) {
-        throw (T 'Не указан -InputIso, а спросить интерактивно нельзя (ввод перенаправлен). Укажите файл параметром: -InputIso <путь>' '-InputIso was not provided and cannot be asked interactively (input is redirected). Pass the file explicitly: -InputIso <path>')
+    if (-not (Test-CanPrompt)) {
+        throw (T 'Не указан файл ISO, а спросить интерактивно нельзя (ввод перенаправлен). Укажите файл параметром: -InputIso <путь к .iso>' 'No ISO file was provided and it cannot be asked interactively (input is redirected). Pass the file explicitly: -InputIso <path to .iso>')
     }
 
+    $showList = $true
     while ($true) {
+        if ($showList) {
+            Write-Host ''
+            if ($found.Count -gt 0) {
+                Write-Host $heading -ForegroundColor White
+                Write-Host ''
+                Write-IsoList -Files $found -Base $base
+            } else {
+                Write-Host $empty -ForegroundColor Yellow
+            }
+            $ownOption = $found.Count + 1
+            Write-Host ((T "   {0,2}. Указать свой файл или папку с ISO" "   {0,2}. Choose another file or a folder with ISO files") -f $ownOption)
+            Write-Host ''
+            $showList = $false
+        }
         $answer = (Read-Host (T "  С каким файлом работать (1-$ownOption)" "  Which file should I use (1-$ownOption)")).Trim()
         if (-not $answer) { continue }
+        $choice = $answer
         if ($answer -match '^\d+$') {
             $n = [int]$answer
             if ($n -ge 1 -and $n -le $found.Count) { return $found[$n - 1].FullName }
-            if ($n -eq $ownOption) {
-                $path = (Read-Host (T '  Путь к ISO' '  Path to the ISO')).Trim().Trim('"')
-                if ($path -and (Test-Path -LiteralPath $path)) { return (Resolve-Path -LiteralPath $path).Path }
-                Write-Host (T '  Файл не найден, попробуйте ещё раз.' '  File not found, try again.') -ForegroundColor Yellow
+            if ($n -ne $ownOption) {
+                Write-Host (T "  Введите число от 1 до $ownOption или путь к файлу либо папке." "  Enter a number between 1 and $ownOption, or a file or folder path.") -ForegroundColor Yellow
                 continue
             }
+            $choice = (Read-Host (T '  Путь к ISO или к папке с ISO' '  Path to the ISO or to a folder with ISO files')).Trim()
         }
-        # Разрешаем и просто вставить путь вместо номера
-        $maybePath = $answer.Trim('"')
-        if (Test-Path -LiteralPath $maybePath) { return (Resolve-Path -LiteralPath $maybePath).Path }
-        Write-Host (T "  Введите число от 1 до $ownOption или путь к файлу." "  Enter a number between 1 and $ownOption, or a file path.") -ForegroundColor Yellow
+        # Разрешаем и просто вставить путь вместо номера — к файлу или к папке.
+        $choice = $choice.Trim().Trim('"')
+        if (-not $choice -or -not (Test-Path -LiteralPath $choice)) {
+            Write-Host (T '  Путь не найден, попробуйте ещё раз.' '  Path not found, try again.') -ForegroundColor Yellow
+            continue
+        }
+        $resolved = (Resolve-Path -LiteralPath $choice).Path
+        if ([IO.Directory]::Exists($resolved)) {
+            $resolved = Get-NormalizedDirectory $resolved
+            $inFolder = @(Get-IsoFilesInDirectory -Directory $resolved)
+            if (-not $inFolder.Count) {
+                Write-Host (T "  В папке $resolved ISO-файлов нет, укажите другую папку или файл." "  There are no ISO files in $resolved; choose another folder or file.") -ForegroundColor Yellow
+                continue
+            }
+            # Папка с ISO заменяет прежний список: дальше выбираем из неё.
+            $found = $inFolder; $base = $resolved
+            $heading = T "  ISO-файлы в папке ${resolved}:" "  ISO files in ${resolved}:"
+            $showList = $true
+            continue
+        }
+        if ([IO.Path]::GetExtension($resolved) -ne '.iso') {
+            Write-Host (T "  Это не ISO-файл: $resolved" "  This is not an ISO file: $resolved") -ForegroundColor Yellow
+            continue
+        }
+        return $resolved
     }
 }
 
@@ -689,7 +786,7 @@ $script:CapabilityRules = @(
     @{ Preset = 'balanced'; Group = 'WMP';      Pattern = '^Media\.WindowsMediaPlayer~';                        Desc = (T 'Windows Media Player' 'Windows Media Player') }
     @{ Preset = 'balanced'; Group = 'Misc';     Pattern = '^Microsoft\.Windows\.MSPaint~';                      Desc = (T 'Классический Paint' 'Classic Paint') }
     @{ Preset = 'balanced'; Group = 'Misc';     Pattern = '^App\.StepsRecorder~';                               Desc = (T 'Steps Recorder' 'Steps Recorder') }
-    @{ Preset = 'balanced'; Group = 'IE';       Pattern = '^Browser\.InternetExplorer~';                        Desc = (T 'Internet Explorer 11 (в 24H2 — заглушка)' 'Internet Explorer 11 (a stub in 24H2)') }
+    @{ Preset = 'balanced'; Group = 'IE';       Pattern = '^Browser\.InternetExplorer~';                        Desc = (T 'Internet Explorer 11 (в Windows 11 24H2 — заглушка, в Windows 10 — рабочий браузер)' 'Internet Explorer 11 (a stub in Windows 11 24H2, a working browser in Windows 10)') }
     @{ Preset = 'balanced'; Group = 'Defender'; Pattern = '^Microsoft\.Windows\.Sense\.Client~';                 Desc = (T 'Defender for Endpoint' 'Defender for Endpoint') }
     @{ Preset = 'max';      Group = 'Misc';     Pattern = '^Hello\.Face\.';                                     Desc = (T 'Windows Hello Face' 'Windows Hello Face') }
     @{ Preset = 'max';      Group = 'Misc';     Pattern = '^MathRecognizer~';                                   Desc = (T 'Распознавание формул' 'Math recognizer') }
@@ -801,6 +898,19 @@ $script:TaskFiles = @(
     @{ Preset = 'balanced'; Group = 'Telemetry'; Path = 'Windows\System32\Tasks\Microsoft\Windows\Windows Error Reporting\QueueReporting';                      Desc = (T 'Отчёты об ошибках' 'Error reporting') }
     @{ Preset = 'balanced'; Group = 'Telemetry'; Path = 'Windows\System32\Tasks\Microsoft\Windows\Feedback\Siuf\DmClient';                                      Desc = (T 'Feedback DmClient' 'Feedback DmClient') }
     @{ Preset = 'balanced'; Group = 'Telemetry'; Path = 'Windows\System32\Tasks\Microsoft\Windows\Feedback\Siuf\DmClientOnScenarioDownload';                    Desc = (T 'Feedback DmClient (сценарии)' 'Feedback DmClient (scenarios)') }
+)
+
+# Компоненты Windows (DISM /Get-Features), удаляемые вместе с файлами (/Remove):
+# без источника их потом не включить. Гостевые интеграционные службы Hyper-V
+# (vmic*, VMBus) входят в ядро, а не в эти компоненты, поэтому Windows внутри VM
+# продолжает работать. Гипервизор, на котором держится VBS/«Целостность памяти»,
+# тоже часть ядра: в Home компонентов Hyper-V нет, а VBS работает.
+$script:FeatureRules = @(
+    @{ Preset = 'max'; Group = 'Virtualization'; Pattern = '^Microsoft-Hyper-V(-.+)?$';                               Desc = (T 'Hyper-V с Диспетчером Hyper-V' 'Hyper-V with Hyper-V Manager') }
+    @{ Preset = 'max'; Group = 'Virtualization'; Pattern = '^(Microsoft-Windows-Subsystem-Linux|VirtualMachinePlatform)$'; Desc = (T 'WSL и платформа виртуальных машин (WSL2)' 'WSL and Virtual Machine Platform (WSL2)') }
+    @{ Preset = 'max'; Group = 'Virtualization'; Pattern = '^HypervisorPlatform$';                                     Desc = 'Windows Hypervisor Platform' }
+    @{ Preset = 'max'; Group = 'Virtualization'; Pattern = '^Containers(-DisposableClientVM)?$';                        Desc = (T 'Песочница Windows и контейнеры' 'Windows Sandbox and containers') }
+    @{ Preset = 'max'; Group = 'Virtualization'; Pattern = '^Windows-Defender-ApplicationGuard$';                      Desc = 'Application Guard' }
 )
 
 # Каталоги AI-компонентов. Ищутся по маске: точные имена меняются от билда к
@@ -1164,9 +1274,16 @@ function Test-Protected {
 }
 
 function Get-WindowsRelease {
-    param([int]$Build)
+    param([int]$Build, [string]$EditionId)
     # Новые ветки не должны получать обновления от последней известной версии.
     switch ($Build) {
+        # Windows 10 2004–22H2 обслуживаются одной веткой 19041: версию задаёт
+        # пакет включения, а в XML носителя остаётся 19041 (так у LTSC 2021,
+        # 10.0.19041.1288). LTSC 2021 — 21H2; остальные редакции поддерживаются
+        # только как 22H2. Номера KB у 21H2 и 22H2 общие.
+        19041 { if ($EditionId -match '^(IoT)?EnterpriseS') { '21H2' } else { '22H2' } }
+        19044 { '21H2' }
+        19045 { '22H2' }
         22000 { '21H2' }
         22621 { '22H2' }
         22631 { '23H2' }
@@ -1175,6 +1292,23 @@ function Get-WindowsRelease {
         28000 { '26H1' }
         default { throw (T "Неизвестная ветка Windows: $Build. Подбор обновлений для неё не настроен." "Unknown Windows build branch: $Build. Update selection is not configured for it.") }
     }
+}
+
+# Запрос к каталогу Microsoft Update и шаблон названия нужного обновления.
+# У Windows 10 каталог каждый месяц публикует три варианта .NET: «3.5 and 4.8»,
+# «3.5 and 4.8.1» и «3.5, 4.8 and 4.8.1». В исходном образе 19041 стоит .NET 4.8,
+# поэтому берётся только первый; LCU отбирается по полному названию x64-пакета.
+function Get-UpdateCatalogSearch {
+    param([int]$Build, [string]$Release, [ValidateSet('lcu', 'dotnet')][string]$Kind)
+    if ($Build -ge 22000) {
+        if ($Kind -eq 'lcu') { return [pscustomobject]@{ Query = "Cumulative Update for Windows 11 version $Release x64"; TitlePattern = 'Cumulative Update' } }
+        return [pscustomobject]@{ Query = "Cumulative Update for .NET Framework Windows 11 version $Release x64"; TitlePattern = '\.NET Framework' }
+    }
+    $product = "Windows 10 Version $Release"
+    if ($Kind -eq 'lcu') {
+        return [pscustomobject]@{ Query = "Cumulative Update for $product x64"; TitlePattern = "Cumulative Update for $([regex]::Escape($product)) for x64-based Systems" }
+    }
+    [pscustomobject]@{ Query = "Cumulative Update for .NET Framework 3.5 and 4.8 $product x64"; TitlePattern = "\.NET Framework 3\.5 and 4\.8 for $([regex]::Escape($product)) for x64" }
 }
 
 function Get-EditionConfig {
@@ -1245,7 +1379,15 @@ function Read-ConfirmedLocalAccountPassword {
 }
 
 function Read-LocalAccountOptions {
-    param([int]$Build,[string]$EditionId,[string]$Mode,[string]$Name,[Security.SecureString]$Password,[switch]$Preview)
+    param([int]$Build,[string]$EditionId,[string]$Mode,[string]$Name,[Security.SecureString]$Password,[switch]$Preview,[switch]$AutoInstall)
+    if ($AutoInstall) {
+        # Учётная запись задаётся до сборки: либо -LocalUserName, либо встроенный Администратор.
+        if ($Mode -eq 'setup') { throw (T '-AutoInstall несовместим с -AccountMode setup: при автоматической установке учётная запись не запрашивается' '-AutoInstall cannot be combined with -AccountMode setup: automatic installation does not ask for an account') }
+        if (-not $Name -and $Mode -ne 'image') {
+            if ($Password) { throw (T 'Пароль указан без создаваемого локального аккаунта' 'A password was supplied without a local account to create') }
+            return [pscustomobject]@{Mode=$Mode;Name='';Password=$null}
+        }
+    }
     $resolved = Resolve-AccountMode -Build $Build -EditionId $EditionId -Mode $Mode -Name $Name -AnswerFile $Unattend
     if ($Password -and $resolved -ne 'image') { throw (T 'Пароль указан без создаваемого локального аккаунта' 'A password was supplied without a local account to create') }
     if ($Mode -eq 'auto' -and -not $Name -and -not $Unattend -and -not $Preview -and (Test-CanPrompt)) {
@@ -1263,8 +1405,18 @@ function Read-LocalAccountOptions {
 }
 
 function Get-LocalAccountXml {
-    param([string]$Name,[Security.SecureString]$Password)
-    if (-not $Name) { return '' }
+    param([string]$Name,[Security.SecureString]$Password,[switch]$BlankAdministrator)
+    if (-not $Name) {
+        if (-not $BlankAdministrator) { return '' }
+        # Пустое значение документировано: встроенный Администратор включается
+        # с пустым паролем, и после OOBE пароль не запрашивается.
+        return @"
+
+            <UserAccounts>
+                <AdministratorPassword><Value></Value><PlainText>true</PlainText></AdministratorPassword>
+            </UserAccounts>
+"@
+    }
     Assert-LocalUserName $Name
     $escaped = [Security.SecurityElement]::Escape($Name)
     $plain = ''
@@ -1290,18 +1442,101 @@ function Get-LocalAccountXml {
 }
 
 function Get-ImageInstallXml {
-    param([bool]$Compact)
+    param([bool]$Compact,[bool]$AvailablePartition)
     $compactSetting = if ($Compact) { "`r`n                    <Compact>true</Compact>" } else { '' }
+    # После разметки диска 0 это первый раздел с достаточным местом: служебные
+    # EFI/System Reserved малы, MSR не является томом. InstallTo не подходит —
+    # номер раздела Windows у GPT (3) и MBR (2) разный.
+    $targetSetting = if ($AvailablePartition) { "`r`n                    <InstallToAvailablePartition>true</InstallToAvailablePartition>`r`n                    <WillShowUI>OnError</WillShowUI>" } else { '' }
     @"
 
             <ImageInstall>
                 <OSImage>$compactSetting
                     <InstallFrom>
                         <MetaData wcm:action="add"><Key>/IMAGE/INDEX</Key><Value>1</Value></MetaData>
-                    </InstallFrom>
+                    </InstallFrom>$targetSetting
                 </OSImage>
             </ImageInstall>
 "@
+}
+
+# Автовход после OOBE. Только английское «Administrator» включает встроенную
+# учётную запись на любом языке образа; при настроенном AutoLogon Windows 10+
+# пропускает создание пользователя в OOBE. Пароль AutoLogon шифруется так же,
+# как пароль LocalAccount (суффикс «Password»); пустой пишется как есть.
+function Get-AutoLogonXml {
+    param([string]$Name,[Security.SecureString]$Password)
+    $user = if ($Name) { Assert-LocalUserName $Name; [Security.SecurityElement]::Escape($Name) } else { 'Administrator' }
+    $passwordXml = '<Value></Value><PlainText>true</PlainText>'
+    if ($Name -and $Password -and $Password.Length) {
+        $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Password)
+        try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer) }
+        $passwordXml = '<Value>' + [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($plain + 'Password')) + '</Value><PlainText>false</PlainText>'
+        $plain = $null
+    }
+    @"
+
+            <AutoLogon>
+                <Enabled>true</Enabled>
+                <LogonCount>9999999</LogonCount>
+                <Password>$passwordXml</Password>
+                <Username>$user</Username>
+            </AutoLogon>
+"@
+}
+
+# Установщик в WinPE не знает буквы носителя, поэтому команда ищет свой
+# сценарий разметки на всех буквах, кроме X: (RAM-диск WinPE).
+function Get-AutoInstallDiskXml {
+    @"
+
+            <RunSynchronous>
+                <RunSynchronousCommand wcm:action="add">
+                    <Order>1</Order>
+                    <Description>Wipe and partition disk 0 for win-11-lite AutoInstall</Description>
+                    <Path>cmd.exe /d /c for %d in (C D E F G H I J K L M N O P Q R S T U V W Y Z) do @if exist %d:\win11lite\disk.cmd (call %d:\win11lite\disk.cmd &amp; exit /b)</Path>
+                </RunSynchronousCommand>
+            </RunSynchronous>
+"@
+}
+
+# Сценарии разметки для носителя. Тип прошивки WinPE сообщает в
+# PEFirmwareType (0x1 — BIOS, 0x2 — UEFI): на UEFI Windows ставится только на
+# GPT, на BIOS — на MBR с активным системным разделом.
+function Get-AutoInstallDiskScripts {
+    [ordered]@{
+        'disk.cmd' = @(
+            '@echo off'
+            'rem win-11-lite -AutoInstall: wipes disk 0 and partitions it for the current firmware.'
+            'setlocal'
+            'set "LAYOUT=bios"'
+            'for /f "tokens=3" %%a in (''reg query HKLM\System\CurrentControlSet\Control /v PEFirmwareType 2^>nul'') do if /i "%%a"=="0x2" set "LAYOUT=uefi"'
+            'diskpart /s "%~dp0disk-%LAYOUT%.txt"'
+            'exit /b %errorlevel%'
+        ) -join "`r`n"
+        'disk-uefi.txt' = @(
+            'select disk 0', 'clean', 'convert gpt'
+            'create partition efi size=300', 'format quick fs=fat32 label="System"'
+            'create partition msr size=16'
+            'create partition primary', 'format quick fs=ntfs label="Windows"'
+            'exit'
+        ) -join "`r`n"
+        'disk-bios.txt' = @(
+            'select disk 0', 'clean', 'convert mbr'
+            'create partition primary size=300', 'format quick fs=ntfs label="System Reserved"', 'active'
+            'create partition primary', 'format quick fs=ntfs label="Windows"'
+            'exit'
+        ) -join "`r`n"
+    }
+}
+
+function Write-AutoInstallMediaFiles {
+    param([Parameter(Mandatory)][string]$Distribution)
+    $directory = Join-Path $Distribution 'win11lite'
+    $null = New-Item -ItemType Directory -Path $directory -Force
+    foreach ($entry in (Get-AutoInstallDiskScripts).GetEnumerator()) {
+        [IO.File]::WriteAllText((Join-Path $directory $entry.Key), $entry.Value + "`r`n", [Text.Encoding]::ASCII)
+    }
 }
 
 function Get-ProductKeyUiMode {
@@ -1314,6 +1549,8 @@ function Get-ProductKeyUiMode {
 function Test-GroupActive {
     param([string]$RulePreset, [string]$Group)
     if ($Keep -contains $Group) { return $false }
+    # Виртуализация входит в max, а в остальных пресетах удаляется только по явному ключу.
+    if ($Group -eq 'Virtualization' -and $RemoveVirtualization) { return $true }
     if ($Group -in @('Family','ToDo') -and $Keep -contains 'Apps') { return $false }
     if ($Preset -ne 'max' -and $Group -eq 'Fonts' -and @($script:ImageLanguages + $AddLanguage + $DownloadLanguage | Where-Object { $_ -match '^(zh|ja|ko)(-|$)' }).Count) { return $false }
     $order = @{ 'safe' = 0; 'balanced' = 1; 'max' = 2 }
@@ -1425,6 +1662,32 @@ function Remove-OfflineRecall {
     }
 }
 
+# Компоненты Windows по FeatureRules (сейчас — виртуализация). /Remove удаляет
+# файлы и оставляет только манифест; уже удалённые (Disabled with Payload
+# Removed) пропускаются, незавершённое обслуживание откладывается.
+function Remove-OfflineFeatures {
+    param([string]$Image)
+    if (-not @($script:FeatureRules | Where-Object { Test-GroupActive -RulePreset $_.Preset -Group $_.Group }).Count) { return }
+    $raw = Invoke-Dism -Arguments @("/Image:$Image", '/Get-Features', '/Format:List') -Quiet
+    $features = @(ConvertFrom-DismList -Lines $raw.Output -Key 'Feature Name')
+    $selected = @(Get-RequestedRemovalItems -Items $features -Identity 'Feature Name' -Rules $script:FeatureRules)
+    Write-Step (T "Компонентов Windows выбрано для удаления: $($selected.Count)" "Windows features selected for removal: $($selected.Count)")
+    $removed = 0; $failed = 0; $deferred = 0
+    foreach ($feature in $selected) {
+        $name = $feature.'Feature Name'
+        if ($feature.State -match 'Pending') {
+            $deferred++
+            Write-Note (T "$name — $($feature.State), удаление отложено до завершения обслуживания при загрузке Windows" "$name - $($feature.State), removal deferred until servicing completes when Windows boots")
+            continue
+        }
+        $result = Invoke-Dism -Arguments @("/Image:$Image", '/Disable-Feature', "/FeatureName:$name", '/Remove') -AllowFail -Quiet
+        if (Test-DismSuccess $result.ExitCode) { $removed++; Write-Ok $name }
+        else { $failed++; Write-ServicingRemovalFailure -Kind 'Feature' -Name $name -Result $result }
+    }
+    $summary = T "Итог компонентов Windows ($($selected.Count)): удалено $removed; ошибок $failed; отложено $deferred" "Windows features summary ($($selected.Count)): removed $removed; failed $failed; deferred $deferred"
+    if ($failed -or $deferred) { Write-Note $summary } else { Write-Ok $summary }
+}
+
 function Write-RemainingRemovalReport {
     param([string]$Image)
     $remaining = @()
@@ -1432,7 +1695,7 @@ function Write-RemainingRemovalReport {
         @{ Name = 'Capability'; Query = '/Get-Capabilities'; Identity = 'Capability Identity'; Rules = $script:CapabilityRules; Extra = $true }
         @{ Name = 'Package'; Query = '/Get-Packages'; Identity = 'Package Identity'; Rules = $script:PackageRules; Extra = $true }
         @{ Name = 'Appx'; Query = '/Get-ProvisionedAppxPackages'; Identity = 'DisplayName'; Rules = $script:AppxRules; Extra = $false }
-        @{ Name = 'Feature'; Query = '/Get-Features'; Identity = 'Feature Name'; Rules = @(@{ Preset = 'balanced'; Group = 'AI'; Pattern = '^Recall$' }); Extra = $false }
+        @{ Name = 'Feature'; Query = '/Get-Features'; Identity = 'Feature Name'; Rules = @(@{ Preset = 'balanced'; Group = 'AI'; Pattern = '^Recall$' }) + @($script:FeatureRules | Where-Object { $_ }); Extra = $false }
     )) {
         $queryArgs = @("/Image:$Image", $kind.Query)
         if ($kind.Name -eq 'Feature') { $queryArgs += '/Format:List' }
@@ -1751,7 +2014,7 @@ function Save-CatalogPayload {
         try {
             $update = Search-Catalog -Query $Query | Where-Object {
                 $_.Title -match $TitlePattern -and $_.Title -notmatch 'Dynamic|Preview' -and
-                ($TitlePattern -eq '\.NET Framework' -or $_.Title -notmatch '\.NET')
+                ($TitlePattern -like '*.NET Framework*' -or $_.Title -notmatch '\.NET')
             } | Sort-Object Date -Descending | Select-Object -First 1
             if (-not $update) { throw (T "Обновление не найдено: $Query" "Update not found: $Query") }
             if ($update.Title -notmatch '\((KB\d+)\)') { throw (T 'В названии обновления нет KB' 'Update title has no KB identifier') }
@@ -3945,6 +4208,21 @@ function Initialize-DeploymentTools {
         if (-not $script:Dism) { $script:Dism = $tools.Dism }
         if (-not $script:Oscdimg) { $script:Oscdimg = $tools.Oscdimg }
     }
+    # oscdimg только записывает ISO и от ветки Windows не зависит. Если DISM
+    # подходит, а oscdimg нет, ADK не устанавливаем: берём oscdimg из того же
+    # закреплённого набора пакетов Microsoft, что и для 26H1 (SHA256 архивов,
+    # размеры из MSI, подпись, кэш). DISM остаётся прежним. Явный -InstallAdk
+    # по-прежнему ставит Deployment Tools.
+    if ($script:Dism -and -not $script:Oscdimg -and -not $SkipIso -and -not $Install) {
+        if ($Preview) {
+            Write-Note (T 'oscdimg не найден: перед сборкой он будет подготовлен из пакетов Microsoft ADK — 4 установщика (~2.3 МиБ) и 9 архивов (~6.3 МиБ), без установки ADK.' 'oscdimg was not found: before the build it will be prepared from Microsoft ADK packages - 4 installers (about 2.3 MiB) and 9 archives (about 6.3 MiB), without installing the ADK.')
+            return
+        }
+        Write-Step (T 'oscdimg не найден — готовлю его из пакетов Microsoft ADK без установки ADK' 'oscdimg was not found - preparing it from Microsoft ADK packages without installing the ADK')
+        try { $script:Oscdimg = (Save-DeploymentTools -Directory $Directory -Build 28000).Oscdimg }
+        catch { throw (T "Не удалось подготовить oscdimg: $($_.Exception.Message). Установите Deployment Tools из ADK или используйте -InstallAdk." "Could not prepare oscdimg: $($_.Exception.Message). Install ADK Deployment Tools or use -InstallAdk.") }
+        Write-Ok (T "oscdimg: $script:Oscdimg" "oscdimg: $script:Oscdimg")
+    }
     if ((-not $script:Dism -or (-not $script:Oscdimg -and -not $SkipIso)) -and $Install -and -not $Preview) {
         $setup = Join-Path $Directory 'adksetup-26100.exe'
         Save-Url -Url 'https://go.microsoft.com/fwlink/?linkid=2289980' -Destination $setup
@@ -4174,14 +4452,15 @@ if ($script:WizardMode) {
     Write-Host (T '  Enter оставляет значение по умолчанию (отмечено звёздочкой).' '  Enter keeps the default value (marked with an asterisk).') -ForegroundColor DarkGray
 
     # 1. Исходный образ
-    if (-not $InputIso) { $InputIso = Select-InputIso }
-    if (-not (Test-Path -LiteralPath $InputIso)) { throw (T "Файл не найден: $InputIso" "File not found: $InputIso") }
-    $InputIso = (Resolve-Path -LiteralPath $InputIso).Path
+    $InputIso = Resolve-InputIsoPath -Path $InputIso
 
     # 2. Редакция внутри образа
     Write-Host ''
     Write-Host (T '  Читаю образ...' '  Reading the image...') -ForegroundColor DarkGray
-    $editions = Get-IsoEditions -Path $InputIso
+    # @(): одна редакция возвращается одиночным PSCustomObject, а у него в
+    # Windows PowerShell 5.1 нет Count — иначе индекс, язык и семейство Windows
+    # не определялись бы (ISO Windows 10 LTSC 2021 считался бы en-US Windows 11).
+    $editions = @(Get-IsoEditions -Path $InputIso)
     $wizardLang = 'en-US'
     if ($editions.Count -gt 1) {
         $items = $editions | ForEach-Object { "{0,-46} {1}" -f $_.Name, $_.EditionId }
@@ -4195,8 +4474,22 @@ if ($script:WizardMode) {
     }
 
     $wizardImage = $editions | Where-Object { [int]$_.Index -eq $Index } | Select-Object -First 1
+    # Вопросы про языки, размер обновления и установщик зависят от семейства Windows.
+    $wizardWindows10 = [bool]($wizardImage -and ([version]$wizardImage.Version).Build -lt 22000)
+    # Автоматическая установка решает и вопрос учётной записи, поэтому идёт раньше него.
+    if (-not $PSBoundParameters.ContainsKey('AutoInstall') -and -not $Unattend) {
+        Write-Host ''
+        Write-Host (T '  Автоматическая установка ставит Windows без единого вопроса и входит под' '  Automatic installation sets up Windows without a single question and signs in') -ForegroundColor DarkGray
+        Write-Host (T '  встроенным Администратором без пароля. ВНИМАНИЕ: диск 0 стирается без' '  as the built-in Administrator without a password. WARNING: disk 0 is erased') -ForegroundColor DarkGray
+        Write-Host (T '  подтверждения — подходит для VM и ПК с одним диском.' '  without confirmation - suitable for VMs and single-disk PCs.') -ForegroundColor DarkGray
+        $AutoInstall = Read-YesNo -Question (T 'Устанавливать Windows автоматически, без вопросов?' 'Install Windows automatically, without questions?') -Default $false
+    }
+    if ($AutoInstall -and $wizardImage.EditionId -match '^(Core|Professional)' -and -not $ProductKey) {
+        Write-Host (T '  Home/Pro без ключа продукта установщик остановит на запросе ключа.' '  Without a product key, Setup stops Home/Pro at the key prompt.') -ForegroundColor DarkGray
+        while (-not $ProductKey) { $ProductKey = (Read-Host (T '  Ключ продукта' '  Product key')).Trim() }
+    }
     if ($wizardImage) {
-        $account = Read-LocalAccountOptions -Build ([version]$wizardImage.Version).Build -EditionId $wizardImage.EditionId -Mode $AccountMode -Name $LocalUserName -Password $LocalUserPassword -Preview:$DryRun
+        $account = Read-LocalAccountOptions -Build ([version]$wizardImage.Version).Build -EditionId $wizardImage.EditionId -Mode $AccountMode -Name $LocalUserName -Password $LocalUserPassword -Preview:$DryRun -AutoInstall:$AutoInstall
         $AccountMode=$account.Mode; $LocalUserName=$account.Name; $LocalUserPassword=$account.Password
     }
 
@@ -4214,6 +4507,33 @@ if ($script:WizardMode) {
             (T 'max       — плюс WebView2, резервы компонентов и дополнительные FoD; возможна потеря совместимости' 'max       - plus WebView2, component backups and extra FoDs; compatibility may be lost')
         ) -Values @('safe', 'balanced', 'max')
 
+    # 4a. Встроенный антивирус — отдельный вопрос: без него Windows остаётся
+    # без защиты, поэтому удалять его стоит только под другой антивирус.
+    # Ответ «нет» — это -Keep Defender: сохраняются Defender, «Безопасность
+    # Windows», их службы и политики, а guard их не трогает.
+    if ($Preset -ne 'safe') {
+        Write-Host ''
+        Write-Host (T '  Microsoft Defender и «Безопасность Windows» — встроенный антивирус.' '  Microsoft Defender and Windows Security are the built-in antivirus.') -ForegroundColor DarkGray
+        Write-Host (T '  Удаляйте его, только если будете устанавливать другой антивирус:' '  Remove it only if you are going to install another antivirus:') -ForegroundColor Yellow
+        Write-Host (T '  иначе Windows останется без защиты от вредоносных программ.' '  otherwise Windows is left without malware protection.') -ForegroundColor Yellow
+        $removeDefender = Read-YesNo -Question (T 'Удалить встроенный антивирус?' 'Remove the built-in antivirus?') -Default ($Keep -notcontains 'Defender')
+        if ($removeDefender) { $Keep = @($Keep | Where-Object { $_ -ne 'Defender' }) }
+        elseif ($Keep -notcontains 'Defender') { $Keep = @($Keep) + 'Defender' }
+    }
+
+    # 4b. Виртуализация: по умолчанию сохраняется, в max удаляется. «Да» —
+    # -RemoveVirtualization, «нет» в max — -Keep Virtualization.
+    Write-Host ''
+    Write-Host (T '  Компоненты виртуализации: Hyper-V с Диспетчером Hyper-V, WSL2 и платформа' '  Virtualization features: Hyper-V with Hyper-V Manager, WSL2 and the Virtual') -ForegroundColor DarkGray
+    Write-Host (T '  виртуальных машин, Windows Hypervisor Platform, песочница и контейнеры.' '  Machine Platform, Windows Hypervisor Platform, Sandbox and containers.') -ForegroundColor DarkGray
+    Write-Host (T '  Удаляйте их, только если не будете пользоваться виртуализацией: без них' '  Remove them only if you will not use virtualization: without them WSL,') -ForegroundColor Yellow
+    Write-Host (T '  не работают WSL, Docker Desktop, виртуальные машины Hyper-V и песочница.' '  Docker Desktop, Hyper-V virtual machines and Sandbox do not work.') -ForegroundColor Yellow
+    # Имя ответа не должно совпасть с $RemoveVirtualization: переменные PowerShell регистронезависимы.
+    $virtualizationAnswer = Read-YesNo -Question (T 'Удалить компоненты виртуализации?' 'Remove the virtualization features?') -Default ([bool](($RemoveVirtualization -or $Preset -eq 'max') -and $Keep -notcontains 'Virtualization'))
+    $Keep = @($Keep | Where-Object { $_ -ne 'Virtualization' })
+    $RemoveVirtualization = $virtualizationAnswer -and $Preset -ne 'max'
+    if (-not $virtualizationAnswer -and $Preset -eq 'max') { $Keep = @($Keep) + 'Virtualization' }
+
     # 5. Сторож — идёт сразу за глубиной чистки: он существует ровно для того,
     # чтобы вырезанное не вернулось, и без него чистка постепенно откатывается
     Write-Host ''
@@ -4228,8 +4548,12 @@ if ($script:WizardMode) {
         (T 'Silent — без окна, отчёты в папке guard' 'Silent - no window, reports in the guard folder')
     ) -Values @('None','Standard','Debug','Silent') -Default $guardDefault
 
-    # 6. Язык — спрашиваем, только если образ англоязычный
-    if ($wizardLang -like 'en-*') {
+    # 6. Язык — спрашиваем, только если образ англоязычный. Для Windows 10
+    # сборщик языки не подбирает: нужен ISO на нужном языке.
+    if ($wizardLang -like 'en-*' -and $wizardWindows10) {
+        Write-Host ''
+        Write-Host (T "  Образ на языке $wizardLang. Для Windows 10 другой язык добавить нельзя — возьмите ISO на нужном языке." "  The image language is $wizardLang. Windows 10 builds cannot add another language - use an ISO in the required language.") -ForegroundColor Gray
+    } elseif ($wizardLang -like 'en-*') {
         Write-Host ''
         Write-Host (T "  Образ на языке $wizardLang." "  The image language is $wizardLang.") -ForegroundColor Gray
         if (Read-YesNo -Question (T 'Добавить другой язык интерфейса?' 'Add another display language?') -Default $false) {
@@ -4252,7 +4576,11 @@ if ($script:WizardMode) {
 
     # 7. Обновления
     Write-Host ''
-    Write-Host (T '  Накопительное обновление весит около 4.9 ГБ и добавляет к сборке ~25 минут,' '  The cumulative update is about 4.9 GB and adds roughly 25 minutes to the build,') -ForegroundColor DarkGray
+    if ($wizardWindows10) {
+        Write-Host (T '  Накопительное обновление Windows 10 весит около 0.9 ГБ и удлиняет сборку,' '  The Windows 10 cumulative update is about 0.9 GB and lengthens the build,') -ForegroundColor DarkGray
+    } else {
+        Write-Host (T '  Накопительное обновление весит около 4.9 ГБ и добавляет к сборке ~25 минут,' '  The cumulative update is about 4.9 GB and adds roughly 25 minutes to the build,') -ForegroundColor DarkGray
+    }
     Write-Host (T '  зато система ставится уже пропатченной. Иначе патчи придут через Windows Update.' '  but the system installs already patched. Otherwise patches arrive via Windows Update.') -ForegroundColor DarkGray
     if (Read-YesNo -Question (T 'Встроить последние обновления?' 'Embed the latest updates?') -Default $false) { $WithUpdates = $true }
 
@@ -4268,7 +4596,8 @@ if ($script:WizardMode) {
     Write-Host (T '  среду восстановления — образ меньше примерно на 650 МБ. Ставится' '  recovery environment - roughly 650 MB smaller. It only installs') -ForegroundColor DarkGray
     Write-Host (T '  только загрузкой с носителя (запуск setup.exe из Windows не работает).' '  by booting from the media (running setup.exe from Windows will not work).') -ForegroundColor DarkGray
     if (Read-YesNo -Question (T 'Уменьшить образ по-максимуму?' 'Shrink the image as much as possible?') -Default $true) {
-        $LegacySetup = $true; $TrimSources = $true
+        # У Windows 10 установщик и так классический: /legacy он не понимает.
+        $LegacySetup = -not $wizardWindows10; $TrimSources = $true
     }
 
     # Среда восстановления — отдельный вопрос, а не подпункт уменьшения размера.
@@ -4280,14 +4609,14 @@ if ($script:WizardMode) {
     Write-Host (T '  загрузки, «Особые варианты загрузки», сброс ПК.' '  failure, Advanced startup options, PC reset.') -ForegroundColor DarkGray
     Write-Host (T '    да  — остаётся внутри ISO, Windows пользуется им после установки' '    yes - stays inside the ISO, Windows uses it after installation') -ForegroundColor DarkGray
     Write-Host (T '    нет — вырезается из ISO и кладётся рядом отдельным файлом' '    no  - cut out of the ISO and saved next to it as a separate file') -ForegroundColor DarkGray
-    if (-not $LegacySetup) {
+    if (-not $LegacySetup -and -not $wizardWindows10) {
         Write-Host (T '  Вырезать можно только с классическим установщиком — он включится сам.' '  Cutting it out requires the classic setup - it will be enabled automatically.') -ForegroundColor DarkGray
     }
     $RemoveWinRE = -not (Read-YesNo -Question (T 'Оставить winre.wim в готовом ISO?' 'Keep winre.wim inside the finished ISO?') -Default $false)
     # Вырезали — значит обязательно сохраняем рядом с ISO, иначе файл потеряется
     $SaveWinRE = $RemoveWinRE
 
-    if ($RemoveWinRE -and -not $LegacySetup) {
+    if ($RemoveWinRE -and -not $LegacySetup -and -not $wizardWindows10) {
         $LegacySetup = $true
         Write-Note (T 'Включён классический установщик: без него установка без winre.wim падает с 0x80070003' 'Classic setup enabled: without it, installing without winre.wim fails with 0x80070003')
     }
@@ -4339,6 +4668,9 @@ if ($script:WizardMode) {
     if ($TrimSources)        { $cmd += ' -TrimSources' }
     if ($RemoveWinRE)        { $cmd += ' -RemoveWinRE' }
     if ($SaveWinRE)          { $cmd += ' -SaveWinRE' }
+    if ($RemoveVirtualization) { $cmd += ' -RemoveVirtualization' }
+    if ($AutoInstall)        { $cmd += ' -AutoInstall' }
+    if ($ProductKey)         { $cmd += " -ProductKey '$($ProductKey.Replace("'","''"))'" }
     $cmd += " -PageFileMode $PageFileMode -PageFileMinMB $PageFileMinMB -PageFileMaxMB $PageFileMaxMB -SwapFile $SwapFile -Hibernation $Hibernation -CrashDumps $CrashDumps"
     $cmd += " -Guard $Guard"
     if ($script:DebugMode)   { $cmd += ' -Debug' }
@@ -4358,18 +4690,16 @@ if ($script:WizardMode) {
 $memoryFilePolicy = Get-MemoryFilePolicy -PageFileMode $PageFileMode -PageFileMinMB $PageFileMinMB -PageFileMaxMB $PageFileMaxMB -SwapFile $SwapFile -Hibernation $Hibernation -CrashDumps $CrashDumps
 
 # --- пути ---
-if (-not $InputIso) { $InputIso = Select-InputIso }
-if (-not (Test-Path -LiteralPath $InputIso)) { throw (T "Файл не найден: $InputIso" "File not found: $InputIso") }
-$InputIso = (Resolve-Path -LiteralPath $InputIso).Path
+$InputIso = Resolve-InputIsoPath -Path $InputIso
 $isoName = [IO.Path]::GetFileNameWithoutExtension($InputIso)
 $outDir = Join-Path $script:ScriptRoot 'out'
 if (-not $OutputIso) { $OutputIso = Join-Path $outDir "${isoName}_lite.iso" }
 $OutputIso = [IO.Path]::GetFullPath($OutputIso)
 $WorkDir = [IO.Path]::GetFullPath($WorkDir)
 if ($InputIso -eq $OutputIso) { throw (T 'InputIso и OutputIso должны быть разными файлами' 'InputIso and OutputIso must be different files') }
-if ($TrimSources -and -not $LegacySetup) { throw (T '-TrimSources требует -LegacySetup' '-TrimSources requires -LegacySetup') }
-if ($RemoveWinRE -and -not $LegacySetup -and $Keep -notcontains 'WinRE') { throw (T '-RemoveWinRE требует -LegacySetup' '-RemoveWinRE requires -LegacySetup') }
 if ($Index -gt 0 -and $Edition) { throw (T 'Укажите только один параметр: -Index или -Edition' 'Use either -Index or -Edition') }
+if ($RemoveVirtualization -and $Keep -contains 'Virtualization') { throw (T 'Укажите что-то одно: -RemoveVirtualization или -Keep Virtualization' 'Use either -RemoveVirtualization or -Keep Virtualization') }
+if ($AutoInstall -and $Unattend) { throw (T '-AutoInstall несовместим с -Unattend: answer-файл автоматической установки строит сборщик' '-AutoInstall cannot be combined with -Unattend: the builder generates the automatic-installation answer file') }
 if ($DriversDir -and -not (Test-Path -LiteralPath $DriversDir -PathType Container)) { throw (T "Папка драйверов не найдена: $DriversDir" "Drivers folder not found: $DriversDir") }
 if ($Unattend -and $Unattend -ne 'none') {
     $Unattend = (Resolve-Path -LiteralPath $Unattend).Path
@@ -4711,12 +5041,36 @@ elseif ($imgVersion -match '^(\d{5})') { $buildNumber = [int]$matches[1] }
 $imgRevision = ''
 if ($imgVersion -match '(\d{5}\.\d+)') { $imgRevision = $matches[1] }
 
-$winVersion = Get-WindowsRelease -Build $buildNumber
+$winVersion = Get-WindowsRelease -Build $buildNumber -EditionId $selected.EditionId
+# Windows 10 ставится штатным классическим установщиком и не проверяет TPM/Secure Boot.
+$isWindows10 = $buildNumber -lt 22000
+$windowsFamily = if ($isWindows10) { 'Windows 10' } else { 'Windows 11' }
 
 Write-Ok (T "Выбран индекс $srcIndex — $($selected.Name)" "Selected index $srcIndex - $($selected.Name)")
-Write-Ok (T "Редакция: $($selected.EditionId)   Язык: $imgLang   Билд: $imgVersion   ($winVersion)" "Edition: $($selected.EditionId)   Language: $imgLang   Build: $imgVersion   ($winVersion)")
+Write-Ok (T "Редакция: $($selected.EditionId)   Язык: $imgLang   Билд: $imgVersion   ($windowsFamily $winVersion)" "Edition: $($selected.EditionId)   Language: $imgLang   Build: $imgVersion   ($windowsFamily $winVersion)")
+# Требования к установщику проверяются здесь, когда ветка уже известна, но до
+# загрузок, обслуживания образа и очистки рабочего каталога.
+if ($isWindows10) {
+    # Ключ /legacy знает только установщик Windows 11: в Windows 10 он и так
+    # классический, а winpeshl.ini с /legacy сломал бы запуск с носителя.
+    if ($LegacySetup) {
+        Write-Note (T 'Windows 10 уже использует классический установщик: -LegacySetup не нужен и boot.wim не меняется' 'Windows 10 already uses the classic setup: -LegacySetup is unnecessary and boot.wim is left unchanged')
+        $LegacySetup = $false
+    }
+    # Ключи LabConfig/MoSetup обходят проверки Windows 11; установщику Windows 10
+    # они не нужны, поэтому boot.wim и реестр образа ради них не трогаем.
+    $NoBypass = $true
+    # Языковые пакеты, LXP и WinPE сборщик подбирает только для Windows 11.
+    if ($AddLanguage -or $DownloadLanguage) { throw (T 'Добавление языков для Windows 10 не поддерживается: возьмите ISO на нужном языке' 'Adding languages is not supported for Windows 10: use an ISO in the required language') }
+    if ($SetupLanguage -notin @('auto', 'original') -and $SetupLanguage -ne $sourceImageLanguage) { throw (T 'Смена языка установщика для Windows 10 не поддерживается: возьмите ISO на нужном языке' 'Changing the Setup language is not supported for Windows 10: use an ISO in the required language') }
+} else {
+    if ($TrimSources -and -not $LegacySetup) { throw (T '-TrimSources требует -LegacySetup' '-TrimSources requires -LegacySetup') }
+    if ($RemoveWinRE -and -not $LegacySetup -and $Keep -notcontains 'WinRE') { throw (T '-RemoveWinRE требует -LegacySetup' '-RemoveWinRE requires -LegacySetup') }
+}
+# Home/Pro без ключа установщик останавливает на запросе ключа, а это вопрос.
+if ($AutoInstall -and $selected.EditionId -match '^(Core|Professional)' -and -not $ProductKey) { throw (T "Для автоматической установки $($selected.EditionId) укажите -ProductKey: без ключа установщик Home/Pro остановится на его запросе" "Automatic installation of $($selected.EditionId) needs -ProductKey: without a key, Home/Pro Setup stops at the key prompt") }
 if ($DryRun) { Initialize-DeploymentTools -Build $buildNumber -Directory $UpdatesDir -ExplicitDism $DismPath -Install:$InstallAdk -Preview }
-$account = Read-LocalAccountOptions -Build $buildNumber -EditionId $selected.EditionId -Mode $AccountMode -Name $LocalUserName -Password $LocalUserPassword -Preview:$DryRun
+$account = Read-LocalAccountOptions -Build $buildNumber -EditionId $selected.EditionId -Mode $AccountMode -Name $LocalUserName -Password $LocalUserPassword -Preview:$DryRun -AutoInstall:$AutoInstall
 $AccountMode=$account.Mode; $LocalUserName=$account.Name; $LocalUserPassword=$account.Password
 
 $mozLang = $script:MozillaLang[$imgLang]
@@ -4745,8 +5099,11 @@ if (-not $DryRun) {
         Set-Content -LiteralPath (Join-Path $UpdatesDir '.win-11-lite-cache') -Value 'win-11-lite cache' -Encoding ascii
     }
     Initialize-DeploymentTools -Build $buildNumber -Directory $UpdatesDir -ExplicitDism $DismPath -Install:$InstallAdk
-    $lcuDir = Join-Path $UpdatesDir "lcu-$winVersion"
-    $netDir = Join-Path $UpdatesDir "dotnet-$winVersion"
+    # Windows 10 21H2 и Windows 11 21H2 не должны делить кэш: при недоступной
+    # сети сборщик иначе взял бы обновление чужой системы.
+    $updateCacheName = if ($isWindows10) { "win10-$winVersion" } else { $winVersion }
+    $lcuDir = Join-Path $UpdatesDir "lcu-$updateCacheName"
+    $netDir = Join-Path $UpdatesDir "dotnet-$updateCacheName"
     $requestedUpdateMode = $UpdateMode
     $lcuPayload = $null
     $dotNetPayload = $null
@@ -4756,7 +5113,8 @@ if (-not $DryRun) {
     if ($UpdateMode -ne 'none') {
         try {
             if ($UpdateMode -eq 'download') {
-                $target = Save-CatalogPayload -Query "Cumulative Update for Windows 11 version $winVersion x64" -Directory $lcuDir
+                $search = Get-UpdateCatalogSearch -Build $buildNumber -Release $winVersion -Kind lcu
+                $target = Save-CatalogPayload -Query $search.Query -TitlePattern $search.TitlePattern -Directory $lcuDir
                 $LcuFile = Split-Path $target -Leaf
             } else {
                 $target = Get-LocalUpdatePayload -Directory $lcuDir -FileName $LcuFile
@@ -4773,7 +5131,8 @@ if (-not $DryRun) {
     if ($requestedUpdateMode -ne 'none' -and $IncludeDotNetUpdate) {
         try {
             if ($requestedUpdateMode -eq 'download') {
-                $target = Save-CatalogPayload -Query "Cumulative Update for .NET Framework Windows 11 version $winVersion x64" -Directory $netDir -TitlePattern '\.NET Framework'
+                $search = Get-UpdateCatalogSearch -Build $buildNumber -Release $winVersion -Kind dotnet
+                $target = Save-CatalogPayload -Query $search.Query -Directory $netDir -TitlePattern $search.TitlePattern
                 $DotNetUpdateFile = Split-Path $target -Leaf
             } else {
                 $target = Get-LocalUpdatePayload -Directory $netDir -FileName $DotNetUpdateFile
@@ -4905,7 +5264,7 @@ if (-not $DryRun) {
 Write-Stage (T 'План удаления при текущем пресете' 'Removal plan for the selected preset')
 
 $activeGroups = @()
-foreach ($rule in ($script:CapabilityRules + $script:PackageRules + $script:AppxRules + $script:FolderRules + $script:FileRules)) {
+foreach ($rule in ($script:CapabilityRules + $script:PackageRules + $script:AppxRules + $script:FolderRules + $script:FileRules + $script:FeatureRules)) {
     if (Test-GroupActive -RulePreset $rule.Preset -Group $rule.Group) {
         $activeGroups += [PSCustomObject]@{ Group = $rule.Group; Desc = $rule.Desc }
     }
@@ -4917,7 +5276,9 @@ foreach ($g in ($activeGroups | Group-Object Group | Sort-Object Name)) {
 if (Test-GroupActive -RulePreset 'balanced' -Group 'Fonts') {
     Write-Host ("  {0,-10} {1}" -f 'Fonts', (T 'CJK-шрифты — файлами (~254 МБ)' 'CJK fonts - by file (about 254 MB)')) -ForegroundColor Gray
 }
-if (Test-GroupActive -RulePreset 'balanced' -Group 'AI') {
+if ((Test-GroupActive -RulePreset 'balanced' -Group 'AI') -and $isWindows10) {
+    Write-Host ("  {0,-10} {1}" -f 'AI', (T 'Copilot — политиками; Recall и AI-компонентов Windows 11 в Windows 10 нет' 'Copilot - by policy; Windows 10 has no Recall or Windows 11 AI components')) -ForegroundColor Gray
+} elseif (Test-GroupActive -RulePreset 'balanced' -Group 'AI') {
     Write-Host ("  {0,-10} {1}" -f 'AI', (T 'Recall, Copilot, AI Fabric, AIX, AugLoop — файлами и политиками' 'Recall, Copilot, AI Fabric, AIX, AugLoop - by file and policy')) -ForegroundColor Gray
     if ($Preset -eq 'balanced') {
         Write-Host (T '             Recall также удаляется как optional feature через DISM' '             Recall is also removed as an optional feature through DISM') -ForegroundColor Gray
@@ -4932,16 +5293,18 @@ Write-Host ''
 $vLang = if ($AddLanguage) {
     $src = if ($DownloadLanguage -and $DryRun) { T ' — скачать' ' - download' } else { (T ' — из ' ' - from ') + (Split-Path $LanguageSource -Leaf) }
     (T 'добавить ' 'add ') + ($AddLanguage -join ', ') + $src
-} else { T "только $imgLang  (добавить: -DownloadLanguage ru-RU)" "$imgLang only  (add with -DownloadLanguage ru-RU)" }
-$vSetup = if ($LegacySetup) { T 'классический (winpeshl.ini /legacy)' 'classic (winpeshl.ini /legacy)' } else { T "штатный для $winVersion (ConX)" "stock $winVersion (ConX)" }
+} elseif ($isWindows10) { T "только $imgLang  (для Windows 10 другие языки не добавляются)" "$imgLang only  (Windows 10 builds cannot add languages)" }
+else { T "только $imgLang  (добавить: -DownloadLanguage ru-RU)" "$imgLang only  (add with -DownloadLanguage ru-RU)" }
+$vSetup = if ($isWindows10) { T 'классический, штатный для Windows 10' 'classic, stock for Windows 10' }
+          elseif ($LegacySetup) { T 'классический (winpeshl.ini /legacy)' 'classic (winpeshl.ini /legacy)' } else { T "штатный для $winVersion (ConX)" "stock $winVersion (ConX)" }
 $vWinRE = if ($RemoveWinRE) {
     $copyNote = if ($SaveWinRE) { T ', копия рядом с ISO' ', copy saved next to the ISO' } else { T ', без копии' ', no copy kept' }
-    if ($LegacySetup) { (T 'удалить' 'remove') + $copyNote }
+    if ($LegacySetup -or $isWindows10) { (T 'удалить' 'remove') + $copyNote }
     else { T 'УДАЛИТЬ — без -LegacySetup установка упадёт!' 'REMOVE - without -LegacySetup the install will fail!' }
 } else { T 'оставить' 'keep' }
 $vSources = if ($TrimSources) { T 'урезать до boot.wim + install + EI.CFG' 'trim to boot.wim + install + EI.CFG' } else { T 'как в оригинале' 'as in the original' }
 $vCleanup = if ($Preset -eq 'safe') { T 'нет' 'none' } elseif ($ResetBase) { 'StartComponentCleanup + ResetBase' } else { 'StartComponentCleanup' }
-$vBypass = if (-not $NoBypass) { T 'да' 'yes' } else { T 'нет' 'no' }
+$vBypass = if ($isWindows10) { T 'не нужен (Windows 10)' 'not needed (Windows 10)' } elseif (-not $NoBypass) { T 'да' 'yes' } else { T 'нет' 'no' }
 $vWinget = if ($WithWinget) { T 'встроить' 'embed' } else { T 'из исходного образа, если есть  (добавить: -WithWinget)' 'keep the source version if present  (add with -WithWinget)' }
 $vUpd = "$UpdateMode" + $(if ($UpdateMode -eq 'none') { T '  (встроить последние: -WithUpdates)' '  (embed latest with -WithUpdates)' })
 
@@ -4954,11 +5317,16 @@ $plannedSetupLang = if ($DryRun -and $SetupLanguage -ne 'original') {
     if ($SetupLanguage -ne 'auto') { $SetupLanguage } elseif ($AddLanguage) { $AddLanguage[0] } else { $setupLang }
 } else { $setupLang }
 Write-Host (T "  Язык установки : $plannedSetupLang" "  Setup language : $plannedSetupLang")
-$accountPlan = if ($AccountMode -eq 'image') {
-    if ($LocalUserName) { $LocalUserName } else { T 'задать перед сборкой ISO' 'configure before building the ISO' }
+$accountPlan = if ($AutoInstall -and -not $LocalUserName) { T 'встроенный Администратор без пароля, автовход' 'built-in Administrator without a password, automatic sign-in' }
+elseif ($AccountMode -eq 'image') {
+    if ($LocalUserName) { $LocalUserName + $(if ($AutoInstall) { T ', автовход' ', automatic sign-in' }) } else { T 'задать перед сборкой ISO' 'configure before building the ISO' }
 } else { T 'ввод при установке Windows' 'enter during Windows Setup' }
+$vInstall = if ($AutoInstall) { T 'автоматически, без вопросов — ДИСК 0 БУДЕТ СТЁРТ' 'automatic, no questions - DISK 0 WILL BE ERASED' } else { T 'с вопросами установщика (диск, учётная запись)' 'Setup asks for the disk and account' }
+Write-Host (T "  Установка      : $vInstall" "  Installation   : $vInstall")
 Write-Host (T "  Пользователь   : $accountPlan" "  User account   : $accountPlan")
 Write-Host (T "  WinRE          : $vWinRE" "  WinRE          : $vWinRE")
+$vVirtualization = if (Test-GroupActive -RulePreset 'max' -Group 'Virtualization') { T 'удалить (Hyper-V, WSL2, песочница, контейнеры)' 'remove (Hyper-V, WSL2, Sandbox, containers)' } else { T 'оставить' 'keep' }
+Write-Host (T "  Виртуализация  : $vVirtualization" "  Virtualization : $vVirtualization")
 Write-Host (T "  sources        : $vSources" "  sources        : $vSources")
 Write-Host (T "  Очистка склада : $vCleanup" "  Store cleanup  : $vCleanup")
 Write-Host (T "  Обход TPM/SB   : $vBypass" "  TPM/SB bypass  : $vBypass")
@@ -4986,12 +5354,20 @@ if ($PageFileMode -eq 'custom') { Write-Note (T "Маленькая подкач
 if ($SwapFile -eq 'disabled') { Write-Note (T 'Отключение swapfile.sys требует проверки на целевой версии Windows; штатного ограничения до 16 МБ нет.' 'Disabling swapfile.sys requires validation on the target Windows version; there is no supported 16 MB size limit.') }
 if ($Hibernation -eq 'disabled') { Write-Note (T 'Гибернация и быстрый запуск будут отключены.' 'Hibernation and Fast Startup will be disabled.') }
 if ($CrashDumps -eq 'disabled') { Write-Note (T 'Аварийные и полные live-дампы не будут сохраняться для разбора сбоев.' 'Crash dumps and full live dumps will not be saved for troubleshooting.') }
+if (Test-GroupActive -RulePreset 'max' -Group 'Virtualization') { Write-Note (T "Компоненты виртуализации удаляются вместе с файлами: WSL, Docker Desktop, виртуальные машины Hyper-V и песочница`r`n  работать не будут, а включить их без исходного образа нельзя." "Virtualization features are removed with their files: WSL, Docker Desktop, Hyper-V virtual machines and Sandbox`r`n  will not work, and they cannot be enabled again without the source image.") }
 # Guard работает скрыто от SYSTEM и отключает службы и политики защиты Windows:
 # поведенческий анализ антивирусов (например, Avast IDP.HEUR) принимает это за
 # вредоносную программу. Тот же файл выполняет и финализацию, поэтому карантин
 # ломает не только Guard. Повторяется в итоговом отчёте после сборки.
 $guardAntivirusNote = T "Антивирус может заблокировать Guard как угрозу: он работает от SYSTEM и отключает службы и политики защиты Windows.`r`n  Не помещайте файл в карантин — добавьте в исключения антивируса C:\Windows\Setup\Scripts\Win11Lite\Win11Lite.ps1" "Antivirus software may block Guard as a threat: it runs as SYSTEM and disables Windows security services and policies.`r`n  Do not quarantine the file - add C:\Windows\Setup\Scripts\Win11Lite\Win11Lite.ps1 to your antivirus exclusions"
 if ($Guard -ne 'None') { Write-Note $guardAntivirusNote }
+# Автоматическая установка разрушительна по определению: говорим об этом в плане
+# и повторяем в итоговом отчёте после сборки.
+if ($AutoInstall) {
+    $autoInstallNote = T "Автоматическая установка стирает диск 0 без подтверждения (GPT для UEFI, MBR для BIOS). Используйте в VM или на ПК,`r`n  где диск 0 — системный; при установке с флешки диском 0 может оказаться она. Загрузка с ISO идёт без «Press any key»:`r`n  после установки извлеките ISO, если прошивка снова загрузит его первым." "Automatic installation erases disk 0 without confirmation (GPT for UEFI, MBR for BIOS). Use it in VMs or on PCs`r`n  where disk 0 is the system disk; when installing from USB, the flash drive may be disk 0. The ISO boots without 'Press any key':`r`n  remove the ISO after installation if the firmware would boot it first again."
+    Write-Note $autoInstallNote
+    if (-not $LocalUserName) { Write-Note (T 'Под встроенным Администратором приложения Microsoft Store (UWP) по умолчанию не запускаются; для них задайте -LocalUserName.' 'Microsoft Store (UWP) apps do not start under the built-in Administrator by default; use -LocalUserName for them.') }
+}
 
 if ($DryRun) {
     Write-Host ''
@@ -5238,7 +5614,7 @@ if ($Preset -eq 'balanced') {
 # Ключ задан явно, поэтому пресет роли не играет: удаление блокирует только -Keep WinRE
 if ($RemoveWinRE -and (Test-GroupActive -RulePreset 'safe' -Group 'WinRE')) {
     Write-Stage (T 'Удаление среды восстановления' 'Removing the recovery environment')
-    if (-not $LegacySetup) {
+    if (-not $LegacySetup -and -not $isWindows10) {
         Write-Note (T 'Без -LegacySetup установка упадёт с 0x80070003: новый установщик извлекает winre.wim в SafeOS' 'Without -LegacySetup the installation fails with 0x80070003: the new setup extracts winre.wim into SafeOS')
     }
 
@@ -5290,6 +5666,15 @@ foreach ($cap in $selectedCaps) {
 }
 $capSummary = T "Итог выбранных возможностей ($($selectedCaps.Count)): удалено $removedCaps; ошибок $failedCaps; отложено $deferredCaps" "Selected capabilities summary ($($selectedCaps.Count)): removed $removedCaps; failed $failedCaps; deferred $deferredCaps"
 if ($failedCaps -or $deferredCaps) { Write-Note $capSummary } else { Write-Ok $capSummary }
+
+#endregion
+
+#region ── Стадия 8a. Удаление компонентов Windows (виртуализация) ───────────
+
+if (@($script:FeatureRules | Where-Object { Test-GroupActive -RulePreset $_.Preset -Group $_.Group }).Count) {
+    Write-Stage (T 'Удаление компонентов виртуализации' 'Removing virtualization features')
+    Remove-OfflineFeatures -Image $mountDir
+}
 
 #endregion
 
@@ -5796,6 +6181,8 @@ $buildInfo = [ordered]@{
     SetupScriptLauncher = $(if ($useVbsLauncher) { 'VBScript / Run-Setup.vbs -> Win11Lite.ps1' } else { 'PowerShell / Win11Lite.ps1' })
     ServicingDismVersion = [string](Get-NativeToolVersion $script:Dism)
     AccountMode = $AccountMode
+    AutoInstall = [bool]$AutoInstall
+    AutoLogon = $(if (-not $AutoInstall) { $null } elseif ($LocalUserName) { $LocalUserName } else { 'Administrator' })
 } | ConvertTo-Json -Depth 8
 [IO.File]::WriteAllText((Join-Path $supportDir 'build-info.json'), $buildInfo, [Text.UTF8Encoding]::new($false))
 [IO.File]::WriteAllText((Join-Path $isoDir 'win11-lite-build.json'), $buildInfo, [Text.UTF8Encoding]::new($false))
@@ -5981,8 +6368,12 @@ if ($Unattend -eq 'none') {
     # Пустой Key вместе с WillShowUI=Never пропускает запрос ключа — для
     # корпоративных редакций это штатный сценарий.
     $setupInputLocale = if ($imgLang -eq 'ru-RU') { '0419:00000419;0409:00000409' } else { $imgLang }
-    $compactBlock = Get-ImageInstallXml -Compact ([bool]$CompactOS)
-    $localAccountXml = Get-LocalAccountXml -Name $LocalUserName -Password $LocalUserPassword
+    $compactBlock = Get-ImageInstallXml -Compact ([bool]$CompactOS) -AvailablePartition ([bool]$AutoInstall)
+    $localAccountXml = Get-LocalAccountXml -Name $LocalUserName -Password $LocalUserPassword -BlankAdministrator:([bool]$AutoInstall)
+    # -AutoInstall: разметка диска 0 до выбора раздела и автовход после OOBE.
+    # RunSynchronous стоит между ImageInstall и UserData — порядок схемы строгий.
+    $autoInstallPeXml = if ($AutoInstall) { Get-AutoInstallDiskXml } else { '' }
+    $autoLogonXml = if ($AutoInstall) { Get-AutoLogonXml -Name $LocalUserName -Password $LocalUserPassword } else { '' }
     $productKeyUi = Get-ProductKeyUiMode -EditionId $selected.EditionId
     $escapedProductKey = [Security.SecurityElement]::Escape($ProductKey)
     $productKeyValue = if ($ProductKey -or $selected.EditionId -notmatch '^(Core|Professional)') { "<Key>$escapedProductKey</Key>" } else { '' }
@@ -6023,7 +6414,7 @@ if ($Unattend -eq 'none') {
             <UILanguage>$imgLang</UILanguage>
             <UserLocale>$imgLang</UserLocale>
         </component>
-        <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">$compactBlock
+        <component name="Microsoft-Windows-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">$compactBlock$autoInstallPeXml
             <UserData>
                 <AcceptEula>true</AcceptEula>
                 <ProductKey>
@@ -6041,7 +6432,7 @@ if ($Unattend -eq 'none') {
             <UILanguageFallback>en-US</UILanguageFallback>
             <UserLocale>$imgLang</UserLocale>
         </component>
-        <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+        <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">$autoLogonXml
             <OOBE>
                 <HideEULAPage>true</HideEULAPage>
                 <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
@@ -6061,6 +6452,11 @@ if ($Unattend -eq 'none') {
 "@
     [IO.File]::WriteAllText((Join-Path $isoDir 'autounattend.xml'), $unattendXml, (New-Object Text.UTF8Encoding $false))
     Write-Ok (T 'autounattend.xml создан (локальный аккаунт, обход проверок, язык образа)' 'autounattend.xml created (local account, requirement bypass, image language)')
+    if ($AutoInstall) {
+        Write-AutoInstallMediaFiles -Distribution $isoDir
+        $autoLogonUser = if ($LocalUserName) { $LocalUserName } else { T 'встроенный Администратор без пароля' 'built-in Administrator without a password' }
+        Write-Ok (T "Автоматическая установка: разметка диска 0 (win11lite\disk.cmd), автовход — $autoLogonUser" "Automatic installation: disk 0 partitioning (win11lite\disk.cmd), automatic sign-in - $autoLogonUser")
+    }
 }
 
 #endregion
@@ -6088,7 +6484,15 @@ if ($SkipIso) {
     # аргумента без пробелов oscdimg получил бы как часть значения.
     # Каталог-источник '.' задаётся рабочим каталогом процесса: Push-Location
     # оболочки на запущенный процесс не влияет.
-    $bootData = '2#p0,e,bboot\etfsboot.com#pEF,e,befi\microsoft\boot\efisys.bin'
+    # Для -AutoInstall UEFI грузится без «Press any key»: иначе без нажатия
+    # клавиши прошивка пропустит DVD. Запрос BIOS (etfsboot) появляется только
+    # при загрузочном диске, то есть уже после установки, — его оставляем.
+    $efiBootImage = 'efi\microsoft\boot\efisys.bin'
+    if ($AutoInstall) {
+        if (Test-Path -LiteralPath (Join-Path $isoDir 'efi\microsoft\boot\efisys_noprompt.bin')) { $efiBootImage = 'efi\microsoft\boot\efisys_noprompt.bin' }
+        else { Write-Note (T 'На носителе нет efisys_noprompt.bin: при загрузке UEFI понадобится нажать клавишу' 'The media has no efisys_noprompt.bin: UEFI boot will still ask for a key press') }
+    }
+    $bootData = "2#p0,e,bboot\etfsboot.com#pEF,e,b$efiBootImage"
     Write-Step (T "oscdimg → $OutputIso" "oscdimg -> $OutputIso")
     $isoRun = Invoke-ProgressProcess -Exe $script:Oscdimg -WorkingDirectory $isoDir -ProgressOnStdErr `
         -Activity (T 'Запись ISO' 'Writing the ISO') `
@@ -6143,6 +6547,7 @@ if ($Preset -eq 'balanced' -and $script:ImageAudit.RemainingRemovals.Count) {
 Write-Host (T "  Объём удалённых файлов до сжатия: $(Format-Size $script:FreedBytes) (не экономия ISO; возможен повторный учёт hard links)" "  Deleted file lengths before compression: $(Format-Size $script:FreedBytes) (not ISO savings; hard links may be counted more than once)")
 if ($script:SkippedDownloads.Count) { Write-Note (T "  Сборка выполнена без: $($script:SkippedDownloads -join '; ')" "  Built without: $($script:SkippedDownloads -join '; ')") }
 if ($Guard -ne 'None') { Write-Note $guardAntivirusNote }
+if ($AutoInstall) { Write-Note $autoInstallNote }
 if ($script:ImageAuditPath -and (Test-Path -LiteralPath $script:ImageAuditPath)) {
     $script:ImageAudit['SourceIsoBytes'] = $srcSize
     $script:ImageAudit['ResultIsoBytes'] = $dstSize
